@@ -1,0 +1,7 @@
+{
+  "name": "Host for tools: Wiki Builder",
+  "version": "1.0.0",
+  "description": "Comprehensive wiki generation from GitHub repository analysis",
+  "depends_on": [],
+  "init_after": []
+}
