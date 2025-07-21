@@ -21,17 +21,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models import BaseLanguageModel
 
-from alita_sdk.tools.wiki_builder_plugin.plugin_implementation.state.wiki_state import (
-    WikiState, PageGenerationState,
-    QualityAssessmentState, EnhancementState,
-    WikiStructureSpec, QualityAssessment, RepositoryAnalysis, PageSpec, WikiPage, WikiStyle, TargetAudience
-)
-from alita_sdk.tools.wiki_builder_plugin.plugin_implementation.prompts.wiki_prompts_enhanced import (
-    ENHANCED_CONTENT_GENERATION_PROMPT, ENHANCED_REPO_ANALYSIS_PROMPT,
-    ENHANCED_WIKI_STRUCTURE_PROMPT, ENHANCED_RETRY_CONTENT_PROMPT,
-    TARGET_AUDIENCES, QUALITY_ASSESSMENT_PROMPT
-)
-from alita_sdk.tools.wiki_builder_plugin.plugin_implementation import GitHubIndexer, WikiRetrieverStack
+from plugin_implementation import GitHubIndexer, WikiRetrieverStack
+from plugin_implementation.prompts.wiki_prompts_enhanced import ENHANCED_WIKI_STRUCTURE_PROMPT, TARGET_AUDIENCES, \
+    ENHANCED_CONTENT_GENERATION_PROMPT, ENHANCED_RETRY_CONTENT_PROMPT, ENHANCED_REPO_ANALYSIS_PROMPT, \
+    QUALITY_ASSESSMENT_PROMPT
+from plugin_implementation.state.wiki_state import WikiStyle, TargetAudience, WikiState, WikiStructureSpec, \
+    PageGenerationState, WikiPage, QualityAssessmentState, QualityAssessment, EnhancementState, PageSpec, \
+    RepositoryAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -242,19 +238,6 @@ class OptimizedWikiGenerationAgent:
                 config=config
             )
 
-            # logger.info(f"LLM response received. Content length: {len(response.content)}")
-            #
-            # # Parse LLM response to WikiStructureSpec
-            # structure_data = self._parse_llm_json_response(response.content)
-            # logger.info(f"Parsed structure data keys: {structure_data.keys() if isinstance(structure_data, dict) else 'Not a dict'}")
-
-            # Validate the structure data has required fields
-            # required_fields = ["wiki_title", "overview", "sections", "total_pages", "estimated_effort"]
-            # missing_fields = [field for field in required_fields if field not in structure_data]
-            # if missing_fields:
-            #     raise ValueError(f"LLM response missing required fields: {missing_fields}")
-
-            # wiki_structure = WikiStructureSpec(**structure_data)
             logger.info(f"WikiStructureSpec created successfully")
             logger.info(f"Wiki structure sections: {len(response.sections)}")
 

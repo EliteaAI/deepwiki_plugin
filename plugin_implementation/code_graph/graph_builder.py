@@ -23,16 +23,10 @@ import networkx as nx
 from langchain.docstore.document import Document
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 
-# Import the code splitter for basic parsing logic
-from alita_sdk.tools.wiki_toolkit.index.code_splitter import GraphAwareCodeSplitter
-# Rich parsers (existing)
-from alita_sdk.tools.wiki_toolkit.parsers.base_parser import (
-    ParseResult
-)
-from alita_sdk.tools.wiki_toolkit.parsers.enhanced_python_parser import PythonParser
-from alita_sdk.tools.wiki_toolkit.parsers.java_visitor_parser import JavaVisitorParser
-
-# Tree-sitter for basic parsing
+from plugin_implementation.code_splitter import GraphAwareCodeSplitter
+from plugin_implementation.parsers.base_parser import ParseResult
+from plugin_implementation.parsers.java_visitor_parser import JavaVisitorParser
+from plugin_implementation.parsers.python_parser import PythonParser
 
 logger = logging.getLogger(__name__)
 
