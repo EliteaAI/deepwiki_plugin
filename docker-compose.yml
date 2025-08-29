@@ -13,7 +13,7 @@ services:
       - ./envs/override.env
     environment:
       - NAME=pylon-deepwiki
-      - PYLON_WEB_RUNTIME=gevent
+      - PYLON_WEB_RUNTIME=waitress
       - PYLON_CONFIG_SEED=file:/data/pylon.yml
     volumes:
       - ./pylon_deepwiki:/data
