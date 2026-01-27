@@ -30,6 +30,9 @@ deepwiki_plugin/                    # Infrastructure/runner repository
 │           │   └── ...
 │           ├── methods/            # RPC method handlers
 │           ├── routes/             # HTTP routes
+│           ├── static/ui/          # Place for the plugin UI implementation based on react 
+│           │   ├── template/       # Plugin UI implementation based on the React
+│           │   ├── dist/           # Compiled react application. It is mandatory to compile it after the feature development
 │           └── tests/              # Plugin unit tests
 ├── PLANNING_*.md                   # Planning documents
 └── tests/                          # Infrastructure-level tests
@@ -52,18 +55,19 @@ deepwiki_plugin/                    # Infrastructure/runner repository
 
 ### Where to Make Changes
 
-| Task | Location |
-|------|----------|
-| Add/modify wiki generation logic | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/agents/` |
-| Add/modify graph operations | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/code_graph/` |
-| Add/modify language parsers | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/parsers/` |
-| Add/modify structure planning | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/wiki_structure_planner/` |
-| Add/modify RPC methods | `pylon_deepwiki/plugins/deepwiki_plugin/methods/` |
-| Add/modify HTTP routes | `pylon_deepwiki/plugins/deepwiki_plugin/routes/` |
-| Add plugin tests | `pylon_deepwiki/plugins/deepwiki_plugin/tests/` |
-| Modify Docker/infrastructure | `deepwiki_plugin/docker-compose.yml`, `envs/` |
-| Add planning documents | `deepwiki_plugin/PLANNING_*.md` |
-| Add quick test scripts | `deepwiki_plugin/test_*.py` (temporary, don't commit) |
+| Task                             | Location                                                                               |
+|----------------------------------|----------------------------------------------------------------------------------------|
+| Add/modify wiki generation logic | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/agents/`                 |
+| Add/modify graph operations      | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/code_graph/`             |
+| Add/modify language parsers      | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/parsers/`                |
+| Add/modify structure planning    | `pylon_deepwiki/plugins/deepwiki_plugin/plugin_implementation/wiki_structure_planner/` |
+| Add/modify RPC methods           | `pylon_deepwiki/plugins/deepwiki_plugin/methods/`                                      |
+| Add/modify HTTP routes           | `pylon_deepwiki/plugins/deepwiki_plugin/routes/`                                       |
+| Add plugin tests                 | `pylon_deepwiki/plugins/deepwiki_plugin/tests/`                                        |
+| Modify Docker/infrastructure     | `deepwiki_plugin/docker-compose.yml`, `envs/`                                          |
+| Add planning documents           | `deepwiki_plugin/PLANNING_*.md`                                                        |
+| Add quick test scripts           | `deepwiki_plugin/test_*.py` (temporary, don't commit)                                  |
+| Plugin UI development            | `deepwiki_plugin/static/ui/template/`                                                  |
 
 ### Committing Changes
 
@@ -73,6 +77,17 @@ cd pylon_deepwiki/plugins/deepwiki_plugin
 git add -A
 git commit -m "feat: your change description"
 git push origin feat/capability-based-naming
+```
+
+**For plugin ui code changes and development:**
+```bash
+cd pylon_deepwiki/plugins/deepwiki_plugin
+git add -A
+git commit -m "feat: your change description"
+git push origin feat/ui-changes
+cd pylon_deepwiki/plugins/deepwiki_plugin/static/ui/template/
+# It is mandatory to build the UI after the changes to enable the testing after the container restart
+npm run build
 ```
 
 **For infrastructure changes:**
