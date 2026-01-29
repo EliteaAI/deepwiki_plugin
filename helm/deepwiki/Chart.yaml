@@ -1,0 +1,21 @@
+apiVersion: v2
+name: deepwiki
+description: DeepWiki - AI-powered wiki generation from code repositories
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+home: https://github.com/epam/deepwiki
+maintainers:
+  - name: EPAM Systems
+    email: alita@epam.com
+
+keywords:
+  - deepwiki
+  - wiki
+  - documentation
+  - code-analysis
+  - ai
+
+# No dependencies - standalone plugin deployment
+# Redis/queue infrastructure is not included; each pod manages its own worker limits

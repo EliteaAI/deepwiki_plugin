@@ -1,0 +1,66 @@
+# Minimal values for local development
+# Use this for quick testing with minikube or kind
+#
+# helm install deepwiki ./deepwiki -n deepwiki -f values-development.yaml
+
+# Minimal resources for dev
+combined:
+  enabled: true
+  replicaCount: 1
+  
+  # Reduced resources for local dev
+  resources:
+    requests:
+      cpu: 200m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 4Gi
+  
+  # Single generation at a time for stability
+  maxParallelWorkers: 1
+  
+  pylonRuntime: gevent
+
+# No Redis needed for single-replica dev
+redis:
+  enabled: false
+
+# Minimal storage
+storage:
+  persistence:
+    enabled: true
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+
+# No ingress for dev (use port-forward)
+ingress:
+  enabled: false
+
+# No PDB for dev
+podDisruptionBudget:
+  enabled: false
+
+# Faster health checks for dev feedback
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Reduced feature flags for faster testing
+env:
+  DEEPWIKI_STRUCTURE_PLANNER: "deepagents"
+  DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK: "0"  # Faster structure planning
+  DEEPWIKI_USE_STRUCTURED_REPO_ANALYSIS: "1"
+  DEEPWIKI_AGENTIC_GENERATE_OVERVIEW: "0"  # Skip overview for speed
+  DEEPWIKI_AGENTIC_GENERATE_CONCLUSION: "0"  # Skip conclusion for speed

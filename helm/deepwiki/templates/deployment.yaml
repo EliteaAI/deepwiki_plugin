@@ -1,0 +1,151 @@
+{{- if .Values.combined.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "deepwiki.fullname" . }}
+  labels:
+    {{- include "deepwiki.labels" . | nindent 4 }}
+    app.kubernetes.io/component: combined
+spec:
+  replicas: {{ .Values.combined.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "deepwiki.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: combined
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "deepwiki.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: combined
+    spec:
+      serviceAccountName: {{ include "deepwiki.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 3600
+      {{- if .Values.config.forcePluginUpdate }}
+      initContainers:
+        - name: refresh-plugins
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Removing plugins to force fresh clone from git..."
+              rm -rf /data/plugins/deepwiki_plugin /data/plugins/bootstrap
+              echo "Plugins removed. Fresh clone will happen on container start."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- end }}
+      containers:
+        - name: deepwiki
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: {{ .Values.securityContext.runAsUser }}
+            runAsGroup: {{ .Values.securityContext.runAsGroup }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: NAME
+              value: pylon-deepwiki
+            - name: PYLON_WEB_RUNTIME
+              value: {{ .Values.combined.pylonRuntime }}
+            - name: PYLON_CONFIG_SEED
+              value: file:/data/pylon.yml
+            - name: DEEPWIKI_MAX_PARALLEL_WORKERS
+              value: {{ .Values.combined.maxParallelWorkers | quote }}
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.healthCheck.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.healthCheck.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.healthCheck.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.healthCheck.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.healthCheck.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.combined.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: pylon-config
+              mountPath: /data/pylon.yml
+              subPath: pylon.yml
+            - name: plugin-config
+              mountPath: /data/configs/deepwiki_plugin.yml
+              subPath: deepwiki_plugin.yml
+            - name: bootstrap-config
+              mountPath: /data/configs/bootstrap.yml
+              subPath: bootstrap.yml
+            - name: env-config
+              mountPath: /data/configs/env.yml
+              subPath: env.yml
+      volumes:
+        - name: data
+          {{- if .Values.storage.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "deepwiki.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: pylon-config
+          configMap:
+            name: {{ include "deepwiki.fullname" . }}-config
+            items:
+              - key: pylon.yml
+                path: pylon.yml
+        - name: plugin-config
+          configMap:
+            name: {{ include "deepwiki.fullname" . }}-config
+            items:
+              - key: deepwiki_plugin.yml
+                path: deepwiki_plugin.yml
+        - name: bootstrap-config
+          configMap:
+            name: {{ include "deepwiki.fullname" . }}-config
+            items:
+              - key: bootstrap.yml
+                path: bootstrap.yml
+        - name: env-config
+          configMap:
+            name: {{ include "deepwiki.fullname" . }}-config
+            items:
+              - key: env.yml
+                path: env.yml
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

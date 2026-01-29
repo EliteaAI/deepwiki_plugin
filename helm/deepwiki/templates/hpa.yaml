@@ -1,0 +1,32 @@
+{{- if and .Values.combined.enabled .Values.combined.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "deepwiki.fullname" . }}
+  labels:
+    {{- include "deepwiki.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "deepwiki.fullname" . }}
+  minReplicas: {{ .Values.combined.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.combined.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.combined.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.combined.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.combined.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.combined.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}

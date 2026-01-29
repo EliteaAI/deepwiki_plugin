@@ -1,0 +1,103 @@
+# Production values for DeepWiki
+# Use this file as a starting point for production deployments
+#
+# helm install deepwiki ./deepwiki -n deepwiki -f values-production.yaml
+
+# Use combined mode with higher resources
+combined:
+  enabled: true
+  replicaCount: 2
+  
+  # Production-grade resources for 3K+ file repos
+  resources:
+    requests:
+      cpu: 2
+      memory: 4Gi
+    limits:
+      cpu: 8
+      memory: 16Gi
+  
+  # Allow more parallel generations per pod
+  # With 16GB limit, 3 workers at ~4GB each is safe
+  maxParallelWorkers: 3
+  
+  pylonRuntime: gevent
+  
+  # Long grace period for wiki generation completion
+  terminationGracePeriodSeconds: 3600
+  
+  # Enable HPA for production
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetMemoryUtilizationPercentage: 75
+
+# Production storage
+storage:
+  persistence:
+    enabled: true
+    storageClass: ""  # Use your production storage class
+    size: 100Gi
+    accessModes:
+      - ReadWriteMany  # Required for multi-replica
+
+# Ingress configuration (adjust for your environment)
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+  hosts:
+    - host: deepwiki.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: deepwiki-tls
+      hosts:
+        - deepwiki.example.com
+
+# Pod disruption budget for high availability
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Production health checks (more lenient for heavy operations)
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# Node affinity for dedicated nodes (optional)
+# nodeSelector:
+#   workload: deepwiki
+
+# Tolerations for dedicated nodes (optional)
+# tolerations:
+#   - key: "workload"
+#     operator: "Equal"
+#     value: "deepwiki"
+#     effect: "NoSchedule"
+
+# Anti-affinity to spread replicas across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: deepwiki
+          topologyKey: kubernetes.io/hostname

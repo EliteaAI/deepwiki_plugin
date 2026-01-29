@@ -1,0 +1,233 @@
+# DeepWiki Helm Chart Values
+# =============================================================================
+# Standalone plugin deployment (no Redis/queue dependencies)
+# See SCALABILITY_KUBERNETES.md for architecture details
+# =============================================================================
+
+# =============================================================================
+# Global Settings
+# =============================================================================
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Image Configuration
+# =============================================================================
+image:
+  repository: getcarrier/pylon
+  tag: "1.2.7"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# =============================================================================
+# Combined Deployment (Recommended - API + Worker in single pod)
+# =============================================================================
+# SCALING STRATEGY: Static Pool (Phase 1)
+# - Multiple pods, 1 worker each = better isolation
+# - Avoids OOM from memory accumulation in single pod
+# - See SCALING_ARCHITECTURE.md for full analysis
+# =============================================================================
+combined:
+  enabled: true
+  replicaCount: 3  # Minikube dev: 3 pods (6GB limit). Production: 4-8 pods
+  
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1536Mi  # Dev: 1.5Gi per pod fits in 6GB minikube
+    limits:
+      cpu: 2000m
+      memory: 2Gi  # Single worker needs ~1.5GB peak + headroom
+  
+  # Max parallel wiki generations per pod
+  # IMPORTANT: Keep at 1 for static pool strategy
+  # Multiple workers per pod = shared memory pressure = OOM risk
+  maxParallelWorkers: 1
+  
+  # Pylon runtime (gevent for async I/O)
+  pylonRuntime: gevent
+  
+  # Long grace period to allow running wiki generations to complete
+  # Wiki generation can take 10-60 minutes for large repos
+  terminationGracePeriodSeconds: 3600
+
+  # HPA configuration (scale on memory - primary bottleneck)
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetMemoryUtilizationPercentage: 75
+
+# =============================================================================
+# Service Configuration
+# =============================================================================
+service:
+  type: ClusterIP
+  port: 8080
+
+# =============================================================================
+# DeepWiki Plugin Configuration
+# =============================================================================
+config:
+  # Platform integration URL
+  # This must be accessible from elitea_core for provider registration
+  # Example: http://deepwiki.deepwiki.svc.cluster.local:8080
+  # Leave empty to auto-generate based on release name
+  serviceLocationUrl: ""
+  
+  # Base path for wiki builder files (inside container)
+  basePath: /data/wiki_builder
+  
+  # Alita release branch for bootstrap plugin
+  alitaRelease: main
+  
+  # GitHub credentials for cloning private repos (optional)
+  # These are defaults - actual credentials come from toolkit config at runtime
+  licenseUsername: ""
+  licensePassword: ""
+  
+  # Force plugin update on pod restart
+  # When enabled, an initContainer removes the plugins folder before starting
+  # This forces a fresh git clone from GitHub on every pod restart
+  # Useful for development/staging where you want latest code on restart
+  # For production, set to false and use helm upgrade to control updates
+  forcePluginUpdate: false
+
+# =============================================================================
+# DeepWiki Feature Flags (Environment Variables)
+# =============================================================================
+env:
+  # Structure planner
+  DEEPWIKI_STRUCTURE_PLANNER: "deepagents"
+  DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK: "1"
+  DEEPWIKI_DEEPAGENTS_COVERAGE_LLM: "1"
+  DEEPWIKI_DEEPAGENTS_USE_STREAM: "1"
+  DEEPWIKI_DEEPAGENTS_LOG_STREAM: "1"
+  
+  # Agentic generation settings
+  DEEPWIKI_AGENTIC_PLAN_MAX_OUTPUT_TOKENS: "8096"
+  DEEPWIKI_AGENTIC_SECTION_MAX_OUTPUT_TOKENS: "8096"
+  DEEPWIKI_AGENTIC_SECTION_CONTEXT_TOKENS: "25000"
+  DEEPWIKI_AGENTIC_SECTION_CODE_TOKENS: "18750"
+  DEEPWIKI_AGENTIC_SIGNATURES_TOKEN_BUDGET: "6250"
+  DEEPWIKI_AGENTIC_SIGNATURES_MAX: "80"
+  DEEPWIKI_AGENTIC_SYMBOL_INDEX_MAX: "250"
+  DEEPWIKI_AGENTIC_PATHS_MAX: "120"
+  DEEPWIKI_AGENTIC_FAST_TOKEN_ESTIMATE: "1"
+  DEEPWIKI_AGENTIC_PLAN_TRACE: "1"
+  DEEPWIKI_AGENTIC_PLAN_MODE: "queries"
+  DEEPWIKI_AGENTIC_STAGE_B: "1"
+  DEEPWIKI_AGENTIC_STAGE_B_TRACE: "1"
+  DEEPWIKI_AGENTIC_SECTION_SEED_K: "15"
+  DEEPWIKI_AGENTIC_EXPAND_CAP_PER_EDGE: "3"
+  DEEPWIKI_AGENTIC_EXPAND_MAX_HOPS: "1"
+  DEEPWIKI_AGENTIC_PRIMARY_LIMIT: "10"
+  DEEPWIKI_AGENTIC_OUTLINE_DIRS_MAX: "25"
+  DEEPWIKI_AGENTIC_OUTLINE_FILES_MAX: "20"
+  DEEPWIKI_AGENTIC_GENERATE_INTRO: "1"
+  DEEPWIKI_AGENTIC_GENERATE_OVERVIEW: "0"
+  DEEPWIKI_AGENTIC_GENERATE_CONCLUSION: "1"
+  DEEPWIKI_AGENTIC_OVERVIEW_SECTIONS_MAX: "2"
+  DEEPWIKI_AGENTIC_INTRO_MAX_OUTPUT_TOKENS: "4096"
+  DEEPWIKI_AGENTIC_PAGE_CONTEXT_PER_SECTION: "4"
+  DEEPWIKI_AGENTIC_PAGE_CONTEXT_SECTIONS_MAX: "8"
+  DEEPWIKI_AGENTIC_DROP_EXPANDED_DOCS: "1"
+  DEEPWIKI_DEEPAGENTS_FILESYSTEM: "1"
+  DEEPWIKI_DEEPAGENTS_DISABLE_TRUNCATED_CONTEXT: "1"
+  DEEPWIKI_DEEPAGENTS_READ_DOCS_ONLY: "1"
+  
+  # Performance optimizations
+  DEEPWIKI_SKIP_REPO_CONTEXT_FOR_PAGES: "1"
+  DEEPWIKI_USE_STRUCTURED_REPO_ANALYSIS: "1"
+  DEEPWIKI_ASK_USE_OPTIMIZED_CONTEXT: "1"
+  
+  # Doc/Code separation
+  DEEPWIKI_DOC_SEPARATE_INDEX: "1"
+  DEEPWIKI_DOC_SEMANTIC_RETRIEVAL: "1"
+  DEEPWIKI_AUTO_TARGET_DOCS: "1"
+
+# =============================================================================
+# Storage Configuration
+# =============================================================================
+storage:
+  # Persistent volume for caches, repos, and indexes
+  persistence:
+    enabled: true
+    storageClass: "deepwiki-rwx"  # RWX storage class for multi-replica
+    size: 50Gi
+    accessModes:
+      - ReadWriteMany  # Required for multi-replica static pool
+
+  # Existing PVC name (if you want to use an existing PVC)
+  existingClaim: ""
+
+# =============================================================================
+# Ingress Configuration
+# =============================================================================
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+  hosts:
+    - host: deepwiki.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: deepwiki-tls
+    #   hosts:
+    #     - deepwiki.local
+
+# =============================================================================
+# Security Configuration
+# =============================================================================
+securityContext:
+  runAsUser: 33
+  runAsGroup: 33
+  fsGroup: 33
+
+podSecurityContext:
+  runAsNonRoot: true
+
+# =============================================================================
+# Service Account
+# =============================================================================
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# =============================================================================
+# Pod Settings
+# =============================================================================
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Pod disruption budget (protect running wiki generations)
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# =============================================================================
+# Health Check Configuration
+# =============================================================================
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
