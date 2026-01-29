@@ -63,6 +63,18 @@ spec:
               value: file:/data/pylon.yml
             - name: DEEPWIKI_MAX_PARALLEL_WORKERS
               value: {{ .Values.combined.maxParallelWorkers | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
