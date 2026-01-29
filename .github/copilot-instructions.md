@@ -79,15 +79,27 @@ git commit -m "feat: your change description"
 git push origin feat/capability-based-naming
 ```
 
-**For plugin ui code changes and development:**
+**For plugin UI code changes and development:**
+
+> **IMPORTANT: Only commit source files, NOT build artifacts!**
+> - ✅ Commit: `static/ui/template/src/**` (source files)
+> - ❌ Do NOT commit: `static/ui/dist/**` (build output)
+> - The `dist/` folder is automatically built by GitHub Actions CI on push to `main`
+> - Run `npm run build` locally only for testing purposes
+
 ```bash
 cd pylon_deepwiki/plugins/deepwiki_plugin
-git add -A
-git commit -m "feat: your change description"
-git push origin feat/ui-changes
+# Only add source files, not dist/
+git add static/ui/template/src/
+git commit -m "feat: your UI change description"
+git push origin main
+# GitHub CI will automatically build and commit dist/ artifacts
+```
+
+For local testing only (do not commit build output):
+```bash
 cd pylon_deepwiki/plugins/deepwiki_plugin/static/ui/template/
-# It is mandatory to build the UI after the changes to enable the testing after the container restart
-npm run build
+npm run build  # Creates dist/ for local testing only
 ```
 
 **For infrastructure changes:**
