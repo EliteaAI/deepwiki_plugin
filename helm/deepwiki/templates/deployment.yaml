@@ -79,6 +79,29 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            {{- if .Values.jobs.enabled }}
+            # K8s Jobs-based scaling configuration
+            - name: DEEPWIKI_JOBS_ENABLED
+              value: "true"
+            - name: DEEPWIKI_MAX_CONCURRENT_JOBS
+              value: {{ .Values.jobs.maxConcurrentJobs | quote }}
+            - name: DEEPWIKI_NAMESPACE
+              value: {{ .Release.Namespace }}
+            - name: DEEPWIKI_JOB_TTL_SECONDS
+              value: {{ .Values.jobs.ttlSecondsAfterFinished | quote }}
+            - name: DEEPWIKI_PVC_NAME
+              value: {{ include "deepwiki.pvcName" . }}
+            - name: DEEPWIKI_WORKER_IMAGE
+              value: {{ .Values.jobs.workerImage | default (printf "%s:%s" .Values.image.repository .Values.image.tag) | quote }}
+            - name: DEEPWIKI_JOB_MEMORY_REQUEST
+              value: {{ .Values.jobs.resources.requests.memory | quote }}
+            - name: DEEPWIKI_JOB_CPU_REQUEST
+              value: {{ .Values.jobs.resources.requests.cpu | quote }}
+            - name: DEEPWIKI_JOB_MEMORY_LIMIT
+              value: {{ .Values.jobs.resources.limits.memory | quote }}
+            - name: DEEPWIKI_JOB_CPU_LIMIT
+              value: {{ .Values.jobs.resources.limits.cpu | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: {{ .Values.healthCheck.liveness.path }}

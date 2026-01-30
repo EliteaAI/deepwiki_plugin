@@ -1,0 +1,16 @@
+{{- if .Values.jobs.enabled -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "deepwiki.fullname" . }}-job-manager
+  labels:
+    {{- include "deepwiki.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "deepwiki.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "deepwiki.fullname" . }}-job-manager
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

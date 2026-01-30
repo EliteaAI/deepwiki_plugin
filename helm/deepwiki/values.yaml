@@ -148,6 +148,46 @@ env:
   DEEPWIKI_AUTO_TARGET_DOCS: "1"
 
 # =============================================================================
+# K8s Jobs-Based Scaling (Phase 2)
+# =============================================================================
+# When enabled, wiki generation runs as K8s Jobs instead of subprocesses.
+# This provides cluster-wide slot management - the /slots endpoint queries
+# K8s API for active job count instead of per-pod counters.
+#
+# Benefits:
+# - Users see true cluster-wide availability
+# - Proper resource isolation per generation
+# - Better observability via K8s native tooling
+# - Scales independently of API pods
+#
+# Prerequisites:
+# - RBAC enabled (Role + RoleBinding created automatically)
+# - Shared PVC for job I/O and caching
+# =============================================================================
+jobs:
+  enabled: false  # Set to true to enable Jobs-based scaling
+  
+  # Maximum concurrent Jobs cluster-wide
+  # This replaces combined.maxParallelWorkers for Jobs mode
+  maxConcurrentJobs: 3
+  
+  # TTL for completed Jobs (seconds)
+  # Jobs are auto-deleted after this time to prevent accumulation
+  ttlSecondsAfterFinished: 300
+  
+  # Worker image (defaults to same as API pod image)
+  # workerImage: "getcarrier/pylon:1.2.7"
+  
+  # Job resource configuration
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: "1"
+    limits:
+      memory: 8Gi
+      cpu: "4"
+
+# =============================================================================
 # Storage Configuration
 # =============================================================================
 storage:
