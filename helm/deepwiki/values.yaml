@@ -82,6 +82,10 @@ config:
   # Alita release branch for bootstrap plugin
   alitaRelease: main
   
+  # DeepWiki plugin branch (defaults to main)
+  # Set to feature branch name for testing
+  pluginBranch: "main"
+  
   # GitHub credentials for cloning private repos (optional)
   # These are defaults - actual credentials come from toolkit config at runtime
   licenseUsername: ""
@@ -232,6 +236,7 @@ securityContext:
 
 podSecurityContext:
   runAsNonRoot: true
+  fsGroup: 33  # www-data group - ensures mounted volumes are group-writable
 
 # =============================================================================
 # Service Account

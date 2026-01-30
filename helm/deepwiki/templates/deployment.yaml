@@ -26,6 +26,7 @@ spec:
       terminationGracePeriodSeconds: 3600
       {{- if .Values.config.forcePluginUpdate }}
       initContainers:
+        # Refresh plugins by clearing old plugin directories
         - name: refresh-plugins
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -36,9 +37,12 @@ spec:
             - /bin/sh
             - -c
             - |
-              echo "Removing plugins to force fresh clone from git..."
-              rm -rf /data/plugins/deepwiki_plugin /data/plugins/bootstrap
-              echo "Plugins removed. Fresh clone will happen on container start."
+              echo "Preparing for fresh plugin clone..."
+              # Create jobs directory if Jobs mode will be used
+              mkdir -p /data/wiki_builder/jobs 2>/dev/null || true
+              # Clear plugin cache for fresh clone
+              rm -rf /data/plugins/deepwiki_plugin /data/plugins/bootstrap 2>/dev/null || true
+              echo "Ready for fresh plugin clone on container start."
           volumeMounts:
             - name: data
               mountPath: /data

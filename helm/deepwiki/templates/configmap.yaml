@@ -73,19 +73,14 @@ data:
 
   bootstrap.yml: |
     # Bootstrap plugin configuration
-    # This tells bootstrap to load deepwiki_plugin from elitea github
     plugin_repo:
     - type: elitea_github
-      release: {{ .Values.config.alitaRelease }}
+      release: {{ .Values.config.pluginBranch | default .Values.config.alitaRelease }}
       {{- if .Values.config.licenseUsername }}
       license_username: {{ .Values.config.licenseUsername }}
-      {{- else }}
-      license_username: ""
       {{- end }}
       {{- if .Values.config.licensePassword }}
       license_password: {{ .Values.config.licensePassword }}
-      {{- else }}
-      license_password: ""
       {{- end }}
       add_source_data: false
       add_head_data: false
