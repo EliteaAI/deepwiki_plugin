@@ -83,6 +83,8 @@ spec:
             # K8s Jobs-based scaling configuration
             - name: DEEPWIKI_JOBS_ENABLED
               value: "true"
+            - name: POD_SERVICE_ACCOUNT
+              value: {{ include "deepwiki.serviceAccountName" . }}
             - name: DEEPWIKI_MAX_CONCURRENT_JOBS
               value: {{ .Values.jobs.maxConcurrentJobs | quote }}
             - name: DEEPWIKI_NAMESPACE
