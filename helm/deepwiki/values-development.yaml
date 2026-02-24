@@ -17,9 +17,6 @@ combined:
       cpu: 2
       memory: 4Gi
   
-  # Single generation at a time for stability
-  maxParallelWorkers: 1
-  
   pylonRuntime: gevent
 
 # No Redis needed for single-replica dev

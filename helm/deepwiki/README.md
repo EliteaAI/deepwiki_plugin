@@ -10,7 +10,7 @@ This Helm chart deploys DeepWiki - an AI-powered wiki generation service that an
 
 ## Architecture
 
-DeepWiki deploys as a **standalone plugin** with no external dependencies (no Redis, no message queue). Each pod manages its own wiki generation workers.
+DeepWiki deploys as a **standalone plugin** with no external dependencies (no Redis, no message queue). Wiki generation runs as K8s Jobs for proper resource isolation.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -18,8 +18,14 @@ DeepWiki deploys as a **standalone plugin** with no external dependencies (no Re
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │  Pod (replicas: 1-5)                                       │  │
 │  │  - HTTP API (/health, /descriptor, /invoke)               │  │
-│  │  - Wiki Generation (DEEPWIKI_MAX_PARALLEL_WORKERS per pod)│  │
 │  │  - UI Serving                                              │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│                              ▼                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  K8s Jobs (wiki generation)                                │  │
+│  │  - One Job per generation request                         │  │
+│  │  - Cluster-wide concurrency via maxConcurrentJobs         │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                              │                                   │
 │                              ▼                                   │
@@ -78,21 +84,24 @@ See `values.yaml` for the full list of configurable parameters.
 | `image.repository` | Pylon container image | `getcarrier/pylon` |
 | `image.tag` | Pylon image tag | `1.2.7` |
 | `combined.replicaCount` | Number of pod replicas | `1` |
-| `combined.maxParallelWorkers` | Max concurrent wiki generations per pod | `2` |
-| `combined.resources.requests.memory` | Memory request | `4Gi` |
-| `combined.resources.limits.memory` | Memory limit | `8Gi` |
+| `combined.resources.requests.memory` | Memory request | `1536Mi` |
+| `combined.resources.limits.memory` | Memory limit | `2Gi` |
 | `combined.terminationGracePeriodSeconds` | Grace period for generation completion | `3600` |
+| `jobs.enabled` | Enable K8s Jobs-based scaling | `false` |
+| `jobs.maxConcurrentJobs` | Max concurrent generation jobs | `3` |
+| `config.aiRunPlatform.url` | Autoregistration endpoint URL | `""` |
+| `config.aiRunPlatform.token` | Bearer token for registration | `""` |
 | `storage.persistence.enabled` | Enable persistent storage | `true` |
 | `storage.persistence.size` | PVC size | `50Gi` |
 | `podDisruptionBudget.enabled` | Protect running generations | `true` |
 
 ### Sizing Guide
 
-| Repo Size | Memory/Pod | Workers/Pod | Recommended Replicas |
-|-----------|------------|-------------|---------------------|
-| 500 files | 4Gi | 2 | 1 |
-| 3,000 files | 8Gi | 2 | 2 |
-| 10,000 files | 16Gi | 2-3 | 2-3 |
+| Repo Size | Memory (Job) | Max Concurrent Jobs |
+|-----------|--------------|--------------------|
+| 500 files | 2Gi | 3 |
+| 3,000 files | 4Gi | 2 |
+| 10,000 files | 8Gi | 1-2 |
 
 ### DeepWiki Feature Flags
 
@@ -110,6 +119,16 @@ All DeepWiki feature flags are set via the `env` section in `values.yaml`. Key f
 DeepWiki integrates with the Elitea platform (elitea_core) via provider registration:
 
 1. **Provider Registration**: Admin registers DeepWiki in elitea_core with the `service_location_url`
+
+Or enable autoregistration via Helm values:
+
+```yaml
+config:
+  aiRunPlatform:
+    url: "http://elitea-core.elitea.svc.cluster.local/api/v1/providers/register"
+    token: "your-bearer-token"
+```
+
 2. **Health Checks**: elitea_core periodically checks `/health` endpoint
 3. **UI Proxying**: elitea_core proxies UI requests via `/ui_host/deepwiki/ui/<project_id>/`
 4. **Tool Invocation**: Platform calls `/tools/<toolkit>/<tool>/invoke` for wiki generation
@@ -143,16 +162,9 @@ storage:
 
 ### Horizontal Scaling
 
-Each pod manages its own worker slots. Scaling horizontally increases total cluster capacity:
+With Jobs-based scaling enabled, generation capacity is controlled by `jobs.maxConcurrentJobs` regardless of API pod count. API pods handle routing only.
 
-| Replicas | Workers/Pod | Total Concurrent | Memory/Pod | Total Memory |
-|----------|-------------|------------------|------------|--------------|
-| 1 | 2 | 2 | 8Gi | 8Gi |
-| 2 | 2 | 4 | 8Gi | 16Gi |
-| 3 | 2 | 6 | 8Gi | 24Gi |
-| 5 | 3 | 15 | 16Gi | 80Gi |
-
-Enable HPA for automatic scaling:
+Enable HPA for API pod autoscaling:
 
 ```yaml
 combined:
@@ -163,20 +175,21 @@ combined:
     targetMemoryUtilizationPercentage: 75
 ```
 
-### Vertical Scaling
+### Job Resources
 
-Increase resources for larger repositories:
+Configure per-job resources for wiki generation:
 
 ```yaml
-combined:
+jobs:
+  enabled: true
+  maxConcurrentJobs: 3
   resources:
     requests:
-      cpu: 2
-      memory: 8Gi
+      memory: 2Gi
+      cpu: "1"
     limits:
-      cpu: 8
-      memory: 16Gi
-  maxParallelWorkers: 3  # More memory = more workers
+      memory: 8Gi
+      cpu: "4"
 ```
 
 ## Graceful Shutdown

@@ -65,8 +65,6 @@ spec:
               value: {{ .Values.combined.pylonRuntime }}
             - name: PYLON_CONFIG_SEED
               value: file:/data/pylon.yml
-            - name: DEEPWIKI_MAX_PARALLEL_WORKERS
-              value: {{ .Values.combined.maxParallelWorkers | quote }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:

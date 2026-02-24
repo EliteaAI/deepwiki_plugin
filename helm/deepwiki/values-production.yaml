@@ -17,10 +17,6 @@ combined:
       cpu: 8
       memory: 16Gi
   
-  # Allow more parallel generations per pod
-  # With 16GB limit, 3 workers at ~4GB each is safe
-  maxParallelWorkers: 3
-  
   pylonRuntime: gevent
   
   # Long grace period for wiki generation completion

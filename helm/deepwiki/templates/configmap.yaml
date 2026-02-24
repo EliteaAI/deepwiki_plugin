@@ -70,6 +70,23 @@ data:
     # Wiki Builder Plugin Configuration
     service_location_url: {{ include "deepwiki.serviceLocationUrl" . }}
     base_path: {{ .Values.config.basePath }}
+    {{- with .Values.config.aiRunPlatform }}
+    {{- if .url }}
+    ai_run_platform_url: {{ .url }}
+    {{- if .token }}
+    ai_run_platform_token: {{ .token }}
+    {{- end }}
+    {{- if .verify }}
+    ai_run_platform_verify: {{ .verify }}
+    {{- end }}
+    {{- if .timeout }}
+    ai_run_platform_timeout: {{ .timeout | int }}
+    {{- end }}
+    {{- if .delay }}
+    ai_run_platform_delay: {{ .delay | int }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
 
   bootstrap.yml: |
     # Bootstrap plugin configuration

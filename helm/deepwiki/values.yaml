@@ -21,29 +21,19 @@ image:
 imagePullSecrets: []
 
 # =============================================================================
-# Combined Deployment (Recommended - API + Worker in single pod)
-# =============================================================================
-# SCALING STRATEGY: Static Pool (Phase 1)
-# - Multiple pods, 1 worker each = better isolation
-# - Avoids OOM from memory accumulation in single pod
-# - See SCALING_ARCHITECTURE.md for full analysis
+# Deployment Configuration
 # =============================================================================
 combined:
   enabled: true
-  replicaCount: 3  # Minikube dev: 3 pods (6GB limit). Production: 4-8 pods
+  replicaCount: 1
   
   resources:
     requests:
       cpu: 500m
-      memory: 1536Mi  # Dev: 1.5Gi per pod fits in 6GB minikube
+      memory: 1536Mi
     limits:
       cpu: 2000m
-      memory: 2Gi  # Single worker needs ~1.5GB peak + headroom
-  
-  # Max parallel wiki generations per pod
-  # IMPORTANT: Keep at 1 for static pool strategy
-  # Multiple workers per pod = shared memory pressure = OOM risk
-  maxParallelWorkers: 1
+      memory: 2Gi
   
   # Pylon runtime (gevent for async I/O)
   pylonRuntime: gevent
@@ -52,7 +42,7 @@ combined:
   # Wiki generation can take 10-60 minutes for large repos
   terminationGracePeriodSeconds: 3600
 
-  # HPA configuration (scale on memory - primary bottleneck)
+  # HPA configuration
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -98,10 +88,25 @@ config:
   # For production, set to false and use helm upgrade to control updates
   forcePluginUpdate: false
 
+  # Autoregistration with AI/Run platform (optional)
+  # When configured, the plugin registers its provider descriptor on startup
+  aiRunPlatform:
+    url: ""           # Platform registration endpoint URL
+    token: ""         # Bearer token for authentication
+    verify: false     # Verify SSL certificates
+    timeout: 120      # HTTP timeout (seconds) for registration request
+    delay: 2          # Delay (seconds) before registration attempt
+
 # =============================================================================
 # DeepWiki Feature Flags (Environment Variables)
 # =============================================================================
 env:
+  # Search and retrieval
+  DEEPWIKI_ENABLE_FTS5: "1"
+  DEEPWIKI_SMART_EXPANSION: "1"
+  DEEPWIKI_HYBRID_FUSION: "1"
+  DEEPWIKI_ASK_AGENTIC: "1"
+  
   # Structure planner
   DEEPWIKI_STRUCTURE_PLANNER: "deepagents"
   DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK: "1"
@@ -152,14 +157,13 @@ env:
   DEEPWIKI_AUTO_TARGET_DOCS: "1"
 
 # =============================================================================
-# K8s Jobs-Based Scaling (Phase 2)
+# K8s Jobs-Based Scaling
 # =============================================================================
-# When enabled, wiki generation runs as K8s Jobs instead of subprocesses.
-# This provides cluster-wide slot management - the /slots endpoint queries
-# K8s API for active job count instead of per-pod counters.
+# When enabled, wiki generation runs as K8s Jobs.
+# The /slots endpoint queries K8s API for active job count.
 #
 # Benefits:
-# - Users see true cluster-wide availability
+# - Cluster-wide slot management and availability
 # - Proper resource isolation per generation
 # - Better observability via K8s native tooling
 # - Scales independently of API pods
@@ -172,7 +176,6 @@ jobs:
   enabled: false  # Set to true to enable Jobs-based scaling
   
   # Maximum concurrent Jobs cluster-wide
-  # This replaces combined.maxParallelWorkers for Jobs mode
   maxConcurrentJobs: 3
   
   # TTL for completed Jobs (seconds)

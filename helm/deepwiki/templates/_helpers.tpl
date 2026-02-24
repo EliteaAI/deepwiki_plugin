@@ -83,15 +83,3 @@ Return the PVC name
 {{- end }}
 {{- end }}
 
-{{/*
-Determine deployment mode
-*/}}
-{{- define "deepwiki.mode" -}}
-{{- if and .Values.api.enabled .Values.worker.enabled }}
-{{- "split" }}
-{{- else if .Values.combined.enabled }}
-{{- "combined" }}
-{{- else }}
-{{- "combined" }}
-{{- end }}
-{{- end }}

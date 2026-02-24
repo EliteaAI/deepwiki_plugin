@@ -18,4 +18,3 @@ keywords:
   - ai
 
 # No dependencies - standalone plugin deployment
-# Redis/queue infrastructure is not included; each pod manages its own worker limits
