@@ -2,3 +2,7 @@
 /.cadence/
 /.idea
 /envs/override.env
+/pylon_deepwiki/cache/*
+/pylon_deepwiki/requirements/*
+/pylon_deepwiki/plugins/*
+/pylon_deepwiki/wiki_builder/*
