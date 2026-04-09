@@ -71,7 +71,7 @@ leidenalg==0.11.0
 # NOTE: sqlite-vec 0.1.6 aarch64 wheel is broken (ships 32-bit ARM .so).
 # On Apple Silicon Docker (linux/aarch64) vec will fail to load.
 # Works fine on x86_64 (production) and macOS native (via pysqlite3).
-sqlite-vec==0.1.6
+sqlite-vec==0.1.9
 pysqlite3==0.6.0
 
 # --- GitHub integration -----------------------------------------
