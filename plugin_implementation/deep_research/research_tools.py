@@ -256,7 +256,7 @@ def _get_unified_db_relationships(db_path: str, symbol_name: str,
 
         # Outgoing edges
         outgoing = conn.execute(
-            "SELECT e.target_id, e.relationship_type, n.symbol_name, n.symbol_type "
+            "SELECT e.target_id, e.rel_type, n.symbol_name, n.symbol_type "
             "FROM repo_edges e "
             "JOIN repo_nodes n ON n.node_id = e.target_id "
             "WHERE e.source_id = ? "
@@ -266,7 +266,7 @@ def _get_unified_db_relationships(db_path: str, symbol_name: str,
 
         # Incoming edges
         incoming = conn.execute(
-            "SELECT e.source_id, e.relationship_type, n.symbol_name, n.symbol_type "
+            "SELECT e.source_id, e.rel_type, n.symbol_name, n.symbol_type "
             "FROM repo_edges e "
             "JOIN repo_nodes n ON n.node_id = e.source_id "
             "WHERE e.target_id = ? "
