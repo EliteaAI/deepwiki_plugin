@@ -301,22 +301,61 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             canonical_repo_identifier = repo_identifier
 
-        # Load vector store
-        _print("Loading vector store...")
-        vectorstore_manager = VectorStoreManager(
-            cache_dir=cache_dir,
-            model_cache_dir=model_cache_dir,
-            embeddings=embeddings
-        )
-        vectorstore = vectorstore_manager.load_by_repo_name(canonical_repo_identifier)
-        if vectorstore is None:
-            return {
-                "success": False,
-                "error": f"No wiki index found for {repo_identifier}. Please generate a wiki first."
-            }
-        _print(f"Vector store loaded with {vectorstore.index.ntotal} vectors")
+        # Phase 6: Check for unified DB mode before loading legacy indexes
+        _unified_retriever_enabled = os.environ.get('DEEPWIKI_UNIFIED_RETRIEVER', '0') == '1'
+        _unified_retriever_active = False
+        retriever_stack = None
 
-        # Load relationship graph
+        if _unified_retriever_enabled:
+            try:
+                import glob as _glob
+                from .unified_retriever import UnifiedRetriever
+                from .unified_db import UnifiedWikiDB
+
+                _udb_path = None
+                _all_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
+                if _all_dbs:
+                    _all_dbs.sort(key=os.path.getmtime, reverse=True)
+                    _udb_path = _all_dbs[0]
+
+                if _udb_path and os.path.isfile(_udb_path):
+                    _udb = UnifiedWikiDB(_udb_path, readonly=True)
+                    _embed_fn = None
+                    if embeddings and hasattr(embeddings, 'embed_query'):
+                        _embed_fn = embeddings.embed_query
+                    retriever_stack = UnifiedRetriever(
+                        db=_udb,
+                        embedding_fn=_embed_fn,
+                        embeddings=embeddings,
+                    )
+                    _unified_retriever_active = True
+                    _print(f"[UNIFIED_RETRIEVER] Agentic Ask using UnifiedRetriever from {_udb_path}")
+                else:
+                    _print("[UNIFIED_RETRIEVER] No .wiki.db found — falling back to legacy retriever")
+            except Exception as _ur_exc:
+                _print(f"[UNIFIED_RETRIEVER] Upgrade failed, using legacy: {_ur_exc}")
+
+        # Load vector store (skip hard failure when UnifiedRetriever is active)
+        vectorstore_manager = None
+        vectorstore = None
+        if not _unified_retriever_active:
+            _print("Loading vector store...")
+            vectorstore_manager = VectorStoreManager(
+                cache_dir=cache_dir,
+                model_cache_dir=model_cache_dir,
+                embeddings=embeddings
+            )
+            vectorstore = vectorstore_manager.load_by_repo_name(canonical_repo_identifier)
+            if vectorstore is None:
+                return {
+                    "success": False,
+                    "error": f"No wiki index found for {repo_identifier}. Please generate a wiki first."
+                }
+            _print(f"Vector store loaded with {vectorstore.index.ntotal} vectors")
+        else:
+            _print("[UNIFIED_RETRIEVER] Skipping legacy FAISS vectorstore loading")
+
+        # Load relationship graph (always try — progressive tools benefit from it)
         _print("Loading relationship graph...")
         graph_manager = GraphManager(cache_dir=cache_dir)
         relationship_graph = graph_manager.load_graph_by_repo_name(canonical_repo_identifier)
@@ -325,7 +364,7 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _print("No relationship graph found — proceeding without graph analysis")
 
-        # Load FTS5 index
+        # Load FTS5 index (always try — progressive tools benefit from it)
         try:
             fts_result = graph_manager.load_fts_index_by_repo_name(canonical_repo_identifier)
             if fts_result is not None:
@@ -354,13 +393,14 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _print("No repository analysis found")
 
-        # Initialize retriever stack
-        _print("Initializing retriever stack...")
-        retriever_stack = WikiRetrieverStack(
-            vectorstore_manager=vectorstore_manager,
-            relationship_graph=relationship_graph,
-            use_enhanced_graph=True
-        )
+        # Initialize retriever stack (legacy fallback if UnifiedRetriever not active)
+        if retriever_stack is None:
+            _print("Initializing legacy retriever stack...")
+            retriever_stack = WikiRetrieverStack(
+                vectorstore_manager=vectorstore_manager,
+                relationship_graph=relationship_graph,
+                use_enhanced_graph=True
+            )
 
         # Build repo analysis dict
         repo_analysis_dict = {"summary": repository_analysis} if repository_analysis else None
