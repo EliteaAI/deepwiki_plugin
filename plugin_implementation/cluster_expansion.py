@@ -35,7 +35,22 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from langchain_core.documents import Document
 
+from .code_graph.shared_expansion import expand_symbol_smart
+from .feature_flags import get_feature_flags
+from .wiki_structure_planner.language_heuristics import (
+    detect_dominant_language,
+    get_language_hints,
+    should_include_in_expansion,
+    compute_augmentation_budget_fraction,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _is_excluded_test_node(node: Dict[str, Any], exclude_tests: bool) -> bool:
+    """Return True if *node* should be skipped because it's a test node."""
+    return exclude_tests and bool(node.get("is_test"))
+
 
 # Languages that support header/implementation split augmentation.
 # Values must match what graph_builder.SUPPORTED_LANGUAGES stores in
@@ -286,6 +301,7 @@ def expand_for_page(
     page_symbols: List[str],
     macro_id: Optional[int] = None,
     micro_id: Optional[int] = None,
+    cluster_node_ids: Optional[List[str]] = None,
     token_budget: int = DEFAULT_TOKEN_BUDGET,
     include_docs: bool = True,
 ) -> List[Document]:
@@ -302,7 +318,12 @@ def expand_for_page(
         Macro-cluster ID for boundary enforcement.  When set, expansion
         neighbours are restricted to this cluster.
     micro_id : int, optional
-        Micro-cluster ID for tighter scoping (rarely needed).
+        Micro-cluster ID for tighter scoping.
+    cluster_node_ids : list[str], optional
+        Authoritative page membership from ``PageSpec.metadata``.
+        When provided, expansion neighbours are restricted to this
+        exact set of node IDs (page boundary), with fallback to
+        macro_id for nodes not in the set.
     token_budget : int
         Maximum estimated tokens for the returned documents.
     include_docs : bool
@@ -323,6 +344,14 @@ def expand_for_page(
 
     # ── Step 1: Resolve symbol names to node_ids ─────────────────
     matched_nodes = _resolve_symbols(db, page_symbols, macro_id)
+
+    # Drop test nodes when exclude_tests is enabled
+    flags = get_feature_flags()
+    if flags.exclude_tests:
+        matched_nodes = {
+            nid: n for nid, n in matched_nodes.items()
+            if not n.get("is_test")
+        }
 
     if not matched_nodes:
         logger.warning(
@@ -372,30 +401,88 @@ def expand_for_page(
         )
 
     # ── Step 3: 1-hop expansion within cluster boundary ──────────
-    expansion_pool = _collect_expansion_neighbors(
-        db, list(matched_nodes.keys()), seen_ids, macro_id,
-    )
+    #    When cluster_node_ids is provided, use it as the authoritative
+    #    page boundary (Phase 2 fix).  Fall back to macro_id boundary.
+    page_boundary_ids = set(cluster_node_ids) if cluster_node_ids else None
 
-    for priority_group in (_P0_REL_TYPES, _P1_REL_TYPES, _P2_REL_TYPES):
-        if budget_remaining <= 0:
-            break
-        group_nodes = [
-            (nid, node, rel) for nid, node, rel in expansion_pool
-            if rel in priority_group and nid not in seen_ids
-        ]
-        for nid, node, rel in group_nodes:
+    flags = get_feature_flags()
+
+    if flags.smart_expansion:
+        # ── Phase 4: Per-symbol-type smart expansion ─────────────
+        conn = db.conn
+
+        # ── Phase 7: Language hints (optional) ───────────────────
+        lang_hints = None
+        if flags.language_hints:
+            seed_ids_for_lang = list(matched_nodes.keys())[:50]
+            dominant_lang = detect_dominant_language(conn, seed_ids_for_lang)
+            if dominant_lang:
+                lang_hints = get_language_hints(dominant_lang)
+                logger.info(
+                    "[CLUSTER_EXPANSION] Language hints: %s (dominant=%s)",
+                    lang_hints.language, dominant_lang,
+                )
+
+        extra_rels = frozenset(lang_hints.extra_expansion_rels) if lang_hints else frozenset()
+
+        for seed_id in list(matched_nodes.keys()):
             if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
                 break
-            doc = _node_to_document(node, is_initial=False, expanded_from=rel)
-            # Augment expansion nodes too (C++ class expanded via inheritance
-            # should also show its implementations)
-            aug_cost = _augment_document(db, doc)
-            cost = _estimate_tokens(doc.page_content)
-            if cost > budget_remaining:
-                continue  # skip large node, try smaller ones
-            result_docs.append(doc)
-            seen_ids.add(nid)
-            budget_remaining -= cost
+            seed_node = matched_nodes[seed_id]
+            seed_type = (seed_node.get("symbol_type") or "").lower()
+            neighbors = expand_symbol_smart(
+                conn, seed_id, seed_type, seen_ids,
+                page_boundary_ids=page_boundary_ids,
+                macro_id=macro_id,
+                per_symbol_budget=MAX_NEIGHBORS_PER_SYMBOL,
+                extra_rel_types=extra_rels,
+            )
+            for nid, node, reason in neighbors:
+                if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
+                    break
+                if nid in seen_ids:
+                    continue
+
+                # Phase 7: Language-aware filtering
+                if lang_hints:
+                    n_type = (node.get("symbol_type") or "").lower()
+                    n_path = node.get("rel_path") or ""
+                    if not should_include_in_expansion(lang_hints, n_type, n_path):
+                        continue
+
+                doc = _node_to_document(node, is_initial=False, expanded_from=reason)
+                aug_cost = _augment_document(db, doc)
+                cost = _estimate_tokens(doc.page_content)
+                if cost > budget_remaining:
+                    continue
+                result_docs.append(doc)
+                seen_ids.add(nid)
+                budget_remaining -= cost
+    else:
+        # ── Legacy: generic 1-hop expansion ──────────────────────
+        expansion_pool = _collect_expansion_neighbors(
+            db, list(matched_nodes.keys()), seen_ids, macro_id,
+            page_boundary_ids=page_boundary_ids,
+        )
+
+        for priority_group in (_P0_REL_TYPES, _P1_REL_TYPES, _P2_REL_TYPES):
+            if budget_remaining <= 0:
+                break
+            group_nodes = [
+                (nid, node, rel) for nid, node, rel in expansion_pool
+                if rel in priority_group and nid not in seen_ids
+            ]
+            for nid, node, rel in group_nodes:
+                if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
+                    break
+                doc = _node_to_document(node, is_initial=False, expanded_from=rel)
+                aug_cost = _augment_document(db, doc)
+                cost = _estimate_tokens(doc.page_content)
+                if cost > budget_remaining:
+                    continue
+                result_docs.append(doc)
+                seen_ids.add(nid)
+                budget_remaining -= cost
 
     # ── Step 4: Include cluster doc nodes (if budget allows) ─────
     if include_docs and macro_id is not None and budget_remaining > 0:
@@ -515,8 +602,13 @@ def _collect_expansion_neighbors(
     seed_ids: List[str],
     seen_ids: Set[str],
     macro_id: Optional[int] = None,
+    page_boundary_ids: Optional[Set[str]] = None,
 ) -> List[Tuple[str, Dict[str, Any], str]]:
     """Collect 1-hop expansion neighbours for *seed_ids*, bounded to cluster.
+
+    When *page_boundary_ids* is provided, only neighbours whose node_id
+    is in that set are included (page-level boundary).  Otherwise, falls
+    back to macro-cluster boundary via *macro_id*.
 
     Returns list of ``(node_id, node_dict, rel_type)`` tuples sorted by
     edge weight (descending, i.e. highest-weight edges first).
@@ -571,11 +663,18 @@ def _collect_expansion_neighbors(
             # Only expand architectural nodes
             if not node.get("is_architectural"):
                 continue
+            # Skip test nodes when exclude_tests is enabled
+            if _is_excluded_test_node(node, get_feature_flags().exclude_tests):
+                continue
             stype = (node.get("symbol_type") or "").lower()
             if stype not in EXPANSION_SYMBOL_TYPES:
                 continue
             # Cluster boundary enforcement
-            if macro_id is not None and node.get("macro_cluster") != macro_id:
+            if page_boundary_ids is not None:
+                # Page-level boundary: only include neighbours in the page
+                if nid not in page_boundary_ids:
+                    continue
+            elif macro_id is not None and node.get("macro_cluster") != macro_id:
                 continue
             candidates.append((nid, node, rel_type, weight))
 
@@ -624,8 +723,10 @@ def _get_cluster_docs(
         ).fetchall()
 
     result = []
+    exclude = get_feature_flags().exclude_tests
     for r in rows:
         node = dict(r)
         if node.get("node_id", "") not in seen_ids:
-            result.append(node)
+            if not _is_excluded_test_node(node, exclude):
+                result.append(node)
     return result

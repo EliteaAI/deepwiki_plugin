@@ -41,6 +41,7 @@ import logging
 import math
 import os
 import re
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -57,6 +58,12 @@ except ImportError:
     _HAS_NUMPY = False
 
 
+# Weight floor for synthetic edges (orphan resolution, doc injection).
+# Equivalent to a structural edge pointing at a node with in-degree ~5.
+# Ensures these edges are strong enough for Leiden to group on.
+SYNTHETIC_WEIGHT_FLOOR = 0.5
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Inverse In-Degree Edge Weighting
 # ═══════════════════════════════════════════════════════════════════════════
@@ -68,9 +75,15 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
 
         weight = 1 / log(InDegree(v) + 2)
 
-    Edges pointing at high-fan-in targets (loggers, base classes, config
-    singletons) get near-zero weight. Edges pointing at low-fan-in
-    capability nodes keep weight ≈ 1.0.
+    **In-degree is computed from structural edges only** — synthetic edges
+    injected by orphan resolution (``directory_link``, ``lexical_link``,
+    ``semantic_link``) and doc edges are excluded from the degree count.
+    This prevents orphan anchors from having their genuine structural
+    edges crushed by inflated in-degree.
+
+    Synthetic edges receive a **weight floor** of ``SYNTHETIC_WEIGHT_FLOOR``
+    so that Leiden treats them as meaningful community signals rather than
+    noise.
 
     Returns:
         Stats dict with min/max/mean weight and distribution info.
@@ -78,24 +91,44 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
     if G.number_of_edges() == 0:
         return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
-    in_degrees = dict(G.in_degree())
+    # Compute in-degree using ONLY structural edges (AST-derived).
+    # Synthetic edges (orphan resolution, doc injection) are excluded
+    # so they don't inflate anchor degrees and crush real edges.
+    _SYNTHETIC_CLASSES = frozenset({"directory", "lexical", "semantic", "doc", "bridge"})
+    structural_in: Dict[str, int] = {}
+    for _u, v, data in G.edges(data=True):
+        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
+            continue
+        structural_in[v] = structural_in.get(v, 0) + 1
 
     weights = []
+    synthetic_count = 0
     for u, v, key, data in G.edges(data=True, keys=True):
-        w = 1.0 / math.log(in_degrees.get(v, 0) + 2)
+        in_deg = structural_in.get(v, 0)
+        w = 1.0 / math.log(in_deg + 2)
+
+        # Synthetic recovery edges get a weight floor so Leiden
+        # actually groups orphan nodes with their anchors.
+        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
+            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+            synthetic_count += 1
+
         data["weight"] = w
         weights.append(w)
 
     stats = {
         "edges_weighted": len(weights),
+        "synthetic_floored": synthetic_count,
         "min": round(min(weights), 4),
         "max": round(max(weights), 4),
         "mean": round(sum(weights) / len(weights), 4),
     }
 
     logger.info(
-        "Edge weighting complete: %d edges, weight range [%.4f, %.4f], mean %.4f",
-        stats["edges_weighted"], stats["min"], stats["max"], stats["mean"],
+        "Edge weighting complete: %d edges (%d synthetic floored at %.2f), "
+        "weight range [%.4f, %.4f], mean %.4f",
+        stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
+        stats["min"], stats["max"], stats["mean"],
     )
     return stats
 
@@ -231,6 +264,86 @@ def find_orphans(G: nx.MultiDiGraph) -> List[str]:
     ]
 
 
+def _resolve_orphans_by_directory(
+    db,
+    G: nx.MultiDiGraph,
+    orphan_ids: List[str],
+) -> int:
+    """Connect remaining orphans to the best anchor in same/parent directory.
+
+    For each orphan:
+    1. Look up its ``rel_path`` from the DB.
+    2. Walk up the directory tree (same dir → parent → grandparent → root).
+    3. At each level, find the connected (non-orphan) node with the
+       highest total degree — the best "anchor" to attach to.
+    4. Add a ``directory_link`` edge (orphan → anchor).
+
+    This is the last-resort fallback when semantic embeddings are
+    unavailable.  It ensures that files in the same directory end up
+    in the same Leiden community rather than creating thousands of
+    singleton components.
+
+    Returns:
+        Number of edges added.
+    """
+    if not orphan_ids:
+        return 0
+
+    orphan_set = set(orphan_ids)
+
+    # Build directory → [(node_id, total_degree)] for NON-orphan nodes
+    dir_index: Dict[str, List[Tuple[str, int]]] = {}
+    for nid, data in G.nodes(data=True):
+        if nid in orphan_set:
+            continue
+        rp = data.get("rel_path", "")
+        if not rp:
+            row = db.get_node(nid)
+            rp = row.get("rel_path", "") if row else ""
+        if not rp:
+            continue
+        d = os.path.dirname(rp).replace("\\", "/") or "<root>"
+        deg = G.in_degree(nid) + G.out_degree(nid)
+        dir_index.setdefault(d, []).append((nid, deg))
+
+    # Sort each directory bucket by degree descending (best anchors first)
+    for d in dir_index:
+        dir_index[d].sort(key=lambda x: x[1], reverse=True)
+
+    edges_added = 0
+
+    for orphan_id in orphan_ids:
+        node = db.get_node(orphan_id)
+        if not node:
+            continue
+        rp = node.get("rel_path", "")
+        if not rp:
+            continue
+
+        # Walk up the directory tree
+        for prefix in _expanding_prefixes(rp):
+            d = prefix if prefix else "<root>"
+            candidates = dir_index.get(d, [])
+            if candidates:
+                anchor_id = candidates[0][0]  # highest-degree node
+                _add_edge(
+                    db, G,
+                    source=orphan_id,
+                    target=anchor_id,
+                    rel_type="directory_link",
+                    edge_class="directory",
+                    created_by="dir_proximity_fallback",
+                )
+                edges_added += 1
+                break  # resolved — stop climbing
+
+    logger.info(
+        "Directory proximity fallback: %d/%d orphans connected",
+        edges_added, len(orphan_ids),
+    )
+    return edges_added
+
+
 def resolve_orphans(
     db,
     G: nx.MultiDiGraph,
@@ -274,6 +387,7 @@ def resolve_orphans(
         "orphan_count": len(orphans),
         "lexical_edges_added": 0,
         "semantic_edges_added": 0,
+        "directory_edges_added": 0,
         "orphans_resolved": 0,
         "orphans_remaining": 0,
     }
@@ -354,13 +468,25 @@ def resolve_orphans(
         if resolved:
             stats["orphans_resolved"] += 1
 
-    stats["orphans_remaining"] = stats["orphan_count"] - stats["orphans_resolved"]
+    # ── Pass 3: Directory proximity fallback ─────────────────────
+    # For orphans still unresolved after lexical & vector passes,
+    # connect to the highest-degree non-orphan in the same or
+    # parent directory.  This is the last-resort fallback when
+    # embeddings are unavailable (e.g. sqlite-vec ELF mismatch).
+    remaining = find_orphans(G)
+    if remaining:
+        dir_edges = _resolve_orphans_by_directory(db, G, remaining)
+        stats["directory_edges_added"] = dir_edges
+        stats["orphans_resolved"] += dir_edges  # 1 edge = 1 resolved
+
+    stats["orphans_remaining"] = len(find_orphans(G))
 
     logger.info(
         "Orphan resolution complete: %d/%d resolved "
-        "(%d lexical + %d semantic edges added), %d remaining",
+        "(%d lexical + %d semantic + %d directory edges), %d remaining",
         stats["orphans_resolved"], stats["orphan_count"],
         stats["lexical_edges_added"], stats["semantic_edges_added"],
+        stats["directory_edges_added"],
         stats["orphans_remaining"],
     )
 
@@ -727,6 +853,119 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 4b. Component Bridging — connect disconnected components
+# ═══════════════════════════════════════════════════════════════════════════
+
+def bridge_disconnected_components(
+    db,
+    G: nx.MultiDiGraph,
+) -> Dict[str, Any]:
+    """Connect disconnected components via directory-proximity bridge edges.
+
+    After orphan resolution and doc edge injection, the graph may still
+    contain many small disconnected components — clusters of 2+ nodes
+    with internal edges but no edges to the rest of the graph.  Leiden
+    produces at minimum one community per connected component regardless
+    of the resolution parameter, so bridging is essential.
+
+    Algorithm:
+    1. Find all weakly connected components.
+    2. Sort largest-first.
+    3. For each non-largest component, find the most directory-similar
+       larger (earlier) component using min-intersection of directory
+       histograms.
+    4. Add a lightweight bridge edge between each pair's highest-degree
+       representative nodes.
+
+    Bridge edges get ``edge_class='bridge'`` so the weighting step
+    treats them as synthetic (excluded from structural in-degree and
+    floored at ``SYNTHETIC_WEIGHT_FLOOR``).
+
+    Mutates *G* in place and persists edges to *db*.
+
+    Returns:
+        Stats dict with component counts and bridges added.
+    """
+    components = list(nx.weakly_connected_components(G))
+    n_before = len(components)
+
+    stats = {
+        "components_before": n_before,
+        "components_after": n_before,
+        "bridges_added": 0,
+    }
+
+    if n_before <= 1:
+        logger.info("Component bridging: graph is fully connected (1 component)")
+        return stats
+
+    # Sort largest-first so index 0 is the biggest component
+    components.sort(key=len, reverse=True)
+
+    # Build directory histogram for each component
+    def _dir_hist(comp):
+        c: Counter = Counter()
+        for nid in comp:
+            data = G.nodes.get(nid, {})
+            rp = data.get("rel_path") or data.get("file_name") or ""
+            d = rp.rsplit("/", 1)[0] if "/" in rp else "<root>"
+            c[d] += 1
+        return c
+
+    comp_dirs = [_dir_hist(comp) for comp in components]
+
+    # Representative node per component (highest total degree)
+    comp_reps = [
+        max(comp, key=lambda n: G.in_degree(n) + G.out_degree(n))
+        for comp in components
+    ]
+
+    def _dir_sim(a: Counter, b: Counter) -> int:
+        return sum(min(a[d], b[d]) for d in a if d in b)
+
+    bridges_added = 0
+    for i in range(1, n_before):
+        # Find the most directory-similar earlier (larger) component
+        best_target = 0
+        best_sim = _dir_sim(comp_dirs[i], comp_dirs[0])
+
+        for j in range(1, i):
+            sim = _dir_sim(comp_dirs[i], comp_dirs[j])
+            if sim > best_sim:
+                best_sim = sim
+                best_target = j
+
+        src = comp_reps[i]
+        dst = comp_reps[best_target]
+
+        # Bidirectional bridge edge
+        _add_edge(
+            db, G, source=src, target=dst,
+            rel_type="component_bridge",
+            edge_class="bridge",
+            created_by="component_bridging",
+        )
+        _add_edge(
+            db, G, source=dst, target=src,
+            rel_type="component_bridge",
+            edge_class="bridge",
+            created_by="component_bridging",
+        )
+        bridges_added += 2
+
+    n_after = nx.number_weakly_connected_components(G)
+    stats["components_after"] = n_after
+    stats["bridges_added"] = bridges_added
+
+    logger.info(
+        "Component bridging: %d → %d components (%d bridge edges added)",
+        n_before, n_after, bridges_added,
+    )
+
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 5. Orchestrator — run full Phase 2 pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -739,12 +978,13 @@ def run_phase2(
 ) -> Dict[str, Any]:
     """Execute the complete Phase 2 pipeline on a graph + unified DB.
 
-    Steps (corrected order — 7E):
+    Steps (corrected order — 7F):
         1. Resolve orphans (FTS5 lexical + vector semantic)
         2. Inject doc edges (hyperlink + proximity)
-        3. Apply inverse in-degree edge weights on ALL edges
-        4. Detect and flag hubs on complete degree distribution
-        5. Persist final weights back to DB
+        3. Bridge disconnected components (directory proximity)
+        4. Apply inverse in-degree edge weights on ALL edges
+        5. Detect and flag hubs on complete degree distribution
+        6. Persist final weights back to DB
 
     Args:
         db: ``UnifiedWikiDB`` instance (already populated by Phase 1).
@@ -769,10 +1009,14 @@ def run_phase2(
     # Step 2: Doc edge injection (hyperlink + proximity)
     results["doc_edges"] = inject_doc_edges(db, G)
 
-    # Step 3: Edge weighting — on ALL edges (structural + semantic + lexical + doc)
+    # Step 3: Bridge disconnected components — BEFORE weighting so
+    # bridge edges receive proper weights in step 4.
+    results["component_bridging"] = bridge_disconnected_components(db, G)
+
+    # Step 4: Edge weighting — on ALL edges (structural + semantic + lexical + doc + bridge)
     results["weighting"] = apply_edge_weights(G)
 
-    # Step 4: Hub detection — on complete degree distribution
+    # Step 5: Hub detection — on complete degree distribution
     hubs = detect_hubs(G, z_threshold=z_threshold)
     flag_hubs_in_db(db, hubs)
     results["hubs"] = {
@@ -780,7 +1024,7 @@ def run_phase2(
         "node_ids": sorted(hubs)[:20],  # Cap at 20 for readability
     }
 
-    # Step 5: Persist weights
+    # Step 6: Persist weights
     results["edges_persisted"] = persist_weights_to_db(db, G)
 
     # Store phase 2 metadata
@@ -789,9 +1033,11 @@ def run_phase2(
 
     logger.info(
         "Phase 2 complete: %d orphans resolved, %d doc edges injected, "
-        "%d edges weighted, %d hubs, %d edges persisted",
+        "%d→%d components bridged, %d edges weighted, %d hubs, %d edges persisted",
         results["orphan_resolution"]["orphans_resolved"],
         results["doc_edges"].get("total_edges_added", 0),
+        results["component_bridging"]["components_before"],
+        results["component_bridging"]["components_after"],
         results["weighting"]["edges_weighted"],
         results["hubs"]["count"],
         results["edges_persisted"],

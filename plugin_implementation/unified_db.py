@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS repo_nodes (
     -- Classification
     is_architectural INTEGER DEFAULT 0,
     is_doc           INTEGER DEFAULT 0,
+    is_test          INTEGER DEFAULT 0,
     chunk_type       TEXT DEFAULT NULL,
 
     -- Clustering (Phase 3 — pre-populated as NULL)
@@ -140,6 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_parent     ON repo_nodes(parent_symbol);
 CREATE INDEX IF NOT EXISTS idx_nodes_macro      ON repo_nodes(macro_cluster);
 CREATE INDEX IF NOT EXISTS idx_nodes_micro      ON repo_nodes(macro_cluster, micro_cluster);
 CREATE INDEX IF NOT EXISTS idx_nodes_arch       ON repo_nodes(is_architectural) WHERE is_architectural = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_test       ON repo_nodes(is_test) WHERE is_test = 1;
 CREATE INDEX IF NOT EXISTS idx_nodes_hub        ON repo_nodes(is_hub) WHERE is_hub = 1;
 """
 
@@ -215,7 +217,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS repo_vec USING vec0(
 # Architectural symbols — shared with graph_builder
 # ═══════════════════════════════════════════════════════════════════════════
 try:
-    from .constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES
+    from .constants import ARCHITECTURAL_SYMBOLS, DOC_SYMBOL_TYPES, is_test_path
 except ImportError:
     ARCHITECTURAL_SYMBOLS = {
         'class', 'interface', 'struct', 'enum', 'trait',
@@ -223,6 +225,9 @@ except ImportError:
         'module_doc', 'file_doc',
     }
     DOC_SYMBOL_TYPES = {'module_doc', 'file_doc'}
+
+    def is_test_path(rel_path: str) -> bool:  # noqa: D103
+        return False
 
 # Legacy symbol types used by graph_builder (pre-constants.py centralization)
 # These coexist with the *_document types in DOC_SYMBOL_TYPES from constants.py
@@ -325,6 +330,7 @@ class UnifiedWikiDB:
         """Create all tables and indexes (idempotent)."""
         cur = self.conn.cursor()
         cur.executescript(_SCHEMA_NODES)
+        self._migrate_schema()          # add missing columns before indexes
         cur.executescript(_SCHEMA_NODES_INDEXES)
         cur.executescript(_SCHEMA_EDGES)
         cur.executescript(_SCHEMA_EDGES_INDEXES)
@@ -341,6 +347,68 @@ class UnifiedWikiDB:
                 self._vec_available = False
 
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Schema migrations — add columns missing from older DBs
+    # ------------------------------------------------------------------
+
+    def _migrate_schema(self) -> None:
+        """Apply incremental schema migrations for pre-existing DBs."""
+        existing = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(repo_nodes)").fetchall()
+        }
+
+        if "is_test" not in existing:
+            logger.info("Migrating repo_nodes: adding is_test column")
+            self.conn.execute(
+                "ALTER TABLE repo_nodes ADD COLUMN is_test INTEGER DEFAULT 0"
+            )
+            self._backfill_is_test()
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_test "
+                "ON repo_nodes(is_test) WHERE is_test = 1"
+            )
+            self.conn.commit()
+        else:
+            # Column exists but may have stale values (added before backfill).
+            # Check for nodes in test paths that are still is_test=0.
+            stale = self.conn.execute(
+                "SELECT count(*) FROM repo_nodes "
+                "WHERE is_test = 0 AND ("
+                "  rel_path GLOB 'test/*' OR rel_path GLOB 'tests/*' "
+                "  OR rel_path GLOB '*/test/*' OR rel_path GLOB '*/tests/*'"
+                ")"
+            ).fetchone()[0]
+            if stale > 0:
+                logger.info(
+                    "Found %d nodes in test paths with stale is_test=0, re-running backfill",
+                    stale,
+                )
+                self._backfill_is_test()
+                self.conn.commit()
+
+    def _backfill_is_test(self) -> None:
+        """Set ``is_test = 1`` for all nodes whose ``rel_path`` matches test heuristics."""
+        rows = self.conn.execute(
+            "SELECT node_id, rel_path FROM repo_nodes"
+        ).fetchall()
+        if not rows:
+            return
+        updates = [
+            (r["node_id"],)
+            for r in rows
+            if is_test_path(r["rel_path"] or "")
+        ]
+        if updates:
+            self.conn.executemany(
+                "UPDATE repo_nodes SET is_test = 1 WHERE node_id = ?",
+                updates,
+            )
+            logger.info(
+                "Backfilled is_test=1 for %d / %d nodes",
+                len(updates), len(rows),
+            )
 
     # ------------------------------------------------------------------
     # Context manager / cleanup
@@ -385,14 +453,14 @@ class UnifiedWikiDB:
             start_line, end_line,
             symbol_name, symbol_type, parent_symbol, analysis_level,
             source_text, docstring, signature, parameters, return_type,
-            is_architectural, is_doc, chunk_type,
+            is_architectural, is_doc, is_test, chunk_type,
             macro_cluster, micro_cluster, is_hub, hub_assignment
         ) VALUES (
             :node_id, :rel_path, :file_name, :language,
             :start_line, :end_line,
             :symbol_name, :symbol_type, :parent_symbol, :analysis_level,
             :source_text, :docstring, :signature, :parameters, :return_type,
-            :is_architectural, :is_doc, :chunk_type,
+            :is_architectural, :is_doc, :is_test, :chunk_type,
             :macro_cluster, :micro_cluster, :is_hub, :hub_assignment
         )
         """
@@ -408,6 +476,9 @@ class UnifiedWikiDB:
             is_arch = 1 if (symbol_type in ARCHITECTURAL_SYMBOLS or symbol_type in _LEGACY_DOC_TYPES or _is_doc_symbol(symbol_type)) else 0
             is_doc = 1 if _is_doc_symbol(symbol_type) else 0
 
+            rel_path = n.get("rel_path", "")
+            is_test = 1 if is_test_path(rel_path) else 0
+
             # parameters can be a list — serialize to JSON
             params = n.get("parameters", "")
             if isinstance(params, (list, tuple)):
@@ -415,7 +486,7 @@ class UnifiedWikiDB:
 
             rows.append({
                 "node_id":         n["node_id"],
-                "rel_path":        n.get("rel_path", ""),
+                "rel_path":        rel_path,
                 "file_name":       n.get("file_name", ""),
                 "language":        n.get("language", ""),
                 "start_line":      n.get("start_line", 0),
@@ -431,6 +502,7 @@ class UnifiedWikiDB:
                 "return_type":     n.get("return_type", ""),
                 "is_architectural": is_arch,
                 "is_doc":          is_doc,
+                "is_test":         is_test,
                 "chunk_type":      n.get("chunk_type"),
                 "macro_cluster":   n.get("macro_cluster"),
                 "micro_cluster":   n.get("micro_cluster"),
@@ -961,6 +1033,11 @@ class UnifiedWikiDB:
         an ``nx.MultiDiGraph``, and we mirror it into SQLite for unified
         search and persistence.
 
+        Stale-node cleanup: after importing, any rows left in ``repo_nodes``
+        whose ``node_id`` is NOT in the incoming graph are deleted.  This
+        prevents phantom nodes from previous runs (the DB file is cached)
+        from leaking stale cluster assignments into later phases.
+
         Performance: Uses ``executemany`` with batching (5000 rows) and
         deferred FTS5 population for speed.
         """
@@ -977,10 +1054,12 @@ class UnifiedWikiDB:
         # --- Nodes ---
         BATCH = 5000
         node_batch: List[Dict[str, Any]] = []
+        imported_ids: set = set()
 
         for node_id, data in G.nodes(data=True):
             node_dict = self._nx_node_to_dict(node_id, data)
             node_batch.append(node_dict)
+            imported_ids.add(node_id)
 
             if len(node_batch) >= BATCH:
                 self._upsert_nodes_batch(node_batch)
@@ -992,6 +1071,35 @@ class UnifiedWikiDB:
         self.conn.commit()
         t_nodes = time.time() - t0
         logger.info("Imported %d nodes in %.1fs", G.number_of_nodes(), t_nodes)
+
+        # --- Purge stale nodes from previous runs ---
+        # The DB file is cached on disk; INSERT OR REPLACE only touches
+        # matching node_ids, so rows from a prior graph survive.  Delete
+        # them now to avoid phantom cluster assignments in Phase 3/4.
+        existing_ids = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT node_id FROM repo_nodes"
+            ).fetchall()
+        }
+        stale_ids = existing_ids - imported_ids
+        if stale_ids:
+            # Also remove stale edges referencing purged nodes
+            placeholders = ",".join("?" for _ in stale_ids)
+            stale_list = list(stale_ids)
+            self.conn.execute(
+                f"DELETE FROM repo_edges WHERE source_id IN ({placeholders})"
+                f" OR target_id IN ({placeholders})",
+                stale_list + stale_list,
+            )
+            self.conn.execute(
+                f"DELETE FROM repo_nodes WHERE node_id IN ({placeholders})",
+                stale_list,
+            )
+            self.conn.commit()
+            logger.info(
+                "Purged %d stale nodes from previous run", len(stale_ids),
+            )
 
         # --- Edges ---
         t1 = time.time()

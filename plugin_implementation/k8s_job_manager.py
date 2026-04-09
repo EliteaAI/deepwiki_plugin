@@ -335,6 +335,18 @@ class K8sJobManager:
         prebaked_path = "/opt/deepwiki/lib/python3.12/site-packages"
         prebaked_marker = "/opt/deepwiki/.prebaked"
         
+        # If using a pre-baked local image (Dockerfile.worker), the init
+        # container is redundant — code + deps are already in the image.
+        # DEEPWIKI_SKIP_WORKER_INIT=1 lets callers (e.g. values-minikube)
+        # opt out even when license credentials are configured.
+        if os.environ.get("DEEPWIKI_SKIP_WORKER_INIT", "").strip() == "1":
+            log.info(
+                "DEEPWIKI_SKIP_WORKER_INIT=1 — skipping Job init container. "
+                "Worker will use baked-in code at /app/deepwiki_plugin "
+                "and pre-installed deps at /opt/deepwiki/."
+            )
+            return None
+
         # If no credentials configured, skip init container.
         # Pre-baked image: code is at /app/deepwiki_plugin — no clone needed.
         # Vanilla pylon image + PVC: relies on PVC having plugin code.

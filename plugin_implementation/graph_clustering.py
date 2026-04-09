@@ -11,7 +11,7 @@ Pipeline:
    projection.  Resolution γ auto-tuned by graph size.
 2. **Micro-clustering** — Sub-Louvain per macro-cluster at higher γ.
 3. **Dynamic page sizing** — merge tiny clusters, split oversized ones.
-4. **Hub re-integration** — majority-vote assignment or "global_core".
+4. **Hub re-integration** — plurality-vote assignment to most-connected cluster.
 5. **Persist** — write all assignments to the unified DB.
 
 Feature-flagged via ``DEEPWIKI_UNIFIED_DB=1`` (same flag as Phases 1-2).
@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
-from .constants import ARCHITECTURAL_SYMBOLS
+from .constants import ARCHITECTURAL_SYMBOLS, SYMBOL_TYPE_PRIORITY, is_test_path
 
 try:
     import igraph as ig
@@ -127,9 +127,87 @@ def select_central_symbols(
     return [nid for nid, _ in ranked[:k]]
 
 
-# Hub re-integration: if >60% edges go to one cluster, assign there
-HUB_MAJORITY_THRESHOLD = 0.6
-GLOBAL_CORE_LABEL = "global_core"
+# ── Centroid detection ─────────────────────────────────────────────────
+# Centroids are the most *significant* nodes within a page community.
+# Significance = structural centrality (degree) boosted by architectural
+# type priority.  Only architectural nodes (priority >= 5) can be
+# centroids; falls back to all nodes when no architectural symbol exists.
+CENTROID_ARCHITECTURAL_MIN_PRIORITY = 5
+MIN_CENTROIDS = 1
+MAX_CENTROIDS = 10
+
+
+def _detect_page_centroids(
+    G: nx.MultiDiGraph,
+    page_node_ids: List[str],
+    top_k: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Identify centroid nodes in a page community.
+
+    Scoring:
+        ``composite = degree_norm * 0.6  +  type_priority_norm * 0.4``
+
+    Only architectural nodes (type priority >= CENTROID_ARCHITECTURAL_MIN_PRIORITY)
+    are eligible.  Falls back to all nodes when none qualify.
+
+    Returns:
+        List of ``{"node_id": ..., "name": ..., "type": ..., "score": ...}``
+        sorted by descending score.
+    """
+    if not page_node_ids:
+        return []
+
+    k = top_k or min(
+        MAX_CENTROIDS,
+        max(MIN_CENTROIDS, round(math.sqrt(len(page_node_ids)))),
+    )
+
+    scored = []
+    for nid in page_node_ids:
+        data = G.nodes.get(nid, {})
+        stype = (data.get("symbol_type") or "unknown").lower()
+        degree = G.in_degree(nid) + G.out_degree(nid)
+        priority = SYMBOL_TYPE_PRIORITY.get(stype, 0)
+        scored.append({
+            "node_id": nid,
+            "name": data.get("symbol_name", nid),
+            "type": stype,
+            "degree": degree,
+            "priority": priority,
+        })
+
+    # Normalize degree and priority to [0, 1]
+    max_deg = max((s["degree"] for s in scored), default=1) or 1
+    max_pri = max((s["priority"] for s in scored), default=1) or 1
+
+    for s in scored:
+        s["score"] = (
+            0.6 * (s["degree"] / max_deg)
+            + 0.4 * (s["priority"] / max_pri)
+        )
+
+    # Filter to architectural-only candidates
+    arch = [s for s in scored if s["priority"] >= CENTROID_ARCHITECTURAL_MIN_PRIORITY]
+    pool = arch if arch else scored
+    pool.sort(key=lambda x: x["score"], reverse=True)
+
+    result = pool[:k]
+
+    # Re-normalize scores so the top centroid = 1.0
+    top_score = result[0]["score"] if result else 1.0
+    return [
+        {
+            "node_id": s["node_id"],
+            "name": s["name"],
+            "type": s["type"],
+            "score": round(s["score"] / top_score, 4) if top_score else 0.0,
+        }
+        for s in result
+    ]
+
+
+# Hub re-integration: always assign to most-connected cluster (plurality)
+GLOBAL_CORE_LABEL = "global_core"  # kept for backward-compat in stats only
 
 # Symbol types that are always sub-components of a parent (never standalone
 # cluster members).  If their parent is an architectural node the edge is
@@ -1080,18 +1158,29 @@ def reintegrate_hubs(
     G: nx.MultiDiGraph,
     hubs: Set[str],
     macro_assignments: Dict[str, int],
-    majority_threshold: float = HUB_MAJORITY_THRESHOLD,
-) -> Dict[str, str]:
-    """Assign quarantined hubs to their majority cluster or global_core.
+    micro_assignments: Optional[Dict[int, Dict[str, int]]] = None,
+) -> Dict[str, Tuple[int, Optional[int]]]:
+    """Assign quarantined hubs to their most-connected cluster.
 
-    For each hub, count edges (in + out) to each macro-cluster.
-    If >60% go to one cluster, assign there. Otherwise → ``global_core``.
+    For each hub, count edges (in + out) to each macro-cluster and
+    assign to the one with the most connections (plurality wins).
+    Hubs with zero edges go to the largest macro-cluster.
+
+    When *micro_assignments* is provided, each hub also gets the
+    micro-cluster within its target macro that has the most edge
+    connections.
 
     Returns:
-        ``{hub_node_id: cluster_assignment_str}``.
-        Cluster-assigned hubs get ``str(macro_id)``, rest get ``"global_core"``.
+        ``{hub_node_id: (macro_id, micro_id | None)}``.
     """
-    hub_assignments: Dict[str, str] = {}
+    hub_results: Dict[str, Tuple[int, Optional[int]]] = {}
+
+    # Fallback: largest macro cluster (by node count)
+    if macro_assignments:
+        cluster_sizes: Counter = Counter(macro_assignments.values())
+        largest_macro = cluster_sizes.most_common(1)[0][0]
+    else:
+        largest_macro = 0
 
     for hub in hubs:
         cluster_edges: Counter = Counter()
@@ -1107,21 +1196,37 @@ def reintegrate_hubs(
                 cluster_edges[macro_assignments[predecessor]] += 1
 
         if not cluster_edges:
-            hub_assignments[hub] = GLOBAL_CORE_LABEL
+            target_macro = largest_macro
         else:
-            total = sum(cluster_edges.values())
-            top_cluster, top_count = cluster_edges.most_common(1)[0]
-            if top_count > total * majority_threshold:
-                hub_assignments[hub] = str(top_cluster)
-            else:
-                hub_assignments[hub] = GLOBAL_CORE_LABEL
+            target_macro = cluster_edges.most_common(1)[0][0]
 
-    assigned = sum(1 for v in hub_assignments.values() if v != GLOBAL_CORE_LABEL)
+        # Determine best micro-cluster within the target macro
+        target_micro: Optional[int] = None
+        if micro_assignments and target_macro in micro_assignments:
+            micro_map = micro_assignments[target_macro]
+            micro_edges: Counter = Counter()
+
+            for _, neighbor in G.out_edges(hub):
+                if neighbor in micro_map:
+                    micro_edges[micro_map[neighbor]] += 1
+            for predecessor, _ in G.in_edges(hub):
+                if predecessor in micro_map:
+                    micro_edges[micro_map[predecessor]] += 1
+
+            if micro_edges:
+                target_micro = micro_edges.most_common(1)[0][0]
+            else:
+                # No direct micro edges — pick the largest micro in this macro
+                micro_sizes: Counter = Counter(micro_map.values())
+                target_micro = micro_sizes.most_common(1)[0][0]
+
+        hub_results[hub] = (target_macro, target_micro)
+
     logger.info(
-        "Hub re-integration: %d hubs — %d assigned to clusters, %d → global_core",
-        len(hubs), assigned, len(hubs) - assigned,
+        "Hub re-integration: %d hubs — all assigned to clusters (plurality vote)",
+        len(hubs),
     )
-    return hub_assignments
+    return hub_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1132,24 +1237,43 @@ def persist_clusters(
     db,
     macro_assignments: Dict[str, int],
     micro_assignments: Dict[int, Dict[str, int]],
-    hub_assignments: Dict[str, str],
+    hub_assignments: Dict[str, Tuple[int, Optional[int]]],
 ) -> Dict[str, Any]:
     """Write all cluster assignments to the unified DB.
+
+    Hub assignments now carry ``(macro_id, micro_id)`` tuples so hubs
+    get proper ``macro_cluster`` / ``micro_cluster`` values alongside
+    their ``is_hub`` flag.
+
+    Safety: resets ALL existing cluster columns to NULL before writing
+    new assignments.  This prevents stale assignments from previous
+    runs (cached DB file) from leaking into the planner.
 
     Returns:
         Stats dict.
     """
+    # Reset all existing cluster / hub columns so stale assignments
+    # from a previous run on the same cached DB file do not survive.
+    db.conn.execute(
+        "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
+        " is_hub = 0, hub_assignment = NULL"
+    )
+
     # Batch-build (node_id, macro, micro) tuples
     batch: List[Tuple[str, int, Optional[int]]] = []
     for node_id, macro_id in macro_assignments.items():
         micro_id = micro_assignments.get(macro_id, {}).get(node_id)
         batch.append((node_id, macro_id, micro_id))
 
+    # Include hubs in the cluster batch so they get macro_cluster/micro_cluster
+    for hub_id, (macro_id, micro_id) in hub_assignments.items():
+        batch.append((hub_id, macro_id, micro_id))
+
     db.set_clusters_batch(batch)
 
-    # Hub assignments
-    for hub_id, assignment in hub_assignments.items():
-        db.set_hub(hub_id, is_hub=True, assignment=assignment)
+    # Hub flags (is_hub + assignment label for metadata/debugging)
+    for hub_id, (macro_id, _micro_id) in hub_assignments.items():
+        db.set_hub(hub_id, is_hub=True, assignment=str(macro_id))
 
     db.conn.commit()
 
@@ -1160,20 +1284,15 @@ def persist_clusters(
             len(set(m.values())) for m in micro_assignments.values()
         ),
         "hubs_assigned": len(hub_assignments),
-        "hubs_in_clusters": sum(
-            1 for v in hub_assignments.values() if v != GLOBAL_CORE_LABEL
-        ),
-        "hubs_global_core": sum(
-            1 for v in hub_assignments.values() if v == GLOBAL_CORE_LABEL
-        ),
+        "hubs_in_clusters": len(hub_assignments),
+        "hubs_global_core": 0,
     }
 
     logger.info(
         "Persisted clusters: %d nodes → %d sections × %d pages, "
-        "%d hubs (%d→cluster, %d→global_core)",
+        "%d hubs (all assigned to clusters)",
         stats["nodes_clustered"], stats["macro_clusters"],
         stats["micro_clusters"], stats["hubs_assigned"],
-        stats["hubs_in_clusters"], stats["hubs_global_core"],
     )
     return stats
 
@@ -1222,6 +1341,742 @@ def detect_doc_clusters(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 6c. Hierarchical Leiden Clustering
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default resolution parameters for the two-pass Leiden.
+# γ_low → fewer, bigger communities (sections).
+# γ_high → more, smaller communities (pages).
+LEIDEN_SECTION_RESOLUTION = 0.01          # Legacy: node-level section pass
+LEIDEN_FILE_SECTION_RESOLUTION = 1.0       # File-contracted section pass
+LEIDEN_PAGE_RESOLUTION = 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6d. Post-Leiden Consolidation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _target_section_count(n_files: int) -> int:
+    """Target section count — **logarithmic** scaling on file count.
+
+    Sections represent high-level logical domains.  A repository has a
+    bounded number of major subsystems regardless of node count, so
+    the target grows as ``log₂(files)`` rather than ``√nodes``.  Using
+    file count (not node count) decouples sections from pages and
+    eliminates the constant pages/sections ratio.
+
+    | Files      | Target sections |
+    |------------|-----------------|
+    | < 10       | 5               |
+    | 50         | 7               |
+    | 116        | 9               |
+    | 500        | 11              |
+    | 1 000      | 12              |
+    | 5 000      | 15              |
+    | 7 165      | 16              |
+    | 50 000     | 19              |
+    | cap        | 20              |
+    """
+    if n_files < 10:
+        return 5
+    return max(5, min(20, math.ceil(1.2 * math.log2(max(10, n_files)))))
+
+
+def _target_total_pages(n_nodes: int) -> int:
+    """Target total-page count — ``√(nodes/7)`` scaling on node count.
+
+    Pages represent content granularity proportional to code volume
+    (node count), NOT file count.  Sections use log₂(files) — a
+    fundamentally different input and growth rate — which breaks the
+    proportional lock between sections and pages.
+
+    | Nodes      | Target pages |
+    |------------|--------------|
+    | 729        | 11           |
+    | 5 000      | 27           |
+    | 11 417     | 41           |
+    | 50 000     | 85           |
+    | 146 091    | 145          |
+    | 280 000    | 200 (cap)    |
+    """
+    return max(8, min(200, math.ceil(math.sqrt(n_nodes / 7))))
+
+
+def _dir_of_node(nid: str, G: nx.MultiDiGraph) -> str:
+    """Get directory prefix from a node's rel_path."""
+    data = G.nodes.get(nid, {})
+    rel_path = data.get("rel_path") or data.get("file_name") or ""
+    if "/" in rel_path:
+        return rel_path.rsplit("/", 1)[0]
+    return "<root>"
+
+
+def _dir_histogram(node_ids, G: nx.MultiDiGraph) -> Counter:
+    """Build a directory-frequency Counter for a set of node IDs."""
+    c: Counter = Counter()
+    for nid in node_ids:
+        c[_dir_of_node(nid, G)] += 1
+    return c
+
+
+def _dir_similarity(a: Counter, b: Counter) -> int:
+    """Shared directory entries (min-intersect) between two histograms."""
+    return sum(min(a[d], b[d]) for d in a if d in b)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Component Bridging  (post-projection, pre-Leiden)
+# ───────────────────────────────────────────────────────────────────────────
+
+# Weight assigned to synthetic bridge edges — deliberately low so Leiden
+# will cut them when stronger structural boundaries exist.
+BRIDGE_WEIGHT = 0.1
+
+
+def _bridge_components(P: nx.MultiDiGraph) -> Dict[str, Any]:
+    """Connect disconnected components in the projected graph.
+
+    After architectural projection many edges become self-loops and are
+    dropped, fragmenting the graph into hundreds of tiny connected
+    components.  Leiden produces at minimum one community per connected
+    component, so the raw community count mirrors this fragmentation
+    regardless of the resolution parameter.
+
+    This function builds a **spanning tree** over all connected components
+    by adding lightweight bridge edges between each small component and its
+    most directory-similar larger neighbour.  The low weight ensures Leiden
+    will prefer to cut these bridges when real structural boundaries exist,
+    but they allow components with shared directories to be grouped
+    together.
+
+    Mutates *P* in place and returns stats.
+    """
+    components = list(nx.weakly_connected_components(P))
+    n_before = len(components)
+
+    if n_before <= 1:
+        return {
+            "components_before": n_before,
+            "components_after": n_before,
+            "bridges_added": 0,
+        }
+
+    # Sort largest-first so index 0 is the biggest component
+    components.sort(key=len, reverse=True)
+
+    # Build directory histogram for each component
+    comp_dirs: List[Counter] = []
+    for comp in components:
+        comp_dirs.append(_dir_histogram(comp, P))
+
+    # Pick a representative node per component (highest total degree).
+    # This ensures the bridge endpoint is well-connected within its
+    # component so the bridge doesn't dangle off a leaf.
+    comp_reps: List[str] = []
+    for comp in components:
+        best_nid = max(comp, key=lambda n: P.in_degree(n) + P.out_degree(n))
+        comp_reps.append(best_nid)
+
+    bridges_added = 0
+    for comp_id in range(1, n_before):
+        # Find the most directory-similar earlier (larger) component
+        best_target = 0
+        best_sim = _dir_similarity(comp_dirs[comp_id], comp_dirs[0])
+
+        for target_id in range(1, comp_id):
+            sim = _dir_similarity(comp_dirs[comp_id], comp_dirs[target_id])
+            if sim > best_sim:
+                best_sim = sim
+                best_target = target_id
+
+        src = comp_reps[comp_id]
+        dst = comp_reps[best_target]
+
+        P.add_edge(src, dst, weight=BRIDGE_WEIGHT, edge_class="bridge")
+        P.add_edge(dst, src, weight=BRIDGE_WEIGHT, edge_class="bridge")
+        bridges_added += 2
+
+    n_after = nx.number_weakly_connected_components(P)
+
+    logger.info(
+        "Component bridging: %d components → %d (added %d bridge edges)",
+        n_before, n_after, bridges_added,
+    )
+
+    return {
+        "components_before": n_before,
+        "components_after": n_after,
+        "bridges_added": bridges_added,
+    }
+
+
+def _consolidate_sections(
+    leiden_result: Dict[str, Any],
+    G: nx.MultiDiGraph,
+    n_files: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Merge small Leiden sections into neighbours using directory proximity.
+
+    Iteratively picks the smallest section and merges it into the section
+    with the most shared directory prefixes.  Stops when the number of
+    sections reaches the adaptive target.
+
+    Args:
+        n_files: File count for target calculation.  When ``None``,
+            falls back to the node count (legacy behaviour).
+
+    Mutates *leiden_result* in-place and returns it.
+    """
+    sections = leiden_result["sections"]
+    macro_assign = leiden_result["macro_assignments"]
+    micro_assign = leiden_result["micro_assignments"]
+
+    scale = n_files if n_files is not None else len(macro_assign)
+    target = _target_section_count(scale)
+
+    if len(sections) <= target:
+        return leiden_result
+
+    original_count = len(sections)
+
+    # Pre-compute per-section directory histograms and sizes
+    sec_dirs: Dict[int, Counter] = {}
+    sec_sizes: Dict[int, int] = {}
+    for sid, sec in sections.items():
+        all_nids = [nid for pg in sec["pages"].values() for nid in pg]
+        sec_dirs[sid] = _dir_histogram(all_nids, G)
+        sec_sizes[sid] = len(all_nids)
+
+    while len(sections) > target:
+        # Pick the smallest section
+        smallest_id = min(sec_sizes, key=sec_sizes.get)
+        dirs_a = sec_dirs[smallest_id]
+
+        # Find the best merge target (most shared directories; break ties
+        # by preferring the smaller target to keep sizes balanced).
+        best_target = None
+        best_score = -1
+        for sid in sections:
+            if sid == smallest_id:
+                continue
+            score = _dir_similarity(dirs_a, sec_dirs[sid])
+            if (score > best_score
+                    or (score == best_score
+                        and (best_target is None
+                             or sec_sizes[sid] < sec_sizes[best_target]))):
+                best_score = score
+                best_target = sid
+
+        if best_target is None:
+            break  # shouldn't happen
+
+        # Merge all pages from source into target
+        target_pages = sections[best_target]["pages"]
+        source_pages = sections[smallest_id]["pages"]
+        next_pg = max(target_pages.keys(), default=-1) + 1
+
+        for _old_pg, node_ids in source_pages.items():
+            target_pages[next_pg] = node_ids
+            for nid in node_ids:
+                macro_assign[nid] = best_target
+                micro_assign.setdefault(best_target, {})[nid] = next_pg
+            next_pg += 1
+
+        micro_assign.pop(smallest_id, None)
+
+        # Update bookkeeping
+        for d, c in dirs_a.items():
+            sec_dirs[best_target][d] = sec_dirs[best_target].get(d, 0) + c
+        del sec_dirs[smallest_id]
+        sec_sizes[best_target] += sec_sizes.pop(smallest_id)
+        del sections[smallest_id]
+
+    logger.info(
+        "Section consolidation: %d → %d sections (target %d, scale %d %s)",
+        original_count, len(sections), target, scale,
+        "files" if n_files is not None else "nodes",
+    )
+    return leiden_result
+
+
+def _consolidate_pages(
+    leiden_result: Dict[str, Any],
+    G: nx.MultiDiGraph,
+) -> Dict[str, Any]:
+    """Merge small pages globally using directory proximity.
+
+    Picks the smallest page across *all* sections, merges it into its
+    best same-section neighbour.  Repeats until total pages ≤ target.
+
+    There is no per-section cap — a large section may keep many pages
+    while a small one collapses to 1.  Sections and pages are independent.
+
+    Page target uses **node count** (code volume), while section target
+    uses **file count** (structural domains).  Different inputs +
+    different growth rates (√ vs log₂) break the proportional lock.
+
+    Mutates *leiden_result* in-place and returns it.
+    """
+    sections = leiden_result["sections"]
+    micro_assign = leiden_result["micro_assignments"]
+
+    n_nodes = len(leiden_result["macro_assignments"])
+    target_total = _target_total_pages(n_nodes)
+
+    total_pages = sum(len(s["pages"]) for s in sections.values())
+    if total_pages <= target_total:
+        return leiden_result
+
+    original_total = total_pages
+
+    # Build global page-size and page-dir indexes: (sid, pid) → size/dirs
+    pg_sizes: Dict[tuple, int] = {}
+    pg_dirs: Dict[tuple, Counter] = {}
+
+    for sid, sec in sections.items():
+        for pid, nids in sec["pages"].items():
+            key = (sid, pid)
+            pg_sizes[key] = len(nids)
+            pg_dirs[key] = _dir_histogram(nids, G)
+
+    while total_pages > target_total:
+        # Find the globally smallest page that has a sibling in its section
+        candidates = sorted(pg_sizes.items(), key=lambda x: x[1])
+
+        merged = False
+        for (sid, pid), _size in candidates:
+            # Must have at least one sibling to merge into
+            sec_pages = sections[sid]["pages"]
+            if len(sec_pages) <= 1:
+                continue
+
+            dirs_a = pg_dirs[(sid, pid)]
+
+            # Best same-section neighbour by directory similarity
+            best_pg = None
+            best_score = -1
+            for other_pid in sec_pages:
+                if other_pid == pid:
+                    continue
+                score = _dir_similarity(dirs_a, pg_dirs[(sid, other_pid)])
+                if (score > best_score
+                        or (score == best_score
+                            and (best_pg is None
+                                 or pg_sizes[(sid, other_pid)] < pg_sizes.get((sid, best_pg), 0)))):
+                    best_score = score
+                    best_pg = other_pid
+
+            if best_pg is None:
+                continue
+
+            # Merge
+            sec_pages[best_pg].extend(sec_pages.pop(pid))
+            for nid in sec_pages[best_pg]:
+                micro_assign.setdefault(sid, {})[nid] = best_pg
+
+            for d, c in dirs_a.items():
+                pg_dirs[(sid, best_pg)][d] = pg_dirs[(sid, best_pg)].get(d, 0) + c
+            del pg_dirs[(sid, pid)]
+            pg_sizes[(sid, best_pg)] += pg_sizes.pop((sid, pid))
+
+            total_pages -= 1
+            merged = True
+            break
+
+        if not merged:
+            break  # no more mergeable pages
+
+    new_total = sum(len(s["pages"]) for s in sections.values())
+    logger.info(
+        "Page consolidation: %d → %d pages (target %d)",
+        original_total, new_total, target_total,
+    )
+    return leiden_result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6e. File-Level Graph Contraction
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _contract_to_file_graph(
+    G: nx.MultiDiGraph,
+) -> Tuple[nx.Graph, Dict[str, List[str]]]:
+    """Contract the node graph to file-level for section clustering.
+
+    Every unique ``rel_path`` becomes a single file-node.  For edges
+    between nodes in *different* files the weight is summed into the
+    file-pair edge.  Same-file edges are dropped (they are intra-node
+    after contraction).
+
+    This eliminates parameter/variable/field noise that fragments
+    community detection: those nodes' cross-file edges become file-level
+    edge weight without inflating the node count.
+
+    Returns:
+        (file_graph, file_to_nodes):
+        - file_graph — undirected weighted ``nx.Graph``
+        - file_to_nodes — ``{rel_path: [node_id, ...]}``
+    """
+    file_to_nodes: Dict[str, List[str]] = {}
+    node_to_file: Dict[str, str] = {}
+
+    for nid, data in G.nodes(data=True):
+        rel_path = data.get("rel_path") or data.get("file_name") or "<unknown>"
+        file_to_nodes.setdefault(rel_path, []).append(nid)
+        node_to_file[nid] = rel_path
+
+    # Sum edge weights between distinct file pairs
+    edge_weights: Dict[Tuple[str, str], float] = {}
+    for u, v, data in G.edges(data=True):
+        fu = node_to_file.get(u)
+        fv = node_to_file.get(v)
+        if fu is None or fv is None or fu == fv:
+            continue
+        key = (min(fu, fv), max(fu, fv))
+        edge_weights[key] = edge_weights.get(key, 0.0) + data.get("weight", 1.0)
+
+    FG = nx.Graph()
+    FG.add_nodes_from(file_to_nodes.keys())
+    for (fu, fv), w in edge_weights.items():
+        FG.add_edge(fu, fv, weight=w)
+
+    return FG, file_to_nodes
+
+
+def hierarchical_leiden_cluster(
+    G_projected: nx.MultiDiGraph,
+    hubs: Set[str],
+    section_resolution: float = LEIDEN_FILE_SECTION_RESOLUTION,
+    page_resolution: float = LEIDEN_PAGE_RESOLUTION,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Two-pass Leiden with file-level contraction for sections.
+
+    **Pass 1 (sections)** — contracts the full graph to file-level nodes
+    (each ``rel_path`` becomes one node, cross-file edge weights are
+    summed), then runs Leiden at *section_resolution*.  This reduces a
+    10K+ node graph to ~50-100 file-nodes, eliminating parameter /
+    variable / field noise that fragments community detection.
+
+    **Pass 2 (pages)** — for each section, runs Leiden at
+    *page_resolution* on the **original node** subgraph.  Intra-file
+    edges naturally group symbols from the same file; cross-file edges
+    within the section pull tightly-coupled code together.
+
+    Args:
+        G_projected: Full code graph (hub-free).
+        hubs: Hub node IDs (excluded from clustering, reintegrated later).
+        section_resolution: Leiden γ for the file-contracted section pass.
+        page_resolution: Leiden γ for the per-section page pass.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        ``{"sections": {sec_id: {"pages": {pg_id: [node_ids]}}},
+           "macro_assignments": {node_id: sec_id},
+           "micro_assignments": {sec_id: {node_id: pg_id}},
+           "algorithm_metadata": {...}}``
+    """
+    if not _HAS_IGRAPH or not _HAS_LEIDEN:
+        raise RuntimeError(
+            "Hierarchical Leiden requires igraph and leidenalg. "
+            "Install with: pip install igraph leidenalg"
+        )
+
+    # Remove hubs from the graph for clustering
+    non_hub_nodes = set(G_projected.nodes()) - hubs
+    if not non_hub_nodes:
+        return {
+            "sections": {},
+            "macro_assignments": {},
+            "micro_assignments": {},
+            "algorithm_metadata": {
+                "algorithm": "hierarchical_leiden_file_contracted",
+                "section_resolution": section_resolution,
+                "page_resolution": page_resolution,
+                "sections": 0,
+                "pages": 0,
+                "note": "no non-hub nodes",
+            },
+        }
+
+    G_sub = G_projected.subgraph(non_hub_nodes).copy()
+
+    # ── Pass 1: Section-level on file-contracted graph ────────────────
+    file_graph, file_to_nodes = _contract_to_file_graph(G_sub)
+
+    connected_files = [f for f in file_graph.nodes() if file_graph.degree(f) > 0]
+    isolated_files = [f for f in file_graph.nodes() if file_graph.degree(f) == 0]
+
+    file_to_section: Dict[str, int] = {}
+
+    if connected_files:
+        file_sub = file_graph.subgraph(connected_files).copy()
+        ig_file, file_list = _nx_to_igraph(file_sub)
+
+        sec_partition = leidenalg.find_partition(
+            ig_file,
+            leidenalg.RBConfigurationVertexPartition,
+            resolution_parameter=section_resolution,
+            weights="weight",
+            seed=seed,
+        )
+
+        for idx, sec_id in enumerate(sec_partition.membership):
+            file_to_section[file_list[idx]] = sec_id
+
+    # Assign isolated files to nearest section by directory proximity
+    if isolated_files and file_to_section:
+        sec_dirs: Dict[int, Counter] = {}
+        for f, sid in file_to_section.items():
+            d = f.rsplit("/", 1)[0] if "/" in f else "<root>"
+            sec_dirs.setdefault(sid, Counter())[d] += 1
+
+        for f in isolated_files:
+            d = f.rsplit("/", 1)[0] if "/" in f else "<root>"
+            best_sec = max(sec_dirs, key=lambda s: sec_dirs[s].get(d, 0))
+            file_to_section[f] = best_sec
+    elif isolated_files:
+        # All files are isolated — each gets its own section so
+        # consolidation can merge them by directory proximity later.
+        for i, f in enumerate(isolated_files):
+            file_to_section[f] = i
+
+    # Propagate file → section to node → section
+    macro_assignments: Dict[str, int] = {}
+    for f, sec_id in file_to_section.items():
+        for nid in file_to_nodes.get(f, []):
+            macro_assignments[nid] = sec_id
+
+    logger.info(
+        "File-contracted section pass: %d files (%d connected, "
+        "%d isolated) → %d sections",
+        len(file_to_section), len(connected_files),
+        len(isolated_files), len(set(file_to_section.values())),
+    )
+
+    # ── Pass 2: Page-level per section on original nodes ──────────────
+    sec_nodes: Dict[int, Set[str]] = {}
+    for nid, sec_id in macro_assignments.items():
+        sec_nodes.setdefault(sec_id, set()).add(nid)
+
+    sections: Dict[int, Dict[str, Any]] = {}
+    micro_assignments: Dict[int, Dict[str, int]] = {}
+
+    for sec_id, node_set in sec_nodes.items():
+        if len(node_set) < 2:
+            nid_list = list(node_set)
+            sections[sec_id] = {
+                "pages": {0: nid_list},
+                "centroids": {0: _detect_page_centroids(G_sub, nid_list)},
+            }
+            micro_assignments[sec_id] = {nid: 0 for nid in nid_list}
+            continue
+
+        # Extract subgraph for this section and run page Leiden
+        sec_subgraph = G_sub.subgraph(node_set)
+        sec_undirected = _to_weighted_undirected(sec_subgraph)
+
+        if sec_undirected.number_of_edges() == 0:
+            nid_list = sorted(node_set)
+            sections[sec_id] = {
+                "pages": {0: nid_list},
+                "centroids": {0: _detect_page_centroids(G_sub, nid_list)},
+            }
+            micro_assignments[sec_id] = {nid: 0 for nid in nid_list}
+            continue
+
+        ig_sec, sec_node_list = _nx_to_igraph(sec_undirected)
+
+        pg_partition = leidenalg.find_partition(
+            ig_sec,
+            leidenalg.RBConfigurationVertexPartition,
+            resolution_parameter=page_resolution,
+            weights="weight",
+            seed=seed,
+        )
+
+        # Build page structure
+        pages: Dict[int, List[str]] = {}
+        for idx, pg_id in enumerate(pg_partition.membership):
+            pages.setdefault(pg_id, []).append(sec_node_list[idx])
+
+        # Renumber pages to dense 0..N-1
+        renumbered: Dict[int, List[str]] = {}
+        page_centroids: Dict[int, List[Dict[str, Any]]] = {}
+        micro_map: Dict[str, int] = {}
+        for new_pg_id, (_, node_ids) in enumerate(sorted(pages.items())):
+            renumbered[new_pg_id] = node_ids
+            page_centroids[new_pg_id] = _detect_page_centroids(G_sub, node_ids)
+            for nid in node_ids:
+                micro_map[nid] = new_pg_id
+
+        sections[sec_id] = {"pages": renumbered, "centroids": page_centroids}
+        micro_assignments[sec_id] = micro_map
+
+    n_sections = len(sections)
+    n_pages = sum(len(s["pages"]) for s in sections.values())
+
+    metadata = {
+        "algorithm": "hierarchical_leiden_file_contracted",
+        "section_resolution": section_resolution,
+        "page_resolution": page_resolution,
+        "sections": n_sections,
+        "pages": n_pages,
+        "seed": seed,
+        "file_nodes": len(file_to_section),
+        "connected_files": len(connected_files),
+        "isolated_files": len(isolated_files),
+    }
+
+    logger.info(
+        "Hierarchical Leiden (file-contracted): %d sections, %d pages "
+        "(γ_sec=%.4f, γ_pg=%.2f, %d files → %d nodes)",
+        n_sections, n_pages, section_resolution, page_resolution,
+        len(file_to_section), len(non_hub_nodes),
+    )
+
+    return {
+        "sections": sections,
+        "macro_assignments": macro_assignments,
+        "micro_assignments": micro_assignments,
+        "algorithm_metadata": metadata,
+    }
+
+
+def _run_phase3_hierarchical_leiden(
+    db,
+    G: nx.MultiDiGraph,
+    hubs: Optional[Set[str]] = None,
+    section_resolution: float = LEIDEN_FILE_SECTION_RESOLUTION,
+    page_resolution: float = LEIDEN_PAGE_RESOLUTION,
+    feature_flags=None,
+) -> Dict[str, Any]:
+    """Phase 3 pipeline using hierarchical Leiden (feature-flagged).
+
+    Uses file-level graph contraction for the section pass: contracts
+    ~10K symbol nodes to ~50-100 file nodes, then runs Leiden on the
+    compact file graph.  Page-level clustering runs on original nodes
+    within each section.
+
+    This eliminates parameter/variable noise while preserving their
+    cross-file edges as aggregated file-level weights.
+
+    When ``feature_flags.exclude_tests`` is True, test nodes are removed
+    from the graph before clustering.  After clustering completes, test
+    nodes are NOT assigned to any cluster — they remain in the DB with
+    ``is_test=1`` and ``macro_cluster=NULL`` so they can still be retrieved
+    via vector search but don't form wiki pages.
+    """
+    if feature_flags is None:
+        from .feature_flags import get_feature_flags
+        feature_flags = get_feature_flags()
+
+    results: Dict[str, Any] = {}
+
+    # Get hubs from DB if not provided
+    if hubs is None:
+        hubs = _load_hubs_from_db(db)
+
+    # ── Optional: Filter test nodes from graph ────────────────────────
+    excluded_test_nodes: Set[str] = set()
+    G_cluster = G  # default: cluster the full graph
+
+    if feature_flags.exclude_tests:
+        for nid, data in G.nodes(data=True):
+            rel_path = data.get("rel_path") or data.get("file_name") or ""
+            if is_test_path(rel_path):
+                excluded_test_nodes.add(nid)
+
+        if excluded_test_nodes:
+            non_test_nodes = set(G.nodes()) - excluded_test_nodes
+            G_cluster = G.subgraph(non_test_nodes).copy()
+            logger.info(
+                "Test exclusion: removed %d test nodes from clustering "
+                "(%d remaining)",
+                len(excluded_test_nodes),
+                G_cluster.number_of_nodes(),
+            )
+
+    results["graph"] = {
+        "total_nodes": G.number_of_nodes(),
+        "total_edges": G.number_of_edges(),
+        "hubs": len(hubs & set(G.nodes())),
+        "test_nodes_excluded": len(excluded_test_nodes),
+    }
+
+    # Step 1+2: Hierarchical Leiden on the (possibly filtered) graph
+    leiden_result = hierarchical_leiden_cluster(
+        G_cluster, hubs,
+        section_resolution=section_resolution,
+        page_resolution=page_resolution,
+    )
+
+    # Step 2b: Consolidation safety net.
+    # On a well-connected full graph Leiden should already produce a
+    # near-target community count, but consolidation catches edge cases
+    # (e.g. disconnected doc-only components).
+    # Use file count (not node count) as the scale for targets — this
+    # gives log₂-scaling for sections and √-scaling for pages, which
+    # breaks the proportional lock between the two.
+    n_files = leiden_result["algorithm_metadata"].get("file_nodes")
+    leiden_result = _consolidate_sections(leiden_result, G, n_files=n_files)
+    leiden_result = _consolidate_pages(leiden_result, G)
+
+    macro_assignments = leiden_result["macro_assignments"]
+    micro_assignments = leiden_result["micro_assignments"]
+
+    results["macro"] = {
+        "cluster_count": len(leiden_result["sections"]),
+        "cluster_count_raw": leiden_result["algorithm_metadata"]["sections"],
+        "nodes_assigned": len(macro_assignments),
+    }
+    results["micro"] = {
+        "total_pages": sum(
+            len(s["pages"]) for s in leiden_result["sections"].values()
+        ),
+        "total_pages_raw": leiden_result["algorithm_metadata"]["pages"],
+    }
+    results["algorithm_metadata"] = leiden_result["algorithm_metadata"]
+
+    # Step 3: Hub re-integration
+    hub_assignments = reintegrate_hubs(
+        G, hubs, macro_assignments, micro_assignments,
+    )
+    results["hubs"] = {
+        "total": len(hub_assignments),
+        "assigned_to_cluster": len(hub_assignments),
+        "global_core": 0,
+    }
+
+    # Merge hubs into macro/micro so they appear in cluster queries
+    for hub_id, (macro_id, micro_id) in hub_assignments.items():
+        macro_assignments[hub_id] = macro_id
+        if micro_id is not None:
+            micro_assignments.setdefault(macro_id, {})[hub_id] = micro_id
+
+    # Step 4: Persist
+    results["persistence"] = persist_clusters(
+        db, macro_assignments, micro_assignments, hub_assignments,
+    )
+
+    # Store metadata
+    db.set_meta("phase3_completed", True)
+    db.set_meta("phase3_stats", results)
+    db.set_meta("phase3_algorithm", leiden_result["algorithm_metadata"])
+
+    logger.info(
+        "Phase 3 (hierarchical Leiden) complete: %d sections (%d raw), "
+        "%d pages (%d raw), %d hubs",
+        results["macro"]["cluster_count"],
+        results["macro"]["cluster_count_raw"],
+        results["micro"]["total_pages"],
+        results["micro"]["total_pages_raw"],
+        results["hubs"]["total"],
+    )
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 7. Orchestrator — run full Phase 3 pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1232,10 +2087,16 @@ def run_phase3(
     macro_resolution: Optional[float] = None,
     micro_resolution: float = 1.5,
     page_sizing_rules: Optional[Dict[str, int]] = None,
+    feature_flags=None,
 ) -> Dict[str, Any]:
     """Execute the complete Phase 3 clustering pipeline.
 
-    Steps:
+    When ``feature_flags.hierarchical_leiden`` is True, delegates to
+    :func:`_run_phase3_hierarchical_leiden` which replaces the formula-
+    driven Louvain pipeline with a structure-driven two-pass Leiden
+    approach.  Otherwise the legacy pipeline runs unchanged.
+
+    Steps (legacy):
         0. Project graph to architectural-only nodes (collapse methods → parent class)
         1. Macro-cluster (Louvain, hub-free, weighted, auto-γ)
         1b. Merge cap — consolidate to ≤ max_sections (log₁₀-based target)
@@ -1252,10 +2113,20 @@ def run_phase3(
         macro_resolution: Override Louvain γ for macro pass.
         micro_resolution: Louvain γ for micro pass (default 1.5).
         page_sizing_rules: Override MICRO_CLUSTER_RULES.
+        feature_flags: Optional ``FeatureFlags`` instance.
 
     Returns:
         Combined stats dict.
     """
+    # Late import to avoid circular dependency
+    if feature_flags is None:
+        from .feature_flags import get_feature_flags
+        feature_flags = get_feature_flags()
+
+    if feature_flags.hierarchical_leiden:
+        return _run_phase3_hierarchical_leiden(db, G, hubs, feature_flags=feature_flags)
+
+    # ── Legacy pipeline (unchanged) ──────────────────────────────────
     results: Dict[str, Any] = {}
 
     # Get hubs from DB if not provided
@@ -1332,25 +2203,27 @@ def run_phase3(
     }
 
     # Step 4: Hub re-integration (on original graph — hubs need full edge info)
-    hub_assignments = reintegrate_hubs(G, projected_hubs, macro_assignments)
+    hub_assignments = reintegrate_hubs(
+        G, projected_hubs, macro_assignments, micro_assignments,
+    )
     results["hubs"] = {
         "total": len(hub_assignments),
-        "assigned_to_cluster": sum(
-            1 for v in hub_assignments.values() if v != GLOBAL_CORE_LABEL
-        ),
-        "global_core": sum(
-            1 for v in hub_assignments.values() if v == GLOBAL_CORE_LABEL
-        ),
+        "assigned_to_cluster": len(hub_assignments),
+        "global_core": 0,
     }
+
+    # Merge hubs into macro/micro assignments so child propagation works
+    for hub_id, (macro_id, micro_id) in hub_assignments.items():
+        macro_assignments[hub_id] = macro_id
+        if micro_id is not None:
+            micro_assignments.setdefault(macro_id, {})[hub_id] = micro_id
 
     # Step 5: Propagate assignments to child nodes.
     # Children inherit their parent's (macro, micro) assignment.
     propagated = 0
     for nid, data in G.nodes(data=True):
         if nid in macro_assignments:
-            continue  # already assigned (architectural node)
-        if nid in projected_hubs:
-            continue  # hub — handled separately
+            continue  # already assigned (architectural node or hub)
 
         stype = (data.get("symbol_type") or "").lower()
         if stype not in _CHILD_SYMBOL_TYPES:

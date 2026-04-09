@@ -1483,8 +1483,15 @@ class OptimizedWikiGenerationAgent:
         if "graph clustering" not in rationale:
             return None
 
-        # Extract macro_id from rationale: "...macro=3, micro=2..."
-        macro_id = self._extract_macro_id(rationale)
+        # Prefer structured metadata over rationale parsing (Phase 2 fix)
+        metadata = getattr(page_spec, "metadata", None) or {}
+        macro_id = metadata.get("section_id")
+        micro_id = metadata.get("page_id")
+        cluster_node_ids = metadata.get("cluster_node_ids")
+
+        # Fallback: parse macro_id from rationale if metadata is missing
+        if macro_id is None:
+            macro_id = self._extract_macro_id(rationale)
 
         db = self._open_cluster_db()
         if db is None:
@@ -1503,6 +1510,8 @@ class OptimizedWikiGenerationAgent:
                 db=db,
                 page_symbols=target_symbols,
                 macro_id=macro_id,
+                micro_id=micro_id,
+                cluster_node_ids=cluster_node_ids,
                 token_budget=CONTEXT_TOKEN_BUDGET,
             )
         except Exception as exc:

@@ -1,13 +1,14 @@
-"""
+"""                                                                              
 Tests for Phase 4 — cluster_planner.py
-Cluster-based wiki structure planning with LLM naming.
+Cluster-based wiki structure planning with two-pass LLM naming.
 
 Suite layout
 ============
 TestDominantSymbols          — scoring and ranking of representative symbols
-TestMicroSummaries           — compact summaries for LLM prompt
+TestMicroSummaries           — compact summaries for section-naming prompt
+TestPageSymbols              — enriched symbols for page-naming prompt
 TestGlobalCoreSection        — hub node section building
-TestClusterNaming            — LLM naming with mock
+TestClusterNaming            — two-pass LLM naming with mock
 TestPlanStructure            — full plan_structure() pipeline
 TestFallbacks                — fallback spec, fallback section, LLM failure
 TestJsonParsing              — _parse_json_response edge cases
@@ -38,7 +39,8 @@ from plugin_implementation.unified_db import UnifiedWikiDB
 from plugin_implementation.wiki_structure_planner.cluster_planner import (
     CLUSTER_NAMING_SYSTEM,
     CLUSTER_NAMING_USER,
-    GLOBAL_CORE_SECTION_NAME,
+    SECTION_NAMING_SYSTEM,
+    PAGE_NAMING_SYSTEM,
     ClusterStructurePlanner,
     _extract_text,
     _parse_json_response,
@@ -129,20 +131,40 @@ def _build_two_community_db(tmp_dir: str):
 
 
 def _mock_llm_response(section_name="Authentication", pages=None):
-    """Create a mock LLM that returns a JSON naming response."""
-    if pages is None:
-        pages = [{"micro_id": 0, "page_name": "Auth Core", "description": "Core auth", "retrieval_query": "auth core"}]
+    """Create a mock LLM that handles two-pass naming.
 
-    response_json = json.dumps({
-        "section_name": section_name,
-        "section_description": f"{section_name} module",
-        "pages": pages,
-    })
+    The first call returns section naming; subsequent calls return page naming.
+    If ``pages`` is given, each entry is returned for successive page-naming calls.
+    """
+    if pages is None:
+        pages = [{"page_name": "Auth Core", "description": "Core auth", "retrieval_query": "auth core"}]
+
+    call_count = [0]
+
+    def mock_invoke(messages, **kwargs):
+        call_count[0] += 1
+        resp = MagicMock()
+        if call_count[0] == 1:
+            # Pass 1: section naming
+            resp.content = json.dumps({
+                "section_name": section_name,
+                "section_description": f"{section_name} module",
+            })
+        else:
+            # Pass 2: page naming (call_count-2 = page index)
+            page_idx = call_count[0] - 2
+            if page_idx < len(pages):
+                resp.content = json.dumps(pages[page_idx])
+            else:
+                resp.content = json.dumps({
+                    "page_name": f"Page {page_idx}",
+                    "description": "Auto-generated",
+                    "retrieval_query": "auto",
+                })
+        return resp
 
     mock = MagicMock()
-    mock_msg = MagicMock()
-    mock_msg.content = response_json
-    mock.invoke.return_value = mock_msg
+    mock.invoke.side_effect = mock_invoke
     return mock
 
 
@@ -230,47 +252,60 @@ class TestMicroSummaries(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. Global Core Section
+# 2b. Page Symbols (enriched, for Pass 2)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestGlobalCoreSection(unittest.TestCase):
+class TestPageSymbols(unittest.TestCase):
 
-    def test_core_section_built(self):
+    def test_returns_enriched_symbols(self):
+        """Page symbols include signature and docstring."""
         with tempfile.TemporaryDirectory() as tmp:
-            nodes = [_make_node_dict(f"hub{i}", rel_path=f"src/utils/{i}.py") for i in range(3)]
+            nodes = [
+                _make_node_dict(f"n{i}", docstring=f"Docstring {i}",
+                                signature=f"def func{i}()")
+                for i in range(5)
+            ]
             db = _make_db(tmp, nodes=nodes)
-            for n in nodes:
-                db.set_hub(n["node_id"], is_hub=True, assignment="global_core")
-            db.conn.commit()
 
             planner = ClusterStructurePlanner(db, _mock_llm_response())
-            core_nodes = planner._load_global_core_nodes()
-            self.assertEqual(len(core_nodes), 3)
+            page_syms = planner._get_page_symbols([f"n{i}" for i in range(5)])
 
-            section = planner._build_global_core_section(core_nodes, section_order=1)
-            self.assertEqual(section.section_name, GLOBAL_CORE_SECTION_NAME)
-            self.assertGreaterEqual(len(section.pages), 1)
+            self.assertGreater(len(page_syms), 0)
+            self.assertIn("signature", page_syms[0])
+            self.assertIn("docstring", page_syms[0])
+            self.assertIn("name", page_syms[0])
+            self.assertIn("type", page_syms[0])
 
-    def test_core_section_splits_large(self):
-        """More than 25 hub nodes → multiple pages."""
+    def test_caps_at_max(self):
+        """Should not return more than MAX_PAGE_NAMING_SYMBOLS."""
         with tempfile.TemporaryDirectory() as tmp:
-            nodes = [_make_node_dict(f"hub{i}") for i in range(30)]
+            nodes = [_make_node_dict(f"n{i}") for i in range(20)]
             db = _make_db(tmp, nodes=nodes)
-            for n in nodes:
-                db.set_hub(n["node_id"], is_hub=True, assignment="global_core")
-            db.conn.commit()
 
             planner = ClusterStructurePlanner(db, _mock_llm_response())
-            core_nodes = planner._load_global_core_nodes()
-            section = planner._build_global_core_section(core_nodes, section_order=1)
-            self.assertGreaterEqual(len(section.pages), 2)
+            page_syms = planner._get_page_symbols([f"n{i}" for i in range(20)])
 
-    def test_no_core_nodes(self):
+            self.assertLessEqual(len(page_syms), planner.MAX_PAGE_NAMING_SYMBOLS)
+
+    def test_empty_node_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = _make_db(tmp)
             planner = ClusterStructurePlanner(db, _mock_llm_response())
-            core_nodes = planner._load_global_core_nodes()
-            self.assertEqual(len(core_nodes), 0)
+            page_syms = planner._get_page_symbols([])
+            self.assertEqual(page_syms, [])
+
+    def test_only_architectural_nodes(self):
+        """Non-architectural nodes are excluded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = [
+                _make_node_dict("arch", is_architectural=1, symbol_type="class"),
+                _make_node_dict("non_arch", is_architectural=0, symbol_type="variable"),
+            ]
+            db = _make_db(tmp, nodes=nodes)
+            planner = ClusterStructurePlanner(db, _mock_llm_response())
+            page_syms = planner._get_page_symbols(["arch", "non_arch"])
+            self.assertEqual(len(page_syms), 1)
+            self.assertEqual(page_syms[0]["name"], "arch")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -290,7 +325,7 @@ class TestClusterNaming(unittest.TestCase):
             mock_llm = _mock_llm_response(
                 section_name="Authentication",
                 pages=[
-                    {"micro_id": 0, "page_name": "Auth Core", "description": "Core auth logic", "retrieval_query": "auth core"},
+                    {"page_name": "Auth Core", "description": "Core auth logic", "retrieval_query": "auth core"},
                 ],
             )
 
@@ -303,7 +338,8 @@ class TestClusterNaming(unittest.TestCase):
             self.assertEqual(section.pages[0].page_name, "Auth Core")
             self.assertTrue(len(section.pages[0].target_symbols) > 0)
 
-    def test_llm_called_with_correct_messages(self):
+    def test_two_pass_calls_llm_separately(self):
+        """Section naming and page naming are separate LLM calls."""
         with tempfile.TemporaryDirectory() as tmp:
             nodes = [_make_node_dict("n0")]
             db = _make_db(tmp, nodes=nodes)
@@ -314,10 +350,61 @@ class TestClusterNaming(unittest.TestCase):
             planner = ClusterStructurePlanner(db, mock_llm)
             planner._name_macro_cluster(0, {0: ["n0"]}, section_order=1)
 
-            mock_llm.invoke.assert_called_once()
-            messages = mock_llm.invoke.call_args[0][0]
-            self.assertEqual(len(messages), 2)
-            self.assertIn("naming", messages[0].content.lower())
+            # 1 micro-cluster → 1 section call + 1 page call = 2 total
+            self.assertEqual(mock_llm.invoke.call_count, 2)
+
+            # First call should use SECTION_NAMING_SYSTEM
+            section_msgs = mock_llm.invoke.call_args_list[0][0][0]
+            self.assertIn("capability name", section_msgs[0].content.lower())
+
+            # Second call should use PAGE_NAMING_SYSTEM
+            page_msgs = mock_llm.invoke.call_args_list[1][0][0]
+            self.assertIn("page titles", page_msgs[0].content.lower())
+
+    def test_page_naming_gets_only_page_symbols(self):
+        """Pass 2 should receive only the micro-cluster's own symbols, not macro dominants."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = [
+                _make_node_dict(f"auth_{i}", symbol_name=f"AuthClass{i}",
+                                rel_path=f"src/auth/{i}.py", symbol_type="class")
+                for i in range(3)
+            ] + [
+                _make_node_dict(f"data_{i}", symbol_name=f"DataHandler{i}",
+                                rel_path=f"src/data/{i}.py", symbol_type="class")
+                for i in range(3)
+            ]
+            db = _make_db(tmp, nodes=nodes)
+            for i in range(3):
+                db.set_cluster(f"auth_{i}", macro=0, micro=0)
+                db.set_cluster(f"data_{i}", macro=0, micro=1)
+            db.conn.commit()
+
+            mock_llm = _mock_llm_response(
+                section_name="Auth & Data",
+                pages=[
+                    {"page_name": "Authentication", "description": "Auth", "retrieval_query": "auth"},
+                    {"page_name": "Data Handling", "description": "Data", "retrieval_query": "data"},
+                ],
+            )
+            planner = ClusterStructurePlanner(db, mock_llm)
+            micro_map = {
+                0: [f"auth_{i}" for i in range(3)],
+                1: [f"data_{i}" for i in range(3)],
+            }
+            section = planner._name_macro_cluster(0, micro_map, section_order=1)
+
+            # 1 section call + 2 page calls = 3 total
+            self.assertEqual(mock_llm.invoke.call_count, 3)
+
+            # Check page-naming call for micro=0 has auth symbols, not data symbols
+            page0_msg = mock_llm.invoke.call_args_list[1][0][0][1].content
+            self.assertIn("AuthClass", page0_msg)
+            self.assertNotIn("DataHandler", page0_msg)
+
+            # Check page-naming call for micro=1 has data symbols, not auth symbols
+            page1_msg = mock_llm.invoke.call_args_list[2][0][0][1].content
+            self.assertIn("DataHandler", page1_msg)
+            self.assertNotIn("AuthClass", page1_msg)
 
     def test_multiple_micro_clusters(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -331,8 +418,8 @@ class TestClusterNaming(unittest.TestCase):
 
             mock_llm = _mock_llm_response(
                 pages=[
-                    {"micro_id": 0, "page_name": "Page A", "description": "A", "retrieval_query": "a"},
-                    {"micro_id": 1, "page_name": "Page B", "description": "B", "retrieval_query": "b"},
+                    {"page_name": "Page A", "description": "A", "retrieval_query": "a"},
+                    {"page_name": "Page B", "description": "B", "retrieval_query": "b"},
                 ],
             )
 
@@ -352,22 +439,30 @@ class TestClusterNaming(unittest.TestCase):
 class TestPlanStructure(unittest.TestCase):
 
     def test_end_to_end(self):
-        """Full pipeline with two communities + hub → sections + global_core."""
+        """Full pipeline with two communities + hub → sections (hubs reintegrated)."""
         with tempfile.TemporaryDirectory() as tmp:
             db, G = _build_two_community_db(tmp)
 
-            # The LLM will be called once per macro-cluster (2 communities)
-            call_count = [0]
+            # Two-pass: each macro-cluster gets 1 section call + N page calls
+            section_count = [0]
 
             def mock_invoke(messages, **kwargs):
-                call_count[0] += 1
+                system_content = messages[0].content.lower()
                 resp = MagicMock()
-                resp.content = json.dumps({
-                    "section_name": f"Section {call_count[0]}",
-                    "section_description": f"Description {call_count[0]}",
-                    "pages": [{"micro_id": 0, "page_name": f"Page {call_count[0]}.1",
-                               "description": "desc", "retrieval_query": "query"}],
-                })
+                if "capability name" in system_content:
+                    # Section naming (Pass 1)
+                    section_count[0] += 1
+                    resp.content = json.dumps({
+                        "section_name": f"Section {section_count[0]}",
+                        "section_description": f"Description {section_count[0]}",
+                    })
+                else:
+                    # Page naming (Pass 2)
+                    resp.content = json.dumps({
+                        "page_name": f"Page {section_count[0]}.auto",
+                        "description": "desc",
+                        "retrieval_query": "query",
+                    })
                 return resp
 
             mock_llm = MagicMock()
@@ -377,7 +472,7 @@ class TestPlanStructure(unittest.TestCase):
             spec = planner.plan_structure()
 
             self.assertIsInstance(spec, WikiStructureSpec)
-            # At least 2 sections from the 2 communities + possibly global_core
+            # At least 2 sections from the 2 communities (hubs now reintegrated)
             self.assertGreaterEqual(len(spec.sections), 2)
             self.assertGreater(spec.total_pages, 0)
             self.assertTrue(spec.wiki_title)
@@ -387,12 +482,25 @@ class TestPlanStructure(unittest.TestCase):
         """Spec should pass Pydantic validation."""
         with tempfile.TemporaryDirectory() as tmp:
             db, _ = _build_two_community_db(tmp)
+
+            def mock_invoke(messages, **kwargs):
+                system_content = messages[0].content.lower()
+                resp = MagicMock()
+                if "capability name" in system_content:
+                    resp.content = json.dumps({
+                        "section_name": "Test Section",
+                        "section_description": "Test",
+                    })
+                else:
+                    resp.content = json.dumps({
+                        "page_name": "P1",
+                        "description": "d",
+                        "retrieval_query": "q",
+                    })
+                return resp
+
             mock_llm = MagicMock()
-            mock_llm.invoke.return_value = MagicMock(content=json.dumps({
-                "section_name": "Test Section",
-                "section_description": "Test",
-                "pages": [{"micro_id": 0, "page_name": "P1", "description": "d", "retrieval_query": "q"}],
-            }))
+            mock_llm.invoke.side_effect = mock_invoke
 
             planner = ClusterStructurePlanner(db, mock_llm)
             spec = planner.plan_structure()
@@ -405,22 +513,32 @@ class TestPlanStructure(unittest.TestCase):
         """Pages should have target_symbols, key_files, target_folders."""
         with tempfile.TemporaryDirectory() as tmp:
             db, _ = _build_two_community_db(tmp)
+
+            def mock_invoke(messages, **kwargs):
+                system_content = messages[0].content.lower()
+                resp = MagicMock()
+                if "capability name" in system_content:
+                    resp.content = json.dumps({
+                        "section_name": "Auth",
+                        "section_description": "Auth module",
+                    })
+                else:
+                    resp.content = json.dumps({
+                        "page_name": "Auth Core",
+                        "description": "core",
+                        "retrieval_query": "auth",
+                    })
+                return resp
+
             mock_llm = MagicMock()
-            mock_llm.invoke.return_value = MagicMock(content=json.dumps({
-                "section_name": "Auth",
-                "section_description": "Auth module",
-                "pages": [{"micro_id": 0, "page_name": "Auth Core",
-                           "description": "core", "retrieval_query": "auth"}],
-            }))
+            mock_llm.invoke.side_effect = mock_invoke
 
             planner = ClusterStructurePlanner(db, mock_llm)
             spec = planner.plan_structure()
 
-            # Find a non-global-core section
-            regular_sections = [s for s in spec.sections
-                                if s.section_name != GLOBAL_CORE_SECTION_NAME]
-            self.assertTrue(regular_sections)
-            page = regular_sections[0].pages[0]
+            # All sections are regular (no more global_core synthetic section)
+            self.assertTrue(spec.sections)
+            page = spec.sections[0].pages[0]
             self.assertTrue(page.target_symbols)
             self.assertTrue(page.key_files)
             self.assertTrue(page.retrieval_query)
