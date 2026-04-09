@@ -182,7 +182,7 @@ def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> List[Docume
         sql = """
             SELECT n.node_id, n.symbol_name, n.symbol_type,
                    n.rel_path, n.start_line, n.end_line,
-                   n.content, n.docstring,
+                   n.source_text, n.docstring,
                    rank
             FROM repo_fts f
             JOIN repo_nodes n ON n.node_id = f.node_id
@@ -196,8 +196,8 @@ def _search_unified_db_fts(db_path: str, query: str, k: int = 10) -> List[Docume
         docs: List[Document] = []
         for row in rows:
             (node_id, sym_name, sym_type, rel_path,
-             start_line, end_line, content, docstring, _rank) = row
-            page_content = content or docstring or ''
+             start_line, end_line, source_text, docstring, _rank) = row
+            page_content = source_text or docstring or ''
             if not page_content.strip():
                 continue
             docs.append(Document(
@@ -297,6 +297,70 @@ def _get_unified_db_relationships(db_path: str, symbol_name: str,
         return '\n'.join(lines)
     except Exception as exc:
         logger.warning("[RESEARCH_TOOLS] Unified DB relationship query failed: %s", exc)
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _get_code_from_unified_db(db_path: str, symbol_name: str, max_lines: int = 200) -> Optional[str]:
+    """Retrieve source code for a symbol from the unified .wiki.db.
+
+    Returns a formatted Markdown code block, or None on failure.
+    """
+    db = _open_unified_db_readonly(db_path)
+    if db is None:
+        return None
+    try:
+        conn = db.conn
+
+        # Resolve symbol to node row (exact match first, then LIKE)
+        row = conn.execute(
+            "SELECT node_id, symbol_name, symbol_type, rel_path, "
+            "       start_line, end_line, source_text, docstring, signature "
+            "FROM repo_nodes WHERE LOWER(symbol_name) = LOWER(?) LIMIT 1",
+            (symbol_name,),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT node_id, symbol_name, symbol_type, rel_path, "
+                "       start_line, end_line, source_text, docstring, signature "
+                "FROM repo_nodes WHERE LOWER(symbol_name) LIKE ? "
+                "ORDER BY length(symbol_name) LIMIT 1",
+                (f'%{symbol_name.lower()}%',),
+            ).fetchone()
+        if not row:
+            return None
+
+        (_nid, sym_name, sym_type, rel_path,
+         start_line, end_line, source_text, docstring, signature) = row
+
+        content = source_text or docstring or ''
+        if not content.strip():
+            if signature:
+                content = signature
+            else:
+                return (
+                    f"### `{sym_name}` ({sym_type}) — {rel_path}\n\n"
+                    f"Source code not stored for this symbol.\n"
+                    f"Tip: use search_docs for documentation context."
+                )
+
+        lines = content.split('\n')
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+
+        loc = f":{start_line}-{end_line}" if start_line else ''
+        header = f"### `{sym_name}` ({sym_type}) — {rel_path}{loc}\n"
+        code_block = '\n'.join(lines)
+        suffix = f'\n... (truncated at {max_lines} lines)' if truncated else ''
+        return f"{header}\n```\n{code_block}\n```{suffix}"
+    except Exception as exc:
+        logger.warning("[RESEARCH_TOOLS] Unified DB get_code failed: %s", exc)
         return None
     finally:
         try:
@@ -1019,6 +1083,24 @@ def create_codebase_tools(
                         'refs': 0,
                         'doc': '',
                     })
+            elif _use_db_fallback:
+                docs = _search_unified_db_fts(_udb_path, query, k=k)
+                for doc in docs:
+                    m = doc.metadata
+                    st = m.get('symbol_type', '').lower()
+                    if sym_types and st not in sym_types:
+                        continue
+                    rp = m.get('rel_path', m.get('source', ''))
+                    if path_prefix and not rp.startswith(path_prefix):
+                        continue
+                    results.append({
+                        'name': m.get('symbol_name', ''),
+                        'kind': st,
+                        'layer': '',
+                        'file': rp,
+                        'refs': 0,
+                        'doc': '',
+                    })
             else:
                 return "No search index available. Use search_codebase instead."
 
@@ -1191,6 +1273,18 @@ def create_codebase_tools(
         })
 
         if not query_service:
+            if _use_db_fallback:
+                result = _get_unified_db_relationships(
+                    _udb_path, symbol_name, max_depth=max_depth,
+                )
+                if result:
+                    emit({
+                        "type": "tool_end",
+                        "tool": "get_relationships",
+                        "result_count": 1,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    return result
             return "Code graph not available for relationship analysis"
 
         try:
@@ -1276,6 +1370,18 @@ def create_codebase_tools(
         })
 
         if code_graph is None:
+            if _use_db_fallback:
+                result = _get_code_from_unified_db(
+                    _udb_path, symbol_name, max_lines=max_lines,
+                )
+                if result:
+                    emit({
+                        "type": "tool_end",
+                        "tool": "get_code",
+                        "result_count": 1,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    return result
             return "Code graph not available"
 
         try:
