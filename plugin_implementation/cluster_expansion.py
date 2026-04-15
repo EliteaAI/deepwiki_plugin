@@ -1,0 +1,631 @@
+"""
+Cluster-Bounded Content Expansion — Phase 6 of the Unified Graph & Clustering plan.
+
+Provides ``expand_for_page()`` which retrieves and expands page content
+directly from :class:`UnifiedWikiDB`, using cluster boundaries to prevent
+context pollution from unrelated symbols.
+
+When ``DEEPWIKI_STRUCTURE_PLANNER=cluster``, the wiki agent calls this
+module instead of the legacy NX-graph based expansion
+(``_get_docs_by_target_symbols`` + ``expand_smart``).
+
+Key advantages:
+- Expansion is bounded to the page's macro-cluster (no cross-cluster leaks)
+- No in-memory NX graph needed at page-generation time
+- Documentation files naturally included (they're cluster members via Phase 2 semantic edges)
+- Token-budget aware: symbols are added in priority order until the budget is exhausted
+- Result is a flat list of LangChain ``Document`` objects ready for LLM context
+
+Typical flow::
+
+    with UnifiedWikiDB(db_path) as db:
+        docs = expand_for_page(
+            db=db,
+            page_symbols=["AuthService", "LoginHandler", "SessionManager"],
+            macro_id=3,
+            token_budget=50_000,
+        )
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from langchain_core.documents import Document
+
+logger = logging.getLogger(__name__)
+
+# Languages that support header/implementation split augmentation.
+# Values must match what graph_builder.SUPPORTED_LANGUAGES stores in
+# repo_nodes.language  (e.g. 'cpp', 'c', 'go', 'rust').
+_CPP_LANGUAGES = frozenset({'cpp', 'c'})   # C++ & C headers/impls
+_GO_LANGUAGES  = frozenset({'go'})
+_RUST_LANGUAGES = frozenset({'rust'})
+_AUGMENTABLE_LANGUAGES = _CPP_LANGUAGES | _GO_LANGUAGES | _RUST_LANGUAGES
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Default token budget per page (matches the CONTEXT_TOKEN_BUDGET in wiki agent)
+DEFAULT_TOKEN_BUDGET = 50_000
+
+# Max neighbours to fetch per symbol during 1-hop expansion
+MAX_NEIGHBORS_PER_SYMBOL = 15
+
+# Global cap on total expansion nodes for one page
+MAX_EXPANSION_TOTAL = 200
+
+# Architectural symbol types accepted during expansion
+# (mirrors constants.EXPANSION_SYMBOL_TYPES)
+EXPANSION_SYMBOL_TYPES = frozenset({
+    'class', 'interface', 'struct', 'enum', 'trait',
+    'function', 'constant', 'type_alias', 'macro',
+    'module_doc', 'file_doc',
+})
+
+# Priority relationship types: edges traversed during expansion (sorted by
+# architectural importance — P0 first, P2 last).
+# Only outgoing edges are expanded.  Incoming edges add too much noise for
+# page-level context (the caller doesn't need the callees' own callers).
+_P0_REL_TYPES = frozenset({
+    'inheritance', 'implementation', 'defines_body',
+    'creates', 'instantiates',
+})
+_P1_REL_TYPES = frozenset({
+    'composition', 'aggregation', 'alias_of', 'specializes',
+})
+_P2_REL_TYPES = frozenset({
+    'calls', 'references',
+})
+
+# Average tokens per 1 char of source — rough estimate for budget tracking.
+# Measured across several real repos: 1 token ≈ 3.5 chars for code.
+_CHARS_PER_TOKEN = 3.5
+
+
+# ---------------------------------------------------------------------------
+# Token estimation
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Quick token estimate without importing tiktoken."""
+    if not text:
+        return 0
+    return max(1, int(len(text) / _CHARS_PER_TOKEN))
+
+
+# ---------------------------------------------------------------------------
+# Node ➜ Document conversion
+# ---------------------------------------------------------------------------
+
+def _node_to_document(
+    node: Dict[str, Any],
+    *,
+    is_initial: bool = True,
+    expanded_from: Optional[str] = None,
+) -> Document:
+    """Convert a unified-DB node dict to a LangChain ``Document``."""
+    page_content = node.get("source_text") or ""
+    metadata = {
+        "node_id": node.get("node_id", ""),
+        "symbol_name": node.get("symbol_name", ""),
+        "symbol_type": node.get("symbol_type", ""),
+        "source": node.get("rel_path", ""),
+        "rel_path": node.get("rel_path", ""),
+        "file_name": node.get("file_name", ""),
+        "language": node.get("language", ""),
+        "start_line": node.get("start_line", 0),
+        "end_line": node.get("end_line", 0),
+        "chunk_type": node.get("chunk_type") or node.get("symbol_type", ""),
+        "docstring": node.get("docstring", ""),
+        "signature": node.get("signature", ""),
+        "is_architectural": bool(node.get("is_architectural", 0)),
+        "is_doc": bool(node.get("is_doc", 0)),
+        "is_documentation": bool(node.get("is_doc", 0)),
+        "macro_cluster": node.get("macro_cluster"),
+        "micro_cluster": node.get("micro_cluster"),
+        "is_initially_retrieved": is_initial,
+    }
+    if expanded_from:
+        metadata["expanded_from"] = expanded_from
+    return Document(page_content=page_content, metadata=metadata)
+
+
+# ---------------------------------------------------------------------------
+# Cross-file augmentation (C++ header↔impl, Go receivers, Rust impl blocks)
+# ---------------------------------------------------------------------------
+
+def _augment_document(db, doc: Document) -> int:
+    """Augment a Document in-place with cross-file implementation bodies.
+
+    For C++ declarations, finds ``defines_body`` predecessors (impl → decl)
+    and stitches implementation source text into the document.
+
+    For Go structs, finds cross-file receiver methods via ``defines`` edges.
+
+    For Rust types, finds cross-file impl methods via ``defines`` edges.
+
+    Returns the *additional* token cost from the augmentation (0 if none).
+    """
+    lang = (doc.metadata.get("language") or "").lower()
+    if lang not in _AUGMENTABLE_LANGUAGES:
+        return 0
+
+    node_id = doc.metadata.get("node_id", "")
+    sym_type = (doc.metadata.get("symbol_type") or "").lower()
+    rel_path = doc.metadata.get("rel_path") or doc.metadata.get("source", "")
+    if not node_id:
+        return 0
+
+    conn = db.conn
+    original_len = len(doc.page_content)
+    augmented_parts: List[str] = []
+
+    if lang in _CPP_LANGUAGES:
+        augmented_parts = _augment_cpp(conn, node_id, sym_type, rel_path)
+    elif lang in _GO_LANGUAGES:
+        augmented_parts = _augment_go_rust(conn, node_id, sym_type, rel_path)
+    elif lang in _RUST_LANGUAGES:
+        augmented_parts = _augment_go_rust(conn, node_id, sym_type, rel_path)
+
+    if augmented_parts:
+        extra = "\n\n".join(augmented_parts)
+        doc.page_content = doc.page_content + "\n\n" + extra
+        doc.metadata["is_augmented"] = True
+        extra_tokens = _estimate_tokens(extra)
+        logger.debug(
+            "[CLUSTER_EXPANSION] Augmented %s (%s) with %d impl parts (+%d tokens)",
+            node_id, sym_type, len(augmented_parts), extra_tokens,
+        )
+        return extra_tokens
+
+    return 0
+
+
+def _augment_cpp(
+    conn, node_id: str, sym_type: str, decl_file: str,
+) -> List[str]:
+    """C++ augmentation: find defines_body implementations for declarations."""
+    parts: List[str] = []
+
+    if sym_type in ('function', 'method', 'constructor'):
+        # Function/method: look for incoming defines_body (impl → decl)
+        rows = conn.execute(
+            "SELECT n.source_text, n.rel_path FROM repo_edges e "
+            "JOIN repo_nodes n ON e.source_id = n.node_id "
+            "WHERE e.target_id = ? AND e.rel_type = 'defines_body'",
+            (node_id,),
+        ).fetchall()
+        for row in rows:
+            impl_text = row[0] or ""
+            impl_file = row[1] or ""
+            if impl_text.strip() and impl_file != decl_file:
+                parts.append(
+                    f"/* Implementation from {impl_file} */\n{impl_text}"
+                )
+
+    elif sym_type in ('class', 'struct'):
+        # Class/struct: find methods defined by this class, then their impls
+        method_rows = conn.execute(
+            "SELECT e.target_id FROM repo_edges e "
+            "JOIN repo_nodes n ON e.target_id = n.node_id "
+            "WHERE e.source_id = ? AND e.rel_type = 'defines' "
+            "AND n.symbol_type IN ('method', 'constructor', 'function')",
+            (node_id,),
+        ).fetchall()
+
+        impl_by_file: Dict[str, List[str]] = {}
+        for method_row in method_rows:
+            method_id = method_row[0]
+            impl_rows = conn.execute(
+                "SELECT n.source_text, n.rel_path FROM repo_edges e "
+                "JOIN repo_nodes n ON e.source_id = n.node_id "
+                "WHERE e.target_id = ? AND e.rel_type = 'defines_body'",
+                (method_id,),
+            ).fetchall()
+            for row in impl_rows:
+                impl_text = row[0] or ""
+                impl_file = row[1] or ""
+                if impl_text.strip() and impl_file != decl_file:
+                    impl_by_file.setdefault(impl_file, []).append(impl_text)
+
+        for impl_file, impls in sorted(impl_by_file.items()):
+            header = (
+                f"/* Implementations from {impl_file} "
+                f"({len(impls)} method{'s' if len(impls) != 1 else ''}) */"
+            )
+            parts.append(header + "\n" + "\n\n".join(impls))
+
+    return parts
+
+
+def _augment_go_rust(
+    conn, node_id: str, sym_type: str, type_file: str,
+) -> List[str]:
+    """Go/Rust augmentation: find cross-file receiver/impl methods."""
+    if sym_type not in ('struct', 'class', 'enum', 'trait'):
+        return []
+
+    # Find methods defined by this type in other files
+    rows = conn.execute(
+        "SELECT n.source_text, n.rel_path, n.symbol_type FROM repo_edges e "
+        "JOIN repo_nodes n ON e.target_id = n.node_id "
+        "WHERE e.source_id = ? AND e.rel_type = 'defines' "
+        "AND n.symbol_type IN ('method', 'function', 'constructor') "
+        "AND n.rel_path != ?",
+        (node_id, type_file),
+    ).fetchall()
+
+    methods_by_file: Dict[str, List[str]] = {}
+    for row in rows:
+        text = row[0] or ""
+        mfile = row[1] or ""
+        if text.strip() and mfile:
+            methods_by_file.setdefault(mfile, []).append(text)
+
+    parts: List[str] = []
+    for mfile, mtexts in sorted(methods_by_file.items()):
+        header = (
+            f"// Methods from {mfile} "
+            f"({len(mtexts)} method{'s' if len(mtexts) != 1 else ''})"
+        )
+        parts.append(header + "\n" + "\n\n".join(mtexts))
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Core API
+# ---------------------------------------------------------------------------
+
+def expand_for_page(
+    db,  # UnifiedWikiDB instance (avoid import cycle)
+    page_symbols: List[str],
+    macro_id: Optional[int] = None,
+    micro_id: Optional[int] = None,
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
+    include_docs: bool = True,
+) -> List[Document]:
+    """Expand page symbols with cluster-bounded context from the unified DB.
+
+    Parameters
+    ----------
+    db : UnifiedWikiDB
+        Opened database (readonly or read-write).
+    page_symbols : list[str]
+        Symbol *names* (not node_ids) assigned to this page by the
+        cluster planner.  Resolved via SQL lookup on ``symbol_name``.
+    macro_id : int, optional
+        Macro-cluster ID for boundary enforcement.  When set, expansion
+        neighbours are restricted to this cluster.
+    micro_id : int, optional
+        Micro-cluster ID for tighter scoping (rarely needed).
+    token_budget : int
+        Maximum estimated tokens for the returned documents.
+    include_docs : bool
+        If True (default), documentation nodes in the same cluster are
+        included automatically alongside code symbols.
+
+    Returns
+    -------
+    list[Document]
+        Flat list ordered by: initial symbols → P0 expansions → P1 → P2 → docs.
+    """
+    if not page_symbols:
+        return []
+
+    budget_remaining = token_budget
+    seen_ids: Set[str] = set()
+    result_docs: List[Document] = []
+
+    # ── Step 1: Resolve symbol names to node_ids ─────────────────
+    matched_nodes = _resolve_symbols(db, page_symbols, macro_id)
+
+    if not matched_nodes:
+        logger.warning(
+            "[CLUSTER_EXPANSION] No nodes resolved for symbols %s (macro=%s)",
+            page_symbols[:5], macro_id,
+        )
+        return []
+
+    logger.info(
+        "[CLUSTER_EXPANSION] Resolved %d/%d symbols to %d nodes (macro=%s)",
+        len([s for s in page_symbols if any(
+            n["symbol_name"] == s for n in matched_nodes.values()
+        )]),
+        len(page_symbols),
+        len(matched_nodes),
+        macro_id,
+    )
+
+    # ── Step 2: Add initial symbols (highest priority) ───────────
+    for node_id, node in matched_nodes.items():
+        doc = _node_to_document(node, is_initial=True)
+        cost = _estimate_tokens(doc.page_content)
+        if cost > budget_remaining:
+            logger.debug(
+                "[CLUSTER_EXPANSION] Budget exhausted adding initial symbol %s "
+                "(%d tokens remaining, %d needed)",
+                node.get("symbol_name"), budget_remaining, cost,
+            )
+            break
+        result_docs.append(doc)
+        seen_ids.add(node_id)
+        budget_remaining -= cost
+
+    # ── Step 2.5: Augment initial symbols with cross-file impls ──
+    # C++ header↔impl, Go receiver methods, Rust impl blocks.
+    augmented_count = 0
+    for doc in result_docs:
+        extra = _augment_document(db, doc)
+        if extra > 0:
+            budget_remaining -= extra
+            augmented_count += 1
+    if augmented_count:
+        logger.info(
+            "[CLUSTER_EXPANSION] Augmented %d/%d initial docs "
+            "(budget remaining: %d)",
+            augmented_count, len(result_docs), budget_remaining,
+        )
+
+    # ── Step 3: 1-hop expansion within cluster boundary ──────────
+    expansion_pool = _collect_expansion_neighbors(
+        db, list(matched_nodes.keys()), seen_ids, macro_id,
+    )
+
+    for priority_group in (_P0_REL_TYPES, _P1_REL_TYPES, _P2_REL_TYPES):
+        if budget_remaining <= 0:
+            break
+        group_nodes = [
+            (nid, node, rel) for nid, node, rel in expansion_pool
+            if rel in priority_group and nid not in seen_ids
+        ]
+        for nid, node, rel in group_nodes:
+            if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
+                break
+            doc = _node_to_document(node, is_initial=False, expanded_from=rel)
+            # Augment expansion nodes too (C++ class expanded via inheritance
+            # should also show its implementations)
+            aug_cost = _augment_document(db, doc)
+            cost = _estimate_tokens(doc.page_content)
+            if cost > budget_remaining:
+                continue  # skip large node, try smaller ones
+            result_docs.append(doc)
+            seen_ids.add(nid)
+            budget_remaining -= cost
+
+    # ── Step 4: Include cluster doc nodes (if budget allows) ─────
+    if include_docs and macro_id is not None and budget_remaining > 0:
+        doc_nodes = _get_cluster_docs(db, macro_id, micro_id, seen_ids)
+        for node in doc_nodes:
+            if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
+                break
+            doc = _node_to_document(node, is_initial=False, expanded_from="cluster_doc")
+            cost = _estimate_tokens(doc.page_content)
+            if cost > budget_remaining:
+                continue
+            result_docs.append(doc)
+            seen_ids.add(node.get("node_id", ""))
+            budget_remaining -= cost
+
+    tokens_used = token_budget - budget_remaining
+    logger.info(
+        "[CLUSTER_EXPANSION] Page expansion: %d docs, ~%d tokens used "
+        "(%d initial, %d expanded, macro=%s)",
+        len(result_docs), tokens_used,
+        sum(1 for d in result_docs if d.metadata.get("is_initially_retrieved")),
+        sum(1 for d in result_docs if not d.metadata.get("is_initially_retrieved")),
+        macro_id,
+    )
+    return result_docs
+
+
+# ---------------------------------------------------------------------------
+# Symbol resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_symbols(
+    db, symbol_names: List[str], macro_id: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve symbol *names* to node dicts via SQL, optionally scoped to cluster.
+
+    Returns ``{node_id: node_dict}`` preserving insertion order.
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    conn = db.conn
+
+    for name in symbol_names:
+        if not name:
+            continue
+
+        # Exact match on symbol_name, optionally within cluster
+        if macro_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE symbol_name = ? AND macro_cluster = ? "
+                "AND is_architectural = 1 "
+                "ORDER BY end_line - start_line DESC "
+                "LIMIT 5",
+                (name, macro_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM repo_nodes "
+                "WHERE symbol_name = ? "
+                "AND is_architectural = 1 "
+                "ORDER BY end_line - start_line DESC "
+                "LIMIT 5",
+                (name,),
+            ).fetchall()
+
+        if not rows:
+            # Fallback: FTS5 fuzzy search scoped to cluster
+            rows = _fts_fallback(db, name, macro_id)
+
+        for row in rows:
+            node = dict(row)
+            nid = node.get("node_id", "")
+            if nid and nid not in result:
+                result[nid] = node
+
+    return result
+
+
+def _fts_fallback(
+    db, name: str, macro_id: Optional[int] = None,
+) -> list:
+    """Use FTS5 to find a symbol by name when exact SQL match fails."""
+    try:
+        # Escape FTS5 special characters
+        safe_name = name.replace('"', '""')
+        if macro_id is not None:
+            rows = db.conn.execute(
+                'SELECT n.* FROM repo_fts f '
+                'JOIN repo_nodes n ON f.node_id = n.node_id '
+                'WHERE repo_fts MATCH ? '
+                'AND n.macro_cluster = ? '
+                'AND n.is_architectural = 1 '
+                'ORDER BY rank LIMIT 3',
+                (f'symbol_name:"{safe_name}"', macro_id),
+            ).fetchall()
+        else:
+            rows = db.conn.execute(
+                'SELECT n.* FROM repo_fts f '
+                'JOIN repo_nodes n ON f.node_id = n.node_id '
+                'WHERE repo_fts MATCH ? '
+                'AND n.is_architectural = 1 '
+                'ORDER BY rank LIMIT 3',
+                (f'symbol_name:"{safe_name}"',),
+            ).fetchall()
+        return rows
+    except Exception as exc:
+        logger.debug("[CLUSTER_EXPANSION] FTS5 fallback failed for '%s': %s", name, exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Expansion neighbour collection
+# ---------------------------------------------------------------------------
+
+def _collect_expansion_neighbors(
+    db,
+    seed_ids: List[str],
+    seen_ids: Set[str],
+    macro_id: Optional[int] = None,
+) -> List[Tuple[str, Dict[str, Any], str]]:
+    """Collect 1-hop expansion neighbours for *seed_ids*, bounded to cluster.
+
+    Returns list of ``(node_id, node_dict, rel_type)`` tuples sorted by
+    edge weight (descending, i.e. highest-weight edges first).
+    """
+    candidates: List[Tuple[str, Dict[str, Any], str, float]] = []
+    conn = db.conn
+
+    for seed_id in seed_ids:
+        # Outgoing edges
+        out_edges = conn.execute(
+            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
+            (seed_id,),
+        ).fetchall()
+        # Incoming edges (structurally important: who inherits/implements me)
+        in_edges = conn.execute(
+            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
+            (seed_id,),
+        ).fetchall()
+
+        neighbor_ids: Set[str] = set()
+        edge_info: List[Tuple[str, str, float]] = []  # (nid, rel_type, weight)
+
+        for row in out_edges:
+            tid = row[0]
+            if tid not in seen_ids and tid not in neighbor_ids:
+                neighbor_ids.add(tid)
+                edge_info.append((tid, row[1] or "unknown", row[2] or 1.0))
+
+        for row in in_edges:
+            sid = row[0]
+            if sid not in seen_ids and sid not in neighbor_ids:
+                neighbor_ids.add(sid)
+                edge_info.append((sid, row[1] or "unknown", row[2] or 1.0))
+
+        if not neighbor_ids:
+            continue
+
+        # Batch-fetch node metadata
+        # (SQLite doesn't have array params, but we can build an IN clause)
+        id_list = list(neighbor_ids)
+        placeholders = ",".join("?" * len(id_list))
+        rows = conn.execute(
+            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+            id_list,
+        ).fetchall()
+        node_map = {dict(r)["node_id"]: dict(r) for r in rows}
+
+        for nid, rel_type, weight in edge_info:
+            node = node_map.get(nid)
+            if not node:
+                continue
+            # Only expand architectural nodes
+            if not node.get("is_architectural"):
+                continue
+            stype = (node.get("symbol_type") or "").lower()
+            if stype not in EXPANSION_SYMBOL_TYPES:
+                continue
+            # Cluster boundary enforcement
+            if macro_id is not None and node.get("macro_cluster") != macro_id:
+                continue
+            candidates.append((nid, node, rel_type, weight))
+
+    # Deduplicate (first occurrence wins) and sort by weight descending
+    seen: Set[str] = set()
+    unique: List[Tuple[str, Dict[str, Any], str, float]] = []
+    for nid, node, rel, w in sorted(candidates, key=lambda x: -x[3]):
+        if nid not in seen and nid not in seen_ids:
+            seen.add(nid)
+            unique.append((nid, node, rel, w))
+
+    # Cap total expansion candidates
+    unique = unique[:MAX_EXPANSION_TOTAL]
+
+    return [(nid, node, rel) for nid, node, rel, _ in unique]
+
+
+# ---------------------------------------------------------------------------
+# Documentation nodes from cluster
+# ---------------------------------------------------------------------------
+
+def _get_cluster_docs(
+    db,
+    macro_id: int,
+    micro_id: Optional[int],
+    seen_ids: Set[str],
+) -> List[Dict[str, Any]]:
+    """Fetch documentation nodes from the same cluster not yet in ``seen_ids``.
+
+    Returns nodes sorted by path (deterministic ordering).
+    """
+    conn = db.conn
+    if micro_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM repo_nodes "
+            "WHERE macro_cluster = ? AND micro_cluster = ? AND is_doc = 1 "
+            "ORDER BY rel_path",
+            (macro_id, micro_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM repo_nodes "
+            "WHERE macro_cluster = ? AND is_doc = 1 "
+            "ORDER BY rel_path",
+            (macro_id,),
+        ).fetchall()
+
+    result = []
+    for r in rows:
+        node = dict(r)
+        if node.get("node_id", "") not in seen_ids:
+            result.append(node)
+    return result

@@ -1,0 +1,78 @@
+name: Build DeepWiki Plugin UI
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'static/ui/template/**'
+      - '.github/workflows/build-ui.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'static/ui/template/**'
+      - '.github/workflows/build-ui.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: static/ui/template/package-lock.json
+
+    - name: Install dependencies
+      working-directory: static/ui/template
+      run: npm ci
+
+    - name: Build UI
+      working-directory: static/ui/template
+      run: npm run build
+
+    - name: Check build output
+      working-directory: static/ui/template
+      run: |
+        if [ ! -d "../dist" ]; then
+          echo "Error: Build output directory ../dist does not exist"
+          exit 1
+        fi
+        if [ ! -f "../dist/index.html" ]; then
+          echo "Error: index.html not found in build output"
+          exit 1
+        fi
+        echo "Build successful! Output in static/ui/dist/"
+        ls -la ../dist/
+
+    - name: Upload build artifacts
+      if: matrix.node-version == '20.x'
+      uses: actions/upload-artifact@v4
+      with:
+        name: deepwiki-ui-dist
+        path: static/ui/dist/
+        retention-days: 7
+
+    - name: Commit build artifacts (main branch only)
+      if: github.ref == 'refs/heads/main' && matrix.node-version == '20.x'
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add static/ui/dist/
+        git diff --staged --quiet || git commit -m "chore: update UI build artifacts [skip ci]"
+
+    - name: Push changes
+      if: github.ref == 'refs/heads/main' && matrix.node-version == '20.x'
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: ${{ github.ref }}

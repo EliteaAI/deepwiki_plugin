@@ -1,0 +1,154 @@
+# ================================================================
+# DeepWiki Plugin — pinned requirements
+# Compatible with Pylon 1.2.22
+#
+# Packages already supplied by the Pylon base image are NOT listed
+# here.  Only packages that Pylon does NOT ship are included:
+#
+# Pylon-provided (do NOT duplicate):
+#   Flask 3.1.x, requests 2.32.x, PyYAML 6.x, pydantic 2.12.x,
+#   typing-extensions 4.15.x, certifi, urllib3 2.6.x, six 1.17.x,
+#   websocket-client 1.9.x, idna, charset-normalizer, click 8.3.x,
+#   Jinja2 3.1.x, MarkupSafe, attrs, greenlet, packaging,
+#   setuptools, cryptography, dulwich, paramiko, minio …
+#
+# NOTE: marshmallow 3.26.2 is installed here to satisfy
+# dataclasses-json < 4.0.0.  It shadows Pylon's marshmallow 4.x
+# in the plugin site-packages.  Pip shows a warning but exit 0.
+# ================================================================
+
+# --- LangChain ecosystem ----------------------------------------
+langchain-core==1.2.16
+langchain==1.2.10
+langchain-classic==1.0.1
+langchain-community==0.4.1
+langchain-text-splitters==1.1.1
+langchain-openai==1.1.10
+langchain-anthropic==1.3.4
+langsmith==0.7.7
+
+# --- LangGraph --------------------------------------------------
+langgraph==1.0.9
+langgraph-checkpoint==4.0.0
+langgraph-prebuilt==1.0.8
+langgraph-sdk==0.3.9
+
+# --- LLM providers ----------------------------------------------
+openai==2.24.0
+anthropic==0.84.0
+
+# --- Kubernetes (Jobs mode) -------------------------------------
+kubernetes==35.0.0
+# kubernetes transitive deps NOT in Pylon base:
+requests-oauthlib==2.0.0
+oauthlib==3.3.1
+durationpy==0.10
+python-dateutil==2.9.0.post0
+
+# --- ML / vector search -----------------------------------------
+faiss-cpu==1.13.2
+sentence-transformers==5.2.3
+rank-bm25==0.2.2
+tiktoken==0.12.0
+
+# --- Graph community detection ----------------------------------
+# igraph provides InfoMap (community_infomap) and is the backend for
+# leidenalg.  Both are C-backed with stable, battle-tested wheels.
+python-igraph==1.0.0
+leidenalg==0.11.0
+
+# --- Unified DB (sqlite-vec) ------------------------------------
+# sqlite-vec provides vector KNN search as a loadable SQLite extension.
+# pysqlite3 ships its own libsqlite3 built with ENABLE_LOAD_EXTENSION,
+# which the stock macOS / official-site Python lacks.  On Linux (Docker)
+# the stdlib sqlite3 already supports extensions, but pysqlite3 is
+# harmless there (compiles fine, gives a newer SQLite 3.51 vs 3.40).
+# unified_db.py imports: try pysqlite3 as sqlite3 / except: import sqlite3
+#
+# Build note: pysqlite3 compiles from source — requires libsqlite3-dev
+# in Dockerfile.worker builder stage (already added).
+#
+# NOTE: sqlite-vec 0.1.6 aarch64 wheel is broken (ships 32-bit ARM .so).
+# On Apple Silicon Docker (linux/aarch64) vec will fail to load.
+# Works fine on x86_64 (production) and macOS native (via pysqlite3).
+sqlite-vec==0.1.6
+pysqlite3==0.6.0
+
+# --- GitHub integration -----------------------------------------
+pygithub==2.3.0
+
+# --- Code parsing ------------------------------------------------
+tree-sitter-language-pack==0.9.1
+tree-sitter==0.23.2
+tree-sitter-c-sharp==0.23.1
+tree-sitter-embedded-template==0.23.2
+tree-sitter-yaml==0.7.0
+
+# --- Deep agents -------------------------------------------------
+deepagents==0.4.4
+wcmatch==10.1
+bracex==2.6
+filetype==1.2.0
+docstring-parser==0.17.0
+
+# --- LangChain transitive deps ----------------------------------
+dataclasses-json==0.6.7
+marshmallow==3.26.2
+typing-inspect==0.9.0
+typing-extensions==4.15.0
+mypy-extensions==1.1.0
+jsonpatch==1.33
+jsonpointer==3.0.0
+tenacity==9.1.4
+pydantic-settings==2.13.1
+python-dotenv==1.2.1
+requests-toolbelt==1.0.0
+orjson==3.11.7
+ormsgpack==1.12.2
+uuid-utils==0.14.1
+xxhash==3.6.0
+zstandard==0.25.0
+
+# --- HTTP / async ------------------------------------------------
+httpx==0.28.1
+httpcore==1.0.9
+anyio==4.12.1
+sniffio==1.3.1
+httpx-sse==0.4.3
+aiohttp==3.13.3
+aiohappyeyeballs==2.6.1
+aiosignal==1.4.0
+frozenlist==1.8.0
+websockets==16.0
+
+# --- ML stack (sentence-transformers deps) -----------------------
+torch==2.10.0
+transformers==5.2.0
+tokenizers==0.22.2
+safetensors==0.7.0
+numpy==2.4.2
+scipy==1.17.1
+scikit-learn==1.8.0
+huggingface-hub==1.5.0
+hf-xet==1.3.1
+regex==2026.2.19
+tqdm==4.67.3
+filelock==3.24.3
+fsspec==2026.2.0
+joblib==1.5.3
+threadpoolctl==3.6.0
+sympy==1.14.0
+mpmath==1.3.0
+networkx==3.6.1
+
+# --- Misc transitive deps ---------------------------------------
+distro==1.9.0
+jiter==0.13.0
+rich==14.3.3
+markdown-it-py==4.0.0
+mdurl==0.1.2
+shellingham==1.5.4
+typer==0.24.1
+typer-slim==0.24.0
+annotated-doc==0.0.4
+google-auth==2.48.0

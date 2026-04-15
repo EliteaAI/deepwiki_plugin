@@ -1,0 +1,45 @@
+# ================================================================
+# .dockerignore — keep the worker image lean
+# ================================================================
+
+# Version control
+.git
+.gitignore
+.gitmodules
+
+# CI/CD
+.github
+
+# Docker (don't nest Dockerfiles in context)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist
+build
+
+# Virtual envs
+.venv
+venv
+.env
+.env.*
+
+# Tests (not needed in worker)
+tests
+
+# Docs / planning
+*.md
+!requirements.txt
+LICENSE
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo

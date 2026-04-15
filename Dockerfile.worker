@@ -1,0 +1,104 @@
+# ================================================================
+# DeepWiki Worker — clean multi-stage build
+#
+# Base: python:3.12-slim-bookworm (Official Docker, ~150MB)
+# The worker doesn't run Pylon — just a Python script.
+# No need for Flask, web frameworks, or the full Pylon stack.
+#
+# Multi-stage:
+#   Stage 1 (builder) — pip install all deps into /opt/deepwiki
+#   Stage 2 (runtime) — slim Python + deps + plugin code
+#
+# Build (default — includes CUDA torch, ~3.5GB):
+#   docker build -f Dockerfile.worker \
+#       -t deepwiki-worker:$(git rev-parse --short HEAD) .
+#
+# Build (CPU-only — no CUDA, ~800MB):
+#   docker build -f Dockerfile.worker \
+#       --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+#       -t deepwiki-worker:$(git rev-parse --short HEAD)-cpu .
+#
+# Two runtime modes:
+#   1. Self-contained — code + deps baked in, no init container.
+#   2. Override — init container git-clones a different branch
+#      into /data/plugins/; PYTHONPATH gives it priority.
+#
+# Marker: /opt/deepwiki/.prebaked tells the init container to
+# skip pip install (only clone code).
+# ================================================================
+
+# ------------------------------------------------------------------
+# Stage 1: Builder — install pip packages
+# ------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS builder
+
+# Build tools for any C extension that ships without a wheel.
+# Most packages (torch, faiss-cpu, tokenizers) have pre-built
+# wheels — build-essential is a safety net, not in the final image.
+# libsqlite3-dev is required for pysqlite3 (extension-capable sqlite3
+# driver needed by unified_db.py for loading sqlite-vec).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONUSERBASE=/opt/deepwiki
+ENV PATH="/opt/deepwiki/bin:${PATH}"
+
+# Copy requirements first for layer caching
+COPY requirements.txt /tmp/requirements.txt
+
+# Optional: CPU-only PyTorch index (much smaller, no CUDA)
+ARG TORCH_INDEX_URL=""
+
+RUN set -ex; \
+    if [ -n "${TORCH_INDEX_URL}" ]; then \
+        pip install --user --no-cache-dir -U \
+            --retries 3 --timeout 600 \
+            --extra-index-url "${TORCH_INDEX_URL}" \
+            -r /tmp/requirements.txt; \
+    else \
+        pip install --user --no-cache-dir -U \
+            --retries 3 --timeout 600 \
+            -r /tmp/requirements.txt; \
+    fi \
+    && rm /tmp/requirements.txt
+
+# ------------------------------------------------------------------
+# Stage 2: Runtime — minimal image with deps + plugin code
+# ------------------------------------------------------------------
+FROM python:3.12-slim-bookworm
+
+LABEL maintainer="EliteaAI" \
+      description="DeepWiki worker — wiki generation Job runner" \
+      base="python:3.12-slim-bookworm"
+
+# Runtime-only system deps:
+#   git       — init container git-clones plugin source
+#   libgomp1  — OpenMP for torch / numpy / scipy
+# Debian slim already has www-data (uid 33) matching Pylon's securityContext.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/deepwiki /app \
+    && chown -R 33:33 /opt/deepwiki /app
+
+# Copy pre-built packages from builder stage
+COPY --from=builder --chown=33:33 /opt/deepwiki /opt/deepwiki
+
+# Copy plugin source code into the image.
+# This is the "baked-in" version — the init container can override
+# it by cloning a different branch to /data/plugins/deepwiki_plugin.
+COPY --chown=33:33 . /app/deepwiki_plugin
+
+# Marker file — init container checks this to skip pip install
+RUN echo "prebaked $(date -u +%Y-%m-%dT%H:%M:%SZ) python:3.12-slim-bookworm" \
+        > /opt/deepwiki/.prebaked
+
+ENV PYTHONUSERBASE=/opt/deepwiki
+ENV PATH="/opt/deepwiki/bin:${PATH}"
+
+# Run as www-data (uid 33) to match K8s securityContext
+USER 33:33
+WORKDIR /app

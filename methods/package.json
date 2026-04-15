@@ -1,0 +1,43 @@
+{
+  "name": "@elitea/sandbox-client",
+  "version": "1.0.0",
+  "description": "Lightweight EliteA client for JavaScript with tool testing and task management",
+  "main": "methods/sandbox_client.js",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./methods/sandbox_client.js",
+      "require": "./methods/sandbox_client.js"
+    }
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "example": "node methods/sandbox_client_examples.js"
+  },
+  "keywords": [
+    "elitea",
+    "sdk",
+    "client",
+    "tool-testing",
+    "task-management",
+    "mcp",
+    "artifacts"
+  ],
+  "author": "EliteA Team",
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EliteaAI/deepwiki_plugin.git"
+  },
+  "files": [
+    "methods/sandbox_client.js",
+    "methods/README_SANDBOX_CLIENT.md",
+    "methods/sandbox_client_examples.js",
+    "SANDBOX_CLIENT_MIGRATION.md"
+  ]
+}

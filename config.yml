@@ -1,0 +1,3 @@
+# Wiki Builder Plugin Configuration
+service_location_url: http://127.0.0.1:8097
+base_path: /tmp/wiki_builder
