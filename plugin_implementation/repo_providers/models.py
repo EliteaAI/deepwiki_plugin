@@ -29,6 +29,7 @@ class ProviderType(str, Enum):
             "bitbucket": cls.BITBUCKET,
             "bb": cls.BITBUCKET,
             "ado": cls.AZURE_DEVOPS,
+            "ado_repos": cls.AZURE_DEVOPS,
             "azure": cls.AZURE_DEVOPS,
             "azure_devops": cls.AZURE_DEVOPS,
             "azuredevops": cls.AZURE_DEVOPS,

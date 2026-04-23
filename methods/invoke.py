@@ -11,6 +11,32 @@ from pylon.core.tools import web  # pylint: disable=E0611,E0401,W0611
 
 default_bucket = 'wiki_artifacts'
 
+_TOOLKIT_PROVIDER_KEYS = (
+    'github_configuration',
+    'gitlab_configuration',
+    'bitbucket_configuration',
+    'ado_configuration',
+)
+def _payload_contains_provider_key(params: Dict[str, Any], provider_key: str) -> bool:
+    """Check known toolkit payload locations for a provider-specific config key."""
+    sources = [
+        params,
+        params.get('code_toolkit'),
+        params.get('toolkit_configuration_code_toolkit'),
+        params.get('code_repository'),
+    ]
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if provider_key in source:
+            return True
+        settings = source.get('settings')
+        if isinstance(settings, dict) and provider_key in settings:
+            return True
+
+    return False
+
 
 def create_llm(
     provider: str,
@@ -230,7 +256,12 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         - project: str or None (for Bitbucket/ADO)
         - is_cloud: bool or None (for Bitbucket)
     """
-    code_toolkit = params.get('code_toolkit') or params.get('code_repository') or {}
+    code_toolkit = (
+        params.get('code_toolkit')
+        or params.get('toolkit_configuration_code_toolkit')
+        or params.get('code_repository')
+        or {}
+    )
     
     # Initialize with defaults
     repo_config = {
@@ -242,32 +273,59 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         'is_cloud': None,
     }
     
-    if isinstance(code_toolkit, dict) and code_toolkit.get('settings'):
-        repo_settings = code_toolkit.get('settings', {})
-        
+    repo_settings = {}
+    if isinstance(code_toolkit, dict):
+        if isinstance(code_toolkit.get('settings'), dict):
+            repo_settings = code_toolkit.get('settings', {})
+        else:
+            repo_settings = code_toolkit
+
+    if not repo_settings and isinstance(params, dict):
+        repo_settings = params
+
+    if isinstance(repo_settings, dict) and any(
+        key in repo_settings
+        for key in ('github_configuration', 'gitlab_configuration', 'bitbucket_configuration', 'ado_configuration')
+    ):
         if 'github_configuration' in repo_settings:
             repo_config['provider_type'] = 'github'
             repo_config['provider_config'] = repo_settings.get('github_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository')
-            repo_config['branch'] = repo_settings.get('active_branch') or repo_settings.get('base_branch', 'main')
+            repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('github_repository')
+            repo_config['branch'] = (
+                repo_settings.get('active_branch')
+                or repo_settings.get('base_branch')
+                or repo_settings.get('branch', 'main')
+            )
         elif 'gitlab_configuration' in repo_settings:
             repo_config['provider_type'] = 'gitlab'
             repo_config['provider_config'] = repo_settings.get('gitlab_configuration', {})
             repo_config['repository'] = repo_settings.get('repository')
-            repo_config['branch'] = repo_settings.get('branch', 'main')
+            repo_config['branch'] = (
+                repo_settings.get('branch')
+                or repo_settings.get('active_branch')
+                or repo_settings.get('base_branch', 'main')
+            )
         elif 'bitbucket_configuration' in repo_settings:
             repo_config['provider_type'] = 'bitbucket'
             repo_config['provider_config'] = repo_settings.get('bitbucket_configuration', {})
             repo_config['repository'] = repo_settings.get('repository')
-            repo_config['branch'] = repo_settings.get('branch', 'main')
+            repo_config['branch'] = (
+                repo_settings.get('branch')
+                or repo_settings.get('active_branch')
+                or repo_settings.get('base_branch', 'main')
+            )
             repo_config['project'] = repo_settings.get('project')
             repo_config['is_cloud'] = repo_settings.get('cloud')
         elif 'ado_configuration' in repo_settings:
             repo_config['provider_type'] = 'ado_repos'
             repo_config['provider_config'] = repo_settings.get('ado_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository_id')
-            repo_config['branch'] = repo_settings.get('active_branch') or repo_settings.get('base_branch', 'main')
-            repo_config['project'] = repo_config['provider_config'].get('project')
+            repo_config['repository'] = repo_settings.get('repository_id') or repo_settings.get('repository')
+            repo_config['branch'] = (
+                repo_settings.get('active_branch')
+                or repo_settings.get('base_branch')
+                or repo_settings.get('branch', 'main')
+            )
+            repo_config['project'] = repo_config['provider_config'].get('project') or repo_settings.get('project')
         else:
             # Fallback: assume GitHub with legacy structure
             repo_config['provider_type'] = 'github'
@@ -280,7 +338,18 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         repo_config['provider_config'] = params.get('github_configuration', {})
         repo_config['repository'] = params.get('github_repository')
         repo_config['branch'] = params.get('github_base_branch') or params.get('github_branch', 'main')
-    
+
+    if _payload_contains_provider_key(params, 'ado_configuration') and (
+        repo_config.get('provider_type') != 'ado_repos' or not repo_config.get('repository')
+    ):
+        log.warning(
+            'Suspicious ADO repo config extraction: provider_type=%s repository=%s branch=%s project=%s',
+            repo_config.get('provider_type'),
+            repo_config.get('repository'),
+            repo_config.get('branch'),
+            repo_config.get('project'),
+        )
+
     return repo_config
 
 class Method:  # pylint: disable=E1101,R0903,W0201
@@ -1246,7 +1315,6 @@ Do not include any explanation or other text."""
                 self.invocation_stop_checkpoint()
 
                 llm_settings = params.get('llm_settings') or {}
-                log.info(f"LLM settings for wiki generation: {llm_settings}")
                 model_name = None
                 if isinstance(llm_settings, dict):
                     model_name = llm_settings.get('model_name')
