@@ -27,7 +27,6 @@ import networkx as nx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from plugin_implementation.graph_clustering import (
-    GLOBAL_CORE_LABEL,
     MICRO_CLUSTER_RULES,
     _find_nearest_cluster,
     _recursive_split,
@@ -336,25 +335,30 @@ class TestHubReintegration(unittest.TestCase):
         macro["c1_0"] = 1
 
         result = reintegrate_hubs(G, {"hub"}, macro)
-        self.assertEqual(result["hub"], "0")
+        self.assertEqual(result["hub"][0], 0)  # macro_id
 
-    def test_global_core_when_dispersed(self):
-        """Hub with edges evenly spread → global_core."""
+    def test_dispersed_hub_gets_plurality(self):
+        """Hub with edges evenly spread → assigned to cluster with most edges."""
         G = nx.MultiDiGraph()
         G.add_edge("hub", "c0_a", weight=1.0)
+        G.add_edge("hub", "c0_b", weight=1.0)
         G.add_edge("hub", "c1_a", weight=1.0)
         G.add_edge("hub", "c2_a", weight=1.0)
 
-        macro = {"c0_a": 0, "c1_a": 1, "c2_a": 2}
+        macro = {"c0_a": 0, "c0_b": 0, "c1_a": 1, "c2_a": 2}
         result = reintegrate_hubs(G, {"hub"}, macro)
-        self.assertEqual(result["hub"], GLOBAL_CORE_LABEL)
+        self.assertEqual(result["hub"][0], 0)  # cluster 0 has most edges (2)
 
-    def test_disconnected_hub(self):
-        """Hub with no edges to clustered nodes → global_core."""
+    def test_disconnected_hub_gets_largest_cluster(self):
+        """Hub with no edges → assigned to largest cluster."""
         G = nx.MultiDiGraph()
         G.add_node("hub")
-        result = reintegrate_hubs(G, {"hub"}, {})
-        self.assertEqual(result["hub"], GLOBAL_CORE_LABEL)
+        G.add_node("n0")
+        G.add_node("n1")
+        G.add_node("n2")
+        macro = {"n0": 0, "n1": 0, "n2": 1}
+        result = reintegrate_hubs(G, {"hub"}, macro)
+        self.assertEqual(result["hub"][0], 0)  # cluster 0 is largest
 
     def test_incoming_edges_count(self):
         """Incoming edges to hub should also be counted."""
@@ -367,10 +371,10 @@ class TestHubReintegration(unittest.TestCase):
         macro["c1_0"] = 1
 
         result = reintegrate_hubs(G, {"hub"}, macro)
-        self.assertEqual(result["hub"], "0")
+        self.assertEqual(result["hub"][0], 0)  # macro_id
 
     def test_multiple_hubs(self):
-        """Each hub gets independent assignment."""
+        """Each hub gets independent assignment (plurality vote)."""
         G = nx.MultiDiGraph()
         for i in range(4):
             G.add_edge("hub1", f"c0_{i}", weight=1.0)
@@ -382,8 +386,9 @@ class TestHubReintegration(unittest.TestCase):
         macro["c2_0"] = 2
 
         result = reintegrate_hubs(G, {"hub1", "hub2"}, macro)
-        self.assertEqual(result["hub1"], "0")
-        self.assertEqual(result["hub2"], GLOBAL_CORE_LABEL)
+        self.assertEqual(result["hub1"][0], 0)
+        # hub2 has tie (1 edge each to cluster 1 and 2) — gets whichever is most_common
+        self.assertIn(result["hub2"][0], [1, 2])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -420,13 +425,42 @@ class TestPersistClusters(unittest.TestCase):
 
             macro = {"n0": 0}
             micro = {0: {"n0": 0}}
-            hub_assign = {"hub1": GLOBAL_CORE_LABEL}
+            hub_assign = {"hub1": (0, 0)}  # (macro_id, micro_id)
 
             persist_clusters(db, macro, micro, hub_assign)
 
             hub = db.get_node("hub1")
             self.assertEqual(hub["is_hub"], 1)
-            self.assertEqual(hub["hub_assignment"], GLOBAL_CORE_LABEL)
+            self.assertEqual(hub["hub_assignment"], "0")
+            self.assertEqual(hub["macro_cluster"], 0)
+            self.assertEqual(hub["micro_cluster"], 0)
+
+    def test_resets_stale_clusters(self):
+        """persist_clusters clears pre-existing cluster assignments before writing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Create nodes with stale cluster assignments from a "previous run"
+            nodes = [
+                _make_node_dict("n0", macro_cluster=9, micro_cluster=9),
+                _make_node_dict("n1", macro_cluster=9, micro_cluster=9),
+                _make_node_dict("stale", macro_cluster=5, micro_cluster=5),
+            ]
+            db = _make_db(tmp, nodes=nodes)
+
+            # Only assign n0 and n1 in the new run — stale is NOT assigned
+            macro = {"n0": 0, "n1": 0}
+            micro = {0: {"n0": 0, "n1": 0}}
+            hub_assign = {}
+
+            persist_clusters(db, macro, micro, hub_assign)
+
+            # n0/n1 should have new assignments
+            self.assertEqual(db.get_node("n0")["macro_cluster"], 0)
+            self.assertEqual(db.get_node("n1")["macro_cluster"], 0)
+
+            # stale node should have NULL clusters (reset)
+            stale = db.get_node("stale")
+            self.assertIsNone(stale["macro_cluster"])
+            self.assertIsNone(stale["micro_cluster"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════

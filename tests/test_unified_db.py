@@ -696,6 +696,56 @@ class TestNetworkXRoundtrip:
         db.from_networkx(None)
         assert db.node_count() == 0
 
+    def test_stale_node_purge(self, db):
+        """DB-5.14: from_networkx purges stale nodes from a previous import."""
+        # First import: graph with nodes A, B, C
+        G1 = nx.MultiDiGraph()
+        G1.add_node("A", symbol_name="A", symbol_type="class",
+                     rel_path="a.py", language="python")
+        G1.add_node("B", symbol_name="B", symbol_type="class",
+                     rel_path="b.py", language="python")
+        G1.add_node("C", symbol_name="C", symbol_type="function",
+                     rel_path="c.py", language="python")
+        G1.add_edge("A", "B", relationship_type="calls", weight=1.0)
+        db.from_networkx(G1)
+        assert db.node_count() == 3
+
+        # Second import: graph with nodes A, D (B and C are gone)
+        G2 = nx.MultiDiGraph()
+        G2.add_node("A", symbol_name="A", symbol_type="class",
+                     rel_path="a.py", language="python")
+        G2.add_node("D", symbol_name="D", symbol_type="function",
+                     rel_path="d.py", language="python")
+        G2.add_edge("A", "D", relationship_type="calls", weight=1.0)
+        db.from_networkx(G2)
+
+        # Only A and D should remain — B and C are stale and purged
+        assert db.node_count() == 2
+        assert db.get_node("A") is not None
+        assert db.get_node("D") is not None
+        assert db.get_node("B") is None
+        assert db.get_node("C") is None
+
+    def test_stale_edge_purge(self, db):
+        """DB-5.15: from_networkx purges stale edges alongside stale nodes."""
+        G1 = nx.MultiDiGraph()
+        G1.add_node("X", symbol_name="X", symbol_type="class",
+                     rel_path="x.py", language="python")
+        G1.add_node("Y", symbol_name="Y", symbol_type="class",
+                     rel_path="y.py", language="python")
+        G1.add_edge("X", "Y", relationship_type="calls", weight=1.0)
+        db.from_networkx(G1)
+        assert db.edge_count() == 1
+
+        # Second import removes Y — edge X→Y should also be gone
+        G2 = nx.MultiDiGraph()
+        G2.add_node("X", symbol_name="X", symbol_type="class",
+                     rel_path="x.py", language="python")
+        db.from_networkx(G2)
+
+        assert db.node_count() == 1
+        assert db.edge_count() == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DB-6: Metadata

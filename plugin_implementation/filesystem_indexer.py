@@ -610,11 +610,13 @@ class FilesystemRepositoryIndexer:
                             embedding_fn=_embed_query_fn,
                         )
                         logger.info(
-                            "Phase 2 complete: %d edges weighted, %d hubs, %d/%d orphans resolved",
+                            "Phase 2 complete: %d edges weighted, %d hubs, %d/%d orphans resolved, %d→%d components bridged",
                             phase2_stats["weighting"]["edges_weighted"],
                             phase2_stats["hubs"]["count"],
                             phase2_stats["orphan_resolution"]["orphans_resolved"],
                             phase2_stats["orphan_resolution"]["orphan_count"],
+                            phase2_stats.get("component_bridging", {}).get("components_before", 0),
+                            phase2_stats.get("component_bridging", {}).get("components_after", 0),
                         )
                     except Exception as exc:
                         logger.warning("Phase 2 graph topology failed (non-fatal): %s", exc)

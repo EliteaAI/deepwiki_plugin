@@ -18,6 +18,13 @@ from .models import GitCloneConfig, ProviderConfig, ProviderType
 logger = logging.getLogger(__name__)
 
 
+def _strip_git_suffix(repository: str) -> str:
+    """Strip a literal .git suffix without trimming repository name characters."""
+    if repository.endswith('.git'):
+        return repository[:-4]
+    return repository
+
+
 class BaseRepoProvider(ABC):
     """Base class for repository providers."""
     
@@ -212,7 +219,7 @@ class GitLabProvider(BaseRepoProvider):
             if match:
                 return match.group(1)
         
-        return repo.rstrip('.git').strip('/')
+        return _strip_git_suffix(repo).strip('/')
     
     def parse_repository_url(self, url: str) -> Tuple[str, Optional[str]]:
         """Parse GitLab URL to extract repo and branch."""
@@ -324,7 +331,7 @@ class BitbucketProvider(BaseRepoProvider):
                     path = path[4:]
                 return path
         
-        return repo.rstrip('.git').strip('/')
+        return _strip_git_suffix(repo).strip('/')
     
     def parse_repository_url(self, url: str) -> Tuple[str, Optional[str]]:
         """Parse Bitbucket URL to extract repo and branch."""
@@ -442,7 +449,7 @@ class AzureDevOpsProvider(BaseRepoProvider):
                 return match.group(1)
         
         # Just the repo name
-        return repo.rstrip('.git').strip('/')
+        return _strip_git_suffix(repo).strip('/')
     
     def parse_repository_url(self, url: str) -> Tuple[str, Optional[str]]:
         """Parse Azure DevOps URL to extract repo and branch."""

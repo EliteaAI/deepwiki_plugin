@@ -2,11 +2,15 @@
 Phase 4 — Cluster-Based Structure Planner
 
 Converts pre-computed math clusters (Phases 1-3) into a full
-``WikiStructureSpec`` with one cheap LLM call per macro-cluster.
+``WikiStructureSpec`` with cheap LLM naming calls.
 
-The LLM no longer *discovers* structure — it only *names and describes*
-what the graph algorithms already found.  This replaces 50-74 DeepAgents
-tool calls with ~8-15 lightweight naming calls.
+**Two-pass naming** eliminates "centroid bleed" — where macro-cluster
+dominant symbols would shadow per-page content:
+
+- **Pass 1** (section naming): one LLM call per macro-cluster using
+  macro-level dominant symbols → section name + description.
+- **Pass 2** (page naming): one LLM call per micro-cluster using
+  *only that page's own* enriched symbols → page name + description.
 
 Activation::
 
@@ -33,9 +37,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 import networkx as nx
 
+from ..constants import PAGE_IDENTITY_SYMBOLS, SUPPORTING_CODE_SYMBOLS, DOC_CLUSTER_SYMBOLS, SYMBOL_TYPE_PRIORITY
+from ..feature_flags import get_feature_flags
 from ..graph_clustering import select_central_symbols
 from ..state.wiki_state import PageSpec, SectionSpec, WikiStructureSpec
 from ..unified_db import UnifiedWikiDB
+from .candidate_builder import build_candidates
+from .coverage_ledger import CoverageLedger
+from .page_validator import validate_all, KEEP, MERGE_WITH, DEMOTE
 
 logger = logging.getLogger(__name__)
 
@@ -53,54 +62,87 @@ MAX_MICRO_SUMMARY_SYMBOLS = 8
 SIGNATURE_TRUNC = 200
 DOCSTRING_TRUNC = 200
 
-#: Label for the hub/core section
-GLOBAL_CORE_SECTION_NAME = "System Core & Utilities"
-GLOBAL_CORE_SECTION_DESC = (
-    "Cross-cutting utilities, shared infrastructure, and high-connectivity "
-    "hub symbols that are referenced by multiple subsystems."
-)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Prompts
+# Prompts — Two-pass naming
 # ═══════════════════════════════════════════════════════════════════════════
 
-CLUSTER_NAMING_SYSTEM = """\
-You are a senior technical documentation architect.  You are given a \
-mathematically verified cluster of code symbols from a software repository.  \
-These symbols were grouped together because they have strong structural \
-and semantic relationships (they call each other, import each other, or \
-share data types).
+# ── Pass 1: Section naming (one call per macro-cluster) ──────────────
 
-Your task is strictly limited to **naming and describing** the cluster — \
-the grouping itself is fixed and correct."""
+SECTION_NAMING_SYSTEM = """\
+You are a documentation architect writing for a mixed audience: product \
+managers, team leads, and engineers.  You are given the most representative \
+code symbols from a group of related source files.
 
-CLUSTER_NAMING_USER = """\
-CLUSTER #{cluster_id} — {node_count} symbols across {file_count} files
+Your job: create a short, user-facing **capability name** and a one-sentence \
+description for this section of a wiki.  The name must describe WHAT the \
+software does for its users — not how it is implemented.
 
-DOMINANT SYMBOLS (most representative by connectivity & documentation):
+Rules:
+- Use plain language a non-developer stakeholder can understand.
+- Name the CAPABILITY or DOMAIN, not file names or class names.
+- Good: "Leader Election & Health Monitoring", "Payment Processing", \
+"Real-time Data Transformation SDK"
+- Bad: "leader_balancer.cc and related files", "Class AuthService", \
+"src/v/resource_mgmt"
+- The name must be ≤ 8 words."""
+
+SECTION_NAMING_USER = """\
+SECTION CLUSTER — {node_count} symbols across {file_count} files
+
+TOP SYMBOLS (most connected and documented in this section):
 {dominant_symbols_json}
 
-MICRO-CLUSTERS (sub-groupings within this cluster):
+SUB-GROUPS (page-level groupings — shown only for context; name the section, \
+not individual pages):
 {micro_summaries_json}
-
-YOUR TASK:
-1. Give this Section a concise, capability-based name (e.g., \
-"Authentication & Session Management", NOT "auth_service.py and related files").
-2. Write a one-sentence section description.
-3. For each micro-cluster, give it a concise Page name describing its \
-specific functionality.
-4. For each page, write a one-sentence description and a short \
-retrieval_query that could be used to find relevant documentation.
 
 Output ONLY valid JSON (no markdown fences):
 {{
   "section_name": "...",
-  "section_description": "...",
-  "pages": [
-    {{"micro_id": 0, "page_name": "...", "description": "...", "retrieval_query": "..."}},
-    ...
-  ]
+  "section_description": "..."
 }}"""
+
+# ── Pass 2: Page naming (one call per micro-cluster) ─────────────────
+
+PAGE_NAMING_SYSTEM = """\
+You are a documentation architect writing page titles for a technical wiki.  \
+The audience includes non-technical stakeholders, so page names must describe \
+the CAPABILITY or FUNCTIONALITY in plain language — never use class names, \
+file names, or implementation jargon as the page title.
+
+You are given the symbols that belong to ONE specific page.  Name this page \
+based ONLY on these symbols — ignore anything outside this list.
+
+Rules:
+- Name the CAPABILITY (what does this code accomplish for its users?).
+- Good: "Record Batch Decoding & Output Routing", "Disk Space Reclamation"
+- Bad: "disk_space_manager and storage.h", "JS VM Bridge"
+- The name must be ≤ 10 words.
+- Description: one sentence explaining the page's value to a reader.
+- retrieval_query: 3-6 keyword phrase for documentation search."""
+
+PAGE_NAMING_USER = """\
+PAGE CLUSTER — {symbol_count} symbols in {file_count} files
+Parent section: "{section_name}"
+
+PAGE SYMBOLS (this page's own representative code elements):
+{page_symbols_json}
+
+DIRECTORIES:
+{directories_json}
+
+Output ONLY valid JSON (no markdown fences):
+{{
+  "page_name": "...",
+  "description": "...",
+  "retrieval_query": "..."
+}}"""
+
+# Legacy constant kept for backward compatibility in tests
+CLUSTER_NAMING_SYSTEM = SECTION_NAMING_SYSTEM
+CLUSTER_NAMING_USER = SECTION_NAMING_USER
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -131,6 +173,11 @@ class ClusterStructurePlanner:
         self.wiki_title = wiki_title or self._derive_wiki_title()
         self._cluster_graph: Optional[nx.MultiDiGraph] = None
         self._central_k: Optional[int] = None
+
+        # Pre-compute test-exclusion SQL fragment once
+        flags = get_feature_flags()
+        self._exclude_tests = flags.exclude_tests
+        self._test_sql = " AND is_test = 0" if self._exclude_tests else ""
 
     # ── adaptive central-k ────────────────────────────────────────────
 
@@ -187,10 +234,91 @@ class ClusterStructurePlanner:
             len(cluster_map),
         )
 
-        # 2. Load hub nodes assigned to global_core
-        global_core_nodes = self._load_global_core_nodes()
+        # 1b. Optional: candidate validation (Phase 5)
+        flags = get_feature_flags()
+        if flags.capability_validation:
+            candidates = build_candidates(self.db, cluster_map)
+            validations = validate_all(candidates)
 
-        # 3. Name each macro-cluster via one LLM call
+            # Pass 1 — Remove DEMOTE candidates
+            for vr in validations:
+                if vr.shape_decision == DEMOTE:
+                    mid = vr.candidate.macro_id
+                    pid = vr.candidate.micro_id
+                    if mid in cluster_map and pid in cluster_map[mid]:
+                        del cluster_map[mid][pid]
+                        logger.debug(
+                            "ClusterStructurePlanner: demoted micro %d.%d",
+                            mid, pid,
+                        )
+
+            # Pass 2 — Merge MERGE_WITH candidates into their largest
+            # surviving sibling (same macro-cluster).
+            merge_count = 0
+            for vr in validations:
+                if vr.shape_decision != MERGE_WITH:
+                    continue
+                mid = vr.candidate.macro_id
+                pid = vr.candidate.micro_id
+                if mid not in cluster_map or pid not in cluster_map[mid]:
+                    continue
+                # Find largest surviving sibling in this macro
+                best_sibling = None
+                best_size = 0
+                for other_pid, other_nids in cluster_map[mid].items():
+                    if other_pid == pid:
+                        continue
+                    if len(other_nids) > best_size:
+                        best_size = len(other_nids)
+                        best_sibling = other_pid
+                if best_sibling is not None:
+                    cluster_map[mid][best_sibling].extend(
+                        cluster_map[mid].pop(pid),
+                    )
+                    merge_count += 1
+
+            if merge_count:
+                logger.info(
+                    "ClusterStructurePlanner: merged %d MERGE_WITH candidates",
+                    merge_count,
+                )
+
+            # Clean up empty macros
+            cluster_map = {
+                m: micros for m, micros in cluster_map.items() if micros
+            }
+
+            total_surviving_pages = sum(
+                len(micros) for micros in cluster_map.values()
+            )
+            logger.info(
+                "ClusterStructurePlanner: after validation — %d sections, "
+                "%d pages surviving",
+                len(cluster_map), total_surviving_pages,
+            )
+
+        # 1c. Optional: coverage ledger (Phase 6)
+        coverage_report = None
+        if flags.coverage_ledger:
+            # Rebuild candidates after any demotion so ledger sees current state
+            ledger_candidates = build_candidates(self.db, cluster_map)
+            ledger = CoverageLedger(self.db, ledger_candidates)
+            coverage_report = ledger.report()
+            logger.info(
+                "CoverageLedger: symbols %d/%d (%.0f%%), docs %d/%d, dirs %d/%d, "
+                "uncovered HV: %d, overlaps: %d",
+                coverage_report.covered_symbols,
+                coverage_report.total_symbols,
+                coverage_report.symbol_coverage * 100,
+                coverage_report.covered_doc_domains,
+                coverage_report.total_doc_domains,
+                coverage_report.covered_directories,
+                coverage_report.total_directories,
+                len(coverage_report.uncovered_high_value),
+                len(coverage_report.page_overlap_pairs),
+            )
+
+        # 2. Name each macro-cluster via one LLM call
         sections: List[SectionSpec] = []
         section_order = 1
 
@@ -213,13 +341,6 @@ class ClusterStructurePlanner:
                     macro_id, micro_map, section_order,
                 ))
                 section_order += 1
-
-        # 4. Add global_core section if there are hub nodes
-        if global_core_nodes:
-            core_section = self._build_global_core_section(
-                global_core_nodes, section_order,
-            )
-            sections.append(core_section)
 
         total_pages = sum(len(s.pages) for s in sections)
         elapsed = time.time() - t0
@@ -249,13 +370,20 @@ class ClusterStructurePlanner:
         same set used by the content expansion module — to avoid inflating
         section and page counts.
 
+        When ``exclude_tests`` is enabled, test nodes (``is_test = 1``) are
+        also excluded — they should not form wiki pages.
+
         Returns ``{macro_id: {micro_id: [node_ids]}}`` where every node_id
-        belongs to an architectural symbol.
+        belongs to a non-test architectural symbol.
         """
+        flags = get_feature_flags()
+        test_filter = self._test_sql
+
         rows = self.db.conn.execute(
             "SELECT node_id, macro_cluster, micro_cluster "
             "FROM repo_nodes "
             "WHERE macro_cluster IS NOT NULL AND is_architectural = 1"
+            + test_filter
         ).fetchall()
 
         result: Dict[int, Dict[int, List[str]]] = {}
@@ -291,11 +419,16 @@ class ClusterStructurePlanner:
         micro_map: Dict[int, List[str]],
         section_order: int,
     ) -> SectionSpec:
-        """Issue one LLM call to name a macro-cluster and its micro-clusters."""
+        """Two-pass naming: section name first, then each page independently.
 
-        # Build compact payloads
-        dominant = self._get_dominant_symbols(macro_id)
-        micro_summaries = self._get_micro_summaries(micro_map)
+        Pass 1 — Section naming: one LLM call with macro-cluster dominant
+        symbols to produce section_name + section_description.
+
+        Pass 2 — Page naming: one LLM call **per micro-cluster** using
+        only that micro-cluster's own enriched symbols (with signatures
+        and docstrings).  This eliminates the "centroid bleed" problem
+        where macro-level dominant symbols would shadow page-level content.
+        """
 
         all_node_ids = set()
         for nids in micro_map.values():
@@ -306,48 +439,84 @@ class ClusterStructurePlanner:
             for nid in list(all_node_ids)[:200]
         } - {""})
 
-        prompt_text = CLUSTER_NAMING_USER.format(
-            cluster_id=macro_id,
+        # ── Pass 1: Section naming ──────────────────────────────────
+        dominant = self._get_dominant_symbols(macro_id)
+        micro_summaries = self._get_micro_summaries(micro_map)
+
+        section_prompt = SECTION_NAMING_USER.format(
             node_count=len(all_node_ids),
             file_count=file_count,
             dominant_symbols_json=json.dumps(dominant, indent=2),
             micro_summaries_json=json.dumps(micro_summaries, indent=2),
         )
 
-        messages = [
-            SystemMessage(content=CLUSTER_NAMING_SYSTEM),
-            HumanMessage(content=prompt_text),
-        ]
+        section_response = self.llm.invoke([
+            SystemMessage(content=SECTION_NAMING_SYSTEM),
+            HumanMessage(content=section_prompt),
+        ])
+        section_naming = _parse_json_response(_extract_text(section_response))
+        section_name = section_naming.get("section_name") or f"Section {macro_id}"
+        section_desc = (
+            section_naming.get("section_description")
+            or f"Section covering {len(all_node_ids)} symbols"
+        )
 
-        response = self.llm.invoke(messages)
-        raw = _extract_text(response)
-
-        naming = _parse_json_response(raw)
-
-        # Build pages from micro-clusters + LLM naming
+        # ── Pass 2: Page naming (one call per micro-cluster) ────────
         pages: List[PageSpec] = []
         page_order = 1
 
-        llm_pages = {p["micro_id"]: p for p in naming.get("pages", [])}
-
         for micro_id in sorted(micro_map.keys()):
             node_ids = micro_map[micro_id]
-            llm_page = llm_pages.get(micro_id, {})
 
-            page_name = llm_page.get("page_name") or f"Section {macro_id} — Page {micro_id}"
-            page_desc = llm_page.get("description") or f"Page covering {len(node_ids)} symbols"
-            retrieval_query = llm_page.get("retrieval_query") or page_name
+            # Build enriched page-level symbols (with signatures + docstrings)
+            page_symbols = self._get_page_symbols(node_ids)
+            page_dirs = self._node_ids_to_folders(node_ids)
+            page_file_count = len(set(
+                (self.db.get_node(nid) or {}).get("rel_path", "")
+                for nid in node_ids[:100]
+            ) - {""})
+
+            page_prompt = PAGE_NAMING_USER.format(
+                symbol_count=len(node_ids),
+                file_count=page_file_count,
+                section_name=section_name,
+                page_symbols_json=json.dumps(page_symbols, indent=2),
+                directories_json=json.dumps(page_dirs),
+            )
+
+            try:
+                page_response = self.llm.invoke([
+                    SystemMessage(content=PAGE_NAMING_SYSTEM),
+                    HumanMessage(content=page_prompt),
+                ])
+                page_naming = _parse_json_response(_extract_text(page_response))
+            except Exception as exc:
+                logger.warning(
+                    "Page naming failed for macro %d micro %d: %s",
+                    macro_id, micro_id, exc,
+                )
+                page_naming = {}
+
+            page_name = (
+                page_naming.get("page_name")
+                or f"{section_name} — Page {micro_id}"
+            )
+            page_desc = (
+                page_naming.get("description")
+                or f"Page covering {len(node_ids)} symbols"
+            )
+            retrieval_query = (
+                page_naming.get("retrieval_query")
+                or page_name
+            )
 
             # Select central symbols via PageRank (Phase 7F)
             central_ids = self._select_central_node_ids(
                 node_ids, k=self._adaptive_central_k(),
             )
             target_symbols = self._node_ids_to_symbol_names(central_ids)
-            # Collect file paths for key_files
             key_files = self._node_ids_to_paths(node_ids)
-            # Collect target folders (unique directory prefixes)
             target_folders = self._node_ids_to_folders(node_ids)
-            # Collect documentation file paths for mixed retrieval
             target_docs = self._node_ids_to_doc_paths(node_ids)
 
             pages.append(PageSpec(
@@ -361,12 +530,14 @@ class ClusterStructurePlanner:
                 target_folders=target_folders,
                 key_files=key_files,
                 retrieval_query=retrieval_query,
-                metadata={"cluster_node_ids": list(node_ids)},
+                metadata={
+                    "planner_mode": "cluster",
+                    "section_id": macro_id,
+                    "page_id": micro_id,
+                    "cluster_node_ids": list(node_ids),
+                },
             ))
             page_order += 1
-
-        section_name = naming.get("section_name") or f"Section {macro_id}"
-        section_desc = naming.get("section_description") or f"Section covering {len(all_node_ids)} symbols"
 
         return SectionSpec(
             section_name=section_name,
@@ -388,8 +559,10 @@ class ClusterStructurePlanner:
         if not nodes:
             return []
 
-        # Filter to architectural nodes only
+        # Filter to architectural nodes only (and exclude test nodes when flag is on)
         nodes = [n for n in nodes if n.get("is_architectural")]
+        if self._exclude_tests:
+            nodes = [n for n in nodes if not n.get("is_test")]
 
         scored = []
         for n in nodes:
@@ -454,61 +627,50 @@ class ClusterStructurePlanner:
 
         return summaries
 
-    # ── Global Core section (hub nodes) ──────────────────────────────
+    # ── Page-level symbols for Pass 2 ────────────────────────────────
 
-    def _load_global_core_nodes(self) -> List[Dict[str, Any]]:
-        """Load hub nodes assigned to global_core."""
-        rows = self.db.conn.execute(
-            "SELECT * FROM repo_nodes WHERE is_hub = 1 AND hub_assignment = 'global_core'"
-        ).fetchall()
-        return [dict(r) for r in rows]
+    #: Maximum symbols sent to the page-naming LLM call
+    MAX_PAGE_NAMING_SYMBOLS = 12
 
-    def _build_global_core_section(
-        self,
-        core_nodes: List[Dict[str, Any]],
-        section_order: int,
-    ) -> SectionSpec:
-        """Build a dedicated section for global-core hub symbols."""
-        # Group into a single page (or split if too many)
-        page_size = 25
-        pages: List[PageSpec] = []
+    def _get_page_symbols(self, node_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get enriched symbols for a single micro-cluster (page-level naming).
 
-        for i in range(0, len(core_nodes), page_size):
-            chunk = core_nodes[i : i + page_size]
-            symbols = [n["symbol_name"] for n in chunk]
-            paths = sorted({n["rel_path"] for n in chunk if n.get("rel_path")})
-            folders = sorted({
-                p.rsplit("/", 1)[0] for p in paths if "/" in p
-            })
-            doc_paths = sorted({n["rel_path"] for n in chunk if n.get("is_doc")})
+        Unlike ``_get_micro_summaries`` (which is lean: name/type/path only),
+        this returns signatures and docstrings so the page-naming LLM has
+        enough context to produce a meaningful capability-based title from
+        *only* this page's own content.
 
-            page_num = (i // page_size) + 1
-            page_name = (
-                "Core Utilities & Shared Infrastructure"
-                if page_num == 1
-                else f"Core Utilities — Part {page_num}"
+        Scoring: min(edge_count, 10) + has_docstring(2)
+        """
+        nodes = [self.db.get_node(nid) for nid in node_ids]
+        nodes = [n for n in nodes if n and n.get("is_architectural")]
+        if self._exclude_tests:
+            nodes = [n for n in nodes if not n.get("is_test")]
+
+        if not nodes:
+            return []
+
+        scored = []
+        for n in nodes:
+            edge_count = len(self.db.get_edges_from(n["node_id"]))
+            score = (
+                min(edge_count, 10)
+                + (2 if n.get("docstring") else 0)
             )
+            scored.append((score, n))
 
-            pages.append(PageSpec(
-                page_name=page_name,
-                page_order=page_num,
-                description="High-connectivity hub symbols referenced across multiple subsystems",
-                content_focus="Shared utilities, base classes, and cross-cutting infrastructure",
-                rationale=f"Hub nodes assigned to global_core ({len(chunk)} symbols)",
-                target_symbols=symbols,
-                target_docs=doc_paths,
-                target_folders=folders[:10],
-                key_files=paths[:20],
-                retrieval_query="core utilities shared infrastructure base classes helpers",
-            ))
+        scored.sort(key=lambda x: -x[0])
 
-        return SectionSpec(
-            section_name=GLOBAL_CORE_SECTION_NAME,
-            section_order=section_order,
-            description=GLOBAL_CORE_SECTION_DESC,
-            rationale=f"Hub re-integration: {len(core_nodes)} high-connectivity symbols",
-            pages=pages,
-        )
+        return [
+            {
+                "name": n["symbol_name"],
+                "type": n["symbol_type"],
+                "path": n["rel_path"],
+                "signature": (n.get("signature") or "")[:SIGNATURE_TRUNC],
+                "docstring": (n.get("docstring") or "")[:DOCSTRING_TRUNC],
+            }
+            for _, n in scored[:self.MAX_PAGE_NAMING_SYMBOLS]
+        ]
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -574,9 +736,10 @@ class ClusterStructurePlanner:
 
         G = nx.MultiDiGraph()
 
-        # Add all architectural nodes
+        # Add all architectural nodes (excluding test nodes when flag is on)
         rows = self.db.conn.execute(
             "SELECT node_id FROM repo_nodes WHERE is_architectural = 1"
+            + self._test_sql
         ).fetchall()
         for row in rows:
             G.add_node(row["node_id"])
@@ -606,8 +769,12 @@ class ClusterStructurePlanner:
     ) -> List[str]:
         """Select the top-k most central node IDs from a micro-cluster.
 
-        Uses PageRank on the reconstructed graph. Falls back to the full
-        list if the graph has too few edges for meaningful ranking.
+        Code-first priority (Phase 3):
+        1. PAGE_IDENTITY_SYMBOLS (class, interface, function, …) ranked by PageRank
+        2. SUPPORTING_CODE_SYMBOLS (constant, type_alias, …) ranked by PageRank
+        3. DOC_CLUSTER_SYMBOLS (module_doc, file_doc) only if budget remains
+
+        Doc-dominant clusters (>70% doc nodes) yield docs-only pages.
         """
         G = self._get_cluster_graph()
         cluster_set = set(node_ids) & set(G.nodes())
@@ -615,11 +782,60 @@ class ClusterStructurePlanner:
         if len(cluster_set) <= k:
             return list(cluster_set)
 
-        central = select_central_symbols(G, cluster_set, k=k)
-        if not central:
-            # Fallback: return first k node_ids
-            return node_ids[:k]
-        return central
+        # Partition by symbol type tier
+        identity_ids = []
+        supporting_ids = []
+        doc_ids = []
+        other_ids = []
+
+        for nid in cluster_set:
+            node = self.db.get_node(nid)
+            if not node:
+                continue
+            stype = (node.get("symbol_type") or "").lower()
+            if stype in PAGE_IDENTITY_SYMBOLS:
+                identity_ids.append(nid)
+            elif stype in SUPPORTING_CODE_SYMBOLS:
+                supporting_ids.append(nid)
+            elif stype in DOC_CLUSTER_SYMBOLS:
+                doc_ids.append(nid)
+            else:
+                other_ids.append(nid)
+
+        # Detect doc-dominant cluster (≥70% doc nodes)
+        total = len(identity_ids) + len(supporting_ids) + len(doc_ids) + len(other_ids)
+        if total > 0 and len(doc_ids) / total >= 0.7:
+            # Docs-only page: prefer doc nodes as seeds
+            central = select_central_symbols(G, set(doc_ids), k=k) if doc_ids else []
+            if len(central) < k:
+                extras = select_central_symbols(
+                    G, cluster_set - set(central), k=k - len(central)
+                )
+                central.extend(extras)
+            return central[:k]
+
+        # Code-first: fill from identity → supporting → doc → other
+        result = []
+        for tier_ids in [identity_ids, supporting_ids, other_ids, doc_ids]:
+            if len(result) >= k:
+                break
+            remaining = k - len(result)
+            tier_set = set(tier_ids) - set(result)
+            if not tier_set:
+                continue
+            if len(tier_set) <= remaining:
+                # Rank by PageRank within tier
+                ranked = select_central_symbols(G, tier_set, k=len(tier_set))
+                result.extend(ranked if ranked else list(tier_set))
+            else:
+                ranked = select_central_symbols(G, tier_set, k=remaining)
+                result.extend(ranked if ranked else list(tier_set)[:remaining])
+
+        if not result:
+            # Fallback: plain PageRank
+            central = select_central_symbols(G, cluster_set, k=k)
+            return central if central else node_ids[:k]
+        return result[:k]
 
     def _derive_wiki_title(self) -> str:
         """Try to derive the wiki title from DB metadata."""
@@ -698,13 +914,18 @@ class ClusterStructurePlanner:
                 page_order=page_order,
                 description=f"Page with {len(node_ids)} symbols",
                 content_focus=f"Symbols in cluster {macro_id}/{micro_id}",
-                rationale=f"Fallback naming for macro={macro_id}, micro={micro_id}",
+                rationale=f"Grouped by graph clustering (macro={macro_id}, micro={micro_id}, {len(node_ids)} symbols)",
                 target_symbols=target_symbols,
                 target_docs=self._node_ids_to_doc_paths(node_ids),
                 target_folders=self._node_ids_to_folders(node_ids),
                 key_files=key_files,
                 retrieval_query=" ".join(target_symbols[:5]),
-                metadata={"cluster_node_ids": list(node_ids)},
+                metadata={
+                    "planner_mode": "cluster",
+                    "section_id": macro_id,
+                    "page_id": micro_id,
+                    "cluster_node_ids": list(node_ids),
+                },
             ))
             page_order += 1
 

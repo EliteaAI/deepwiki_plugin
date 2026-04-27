@@ -207,6 +207,48 @@ EXPANSION_SYMBOL_TYPES = frozenset({
     'module_doc', 'file_doc',
 })
 
+# =============================================================================
+# Page Identity Classification (capability-first clustering)
+# =============================================================================
+# These sets partition code symbols by their page-identity role.
+# Used by cluster_planner seed selection and candidate_builder classification.
+
+# Symbols that can anchor a page (drive page identity in mixed clusters).
+# Ordered by SYMBOL_TYPE_PRIORITY when selecting seeds.
+PAGE_IDENTITY_SYMBOLS = frozenset({
+    'class', 'interface', 'trait', 'protocol',
+    'enum', 'struct', 'record',
+    'module', 'namespace',
+    'function',
+})
+
+# Symbols that support page content but do not drive page identity
+# in mixed clusters; eligible as seeds only when no identity symbol exists.
+SUPPORTING_CODE_SYMBOLS = frozenset({
+    'constant', 'type_alias', 'macro',
+    'method', 'property',
+})
+
+# Documentation symbol kinds used for docs-only page detection.
+DOC_CLUSTER_SYMBOLS = frozenset({
+    'module_doc', 'file_doc',
+})
+
+# Numeric priority for seed ordering — aligned with graph_builder._get_type_priority().
+SYMBOL_TYPE_PRIORITY = {
+    'class': 10, 'interface': 10, 'trait': 10, 'protocol': 10,
+    'enum': 9, 'struct': 9, 'record': 9,
+    'module': 8, 'namespace': 8,
+    'function': 7,
+    'constant': 6, 'type_alias': 6, 'macro': 6,
+    'method': 3, 'property': 2,
+    'module_doc': 1, 'file_doc': 1,
+}
+
+# =============================================================================
+# Code-Only Symbol Types
+# =============================================================================
+
 # Code-only architectural types used by query_graph and graph expansion
 # when we need only code symbols (no docs).
 # This is the set shown in the structure planner's query_graph output.
@@ -406,3 +448,45 @@ DEFAULT_EXCLUDE_PATTERNS = (
     # Compiled artifacts
     '**/*.class', '**/*.jar', '**/*.war',
 )
+
+
+# ── Test code detection ──────────────────────────────────────────────
+# Path-based heuristics for identifying test files.
+# Used when ``exclude_tests`` feature flag is enabled.
+# Matches are case-insensitive (compiled with re.IGNORECASE).
+
+import re as _re  # noqa: E402 — local import to keep at bottom of file
+
+_TEST_PATH_PATTERNS = [
+    # ── Directory-based ──
+    _re.compile(r'(^|/)tests?/', _re.IGNORECASE),              # tests/, test/
+    _re.compile(r'(^|/)__tests__/', _re.IGNORECASE),           # JavaScript __tests__/
+    _re.compile(r'(^|/)specs?/', _re.IGNORECASE),              # Ruby/JS spec/
+    _re.compile(r'(^|/)testing/', _re.IGNORECASE),             # Go testing/
+    _re.compile(r'(^|/)test_?helpers?/', _re.IGNORECASE),      # test_helper/, testhelpers/
+    _re.compile(r'(^|/)fixtures/', _re.IGNORECASE),            # Test fixtures
+    _re.compile(r'(^|/)mocks?/', _re.IGNORECASE),              # Mock directories
+    _re.compile(r'(^|/)testdata/', _re.IGNORECASE),            # Go test data
+    _re.compile(r'(^|/)testutils?/', _re.IGNORECASE),          # Test utilities
+
+    # ── File-based ──
+    _re.compile(r'(^|/)test_[^/]+\.\w+$', _re.IGNORECASE),         # test_foo.py
+    _re.compile(r'(^|/)[^/]+_test\.\w+$', _re.IGNORECASE),         # foo_test.go
+    _re.compile(r'(^|/)[^/]+\.test\.\w+$', _re.IGNORECASE),        # foo.test.js
+    _re.compile(r'(^|/)[^/]+\.spec\.\w+$', _re.IGNORECASE),        # foo.spec.js
+    _re.compile(r'(^|/)[^/]+Tests?\.\w+$', _re.IGNORECASE),        # FooTest.java
+    _re.compile(r'(^|/)conftest\.py$', _re.IGNORECASE),             # pytest conftest
+    _re.compile(r'(^|/)setup_tests?\.\w+$', _re.IGNORECASE),       # Test setup files
+]
+
+
+def is_test_path(rel_path: str) -> bool:
+    """Check if a relative file path matches test code patterns.
+
+    Uses path-based heuristics (directory names and file suffixes) to
+    identify test files.  This is deterministic, language-agnostic,
+    and covers the vast majority of real-world test layouts.
+
+    Returns ``True`` if the path matches any test pattern.
+    """
+    return any(p.search(rel_path) for p in _TEST_PATH_PATTERNS)
