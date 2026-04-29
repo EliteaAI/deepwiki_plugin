@@ -15,7 +15,7 @@ fullnameOverride: ""
 # =============================================================================
 image:
   repository: getcarrier/pylon
-  tag: "1.2.7"
+  tag: "1.2.25"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -162,15 +162,22 @@ env:
 # When enabled, wiki generation runs as K8s Jobs.
 # The /slots endpoint queries K8s API for active job count.
 #
-# Benefits:
-# - Cluster-wide slot management and availability
-# - Proper resource isolation per generation
-# - Better observability via K8s native tooling
-# - Scales independently of API pods
+# Two sub-modes (auto-detected):
+#
+# 1. Jobs+PVC (default): Workers mount the same PVC as the controller.
+#    - Input/output via shared filesystem
+#    - Simpler setup, requires RWX storage class
+#
+# 2. Jobs+API (recommended for production): Workers use emptyDir volumes.
+#    - Input/output via ELITEA platform artifact HTTP API
+#    - Workers are fully stateless — no PVC dependency
+#    - Artifact API credentials are derived per-request from llm_settings
+#      (injected into worker pods as env vars by the controller)
 #
 # Prerequisites:
 # - RBAC enabled (Role + RoleBinding created automatically)
-# - Shared PVC for job I/O and caching
+# - Jobs+PVC: Shared RWX PVC
+# - Jobs+API: Platform artifact API access (via llm_settings)
 # =============================================================================
 jobs:
   enabled: false  # Set to true to enable Jobs-based scaling
@@ -184,7 +191,13 @@ jobs:
   
   # Worker image (defaults to same as API pod image)
   # workerImage: "getcarrier/pylon:1.2.7"
-  
+  # workerImagePullPolicy: IfNotPresent  # Set to Never for local minikube images
+
+  # Service account for worker Job pods.
+  # Workers make zero K8s API calls, so they don't need RBAC.
+  # The controller SA (with Job management RBAC) is separate.
+  workerServiceAccount: "default"
+
   # Job resource configuration
   resources:
     requests:
@@ -193,6 +206,17 @@ jobs:
     limits:
       memory: 8Gi
       cpu: "4"
+
+  # ---------------------------------------------------------------------------
+  # Platform Artifact Transport (Jobs+API mode)
+  # ---------------------------------------------------------------------------
+  # In Jobs+API mode, artifact API credentials are derived per-request from
+  # llm_settings (provided by the ELITEA platform on each invocation).
+  # The controller injects these into worker pods as environment variables.
+  #
+  # The bucket name ("wiki_artifacts") is hardcoded in the plugin code.
+  # No Helm configuration is needed for artifact storage.
+  # ---------------------------------------------------------------------------
 
 # =============================================================================
 # Storage Configuration

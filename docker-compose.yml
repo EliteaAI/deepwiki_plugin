@@ -1,6 +1,6 @@
 services:
   pylon_deepwiki:
-    image: getcarrier/pylon:1.2.7
+    image: getcarrier/pylon:1.2.25
     user: "33:33"
     restart: unless-stopped
     logging:
@@ -15,6 +15,133 @@ services:
       - NAME=pylon-deepwiki
       - PYLON_WEB_RUNTIME=gevent
       - PYLON_CONFIG_SEED=file:/data/pylon.yml
+    # =============================================================================
+    # Core Search & Expansion Flags
+    # =============================================================================
+    # All performance optimizations are now enabled by default in code.
+    # Only override these if you need non-default behavior:
+    # - DEEPWIKI_CHECKPOINT_BACKEND=memory  # Enable state snapshots (uses RAM)
+    # - DEEPWIKI_ENABLE_RERANKER=1          # Enable cross-encoder reranker (slow but better quality)
+    # - DEEPWIKI_PROFILE_EXPANSION=1        # Log timing breakdown for content expansion stages
+      - DEEPWIKI_ENABLE_FTS5=1              # FTS5 full-text search index
+      - DEEPWIKI_SMART_EXPANSION=1          # Graph-aware expansion: inheritance, composition, creates, alias chains
+      - DEEPWIKI_HYBRID_FUSION=1            # RRF hybrid fusion in search_codebase (FTS5 + vector store)
+      - DEEPWIKI_ASK_AGENTIC=1              # Agentic ask tool with tool-calling
+    # =============================================================================
+    # Wiki Structure Planner — SWITCH BETWEEN MODES HERE
+    # =============================================================================
+    # Options:
+    #   deepagents  — LLM-heavy DeepAgents loop (~50-74 tool calls, ~150K-400K tokens)
+    #   cluster     — Unified DB + mathematical clustering (Louvain/sub-Louvain, 1 LLM call per cluster)
+    #   auto        — Auto-detect (falls back to deepagents if no unified DB available)
+    #
+    # To test CLUSTER mode: set DEEPWIKI_STRUCTURE_PLANNER=cluster and enable
+    # the "Unified Graph & Clustering" section below.
+    # To test DEEPAGENTS mode (current default): keep as deepagents.
+      - DEEPWIKI_STRUCTURE_PLANNER=cluster
+    # =============================================================================
+    # DeepAgents Settings (active when DEEPWIKI_STRUCTURE_PLANNER=cluster
+    # =============================================================================
+      - DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK=1
+      - DEEPWIKI_DEEPAGENTS_COVERAGE_LLM=1
+      - DEEPWIKI_DEEPAGENTS_USE_STREAM=1
+      - DEEPWIKI_DEEPAGENTS_LOG_STREAM=1
+      - DEEPWIKI_DEEPAGENTS_FILESYSTEM=1
+      - DEEPWIKI_DEEPAGENTS_DISABLE_TRUNCATED_CONTEXT=1
+      - DEEPWIKI_DEEPAGENTS_READ_DOCS_ONLY=1
+    # =============================================================================
+    # Agentic V2 Page Generation Tuning
+    # =============================================================================
+      - DEEPWIKI_AGENTIC_PLAN_MAX_OUTPUT_TOKENS=8096
+      - DEEPWIKI_AGENTIC_SECTION_MAX_OUTPUT_TOKENS=8096
+      - DEEPWIKI_AGENTIC_SECTION_CONTEXT_TOKENS=25000
+      - DEEPWIKI_AGENTIC_SECTION_CODE_TOKENS=18750
+      - DEEPWIKI_AGENTIC_SIGNATURES_TOKEN_BUDGET=6250
+      - DEEPWIKI_AGENTIC_SIGNATURES_MAX=80
+      - DEEPWIKI_AGENTIC_SYMBOL_INDEX_MAX=250
+      - DEEPWIKI_AGENTIC_PATHS_MAX=120
+      - DEEPWIKI_AGENTIC_FAST_TOKEN_ESTIMATE=1
+      - DEEPWIKI_AGENTIC_PLAN_TRACE=1
+      - DEEPWIKI_AGENTIC_PLAN_MODE=queries
+      - DEEPWIKI_AGENTIC_STAGE_B=1
+      - DEEPWIKI_AGENTIC_STAGE_B_TRACE=1
+      - DEEPWIKI_AGENTIC_SECTION_SEED_K=15
+      - DEEPWIKI_AGENTIC_EXPAND_CAP_PER_EDGE=3
+      - DEEPWIKI_AGENTIC_EXPAND_MAX_HOPS=1
+      - DEEPWIKI_AGENTIC_PRIMARY_LIMIT=10
+      - DEEPWIKI_AGENTIC_OUTLINE_DIRS_MAX=25
+      - DEEPWIKI_AGENTIC_OUTLINE_FILES_MAX=20
+      - DEEPWIKI_AGENTIC_GENERATE_INTRO=1
+      - DEEPWIKI_AGENTIC_GENERATE_OVERVIEW=0
+      - DEEPWIKI_AGENTIC_GENERATE_CONCLUSION=1
+      - DEEPWIKI_AGENTIC_OVERVIEW_SECTIONS_MAX=2
+      - DEEPWIKI_AGENTIC_INTRO_MAX_OUTPUT_TOKENS=4096
+      - DEEPWIKI_AGENTIC_PAGE_CONTEXT_PER_SECTION=4
+      - DEEPWIKI_AGENTIC_PAGE_CONTEXT_SECTIONS_MAX=8
+      - DEEPWIKI_AGENTIC_DROP_EXPANDED_DOCS=1
+    # =============================================================================
+    # Token & Context Optimization
+    # =============================================================================
+    # Skip 60K+ repository_context in page generation (saves tokens)
+      - DEEPWIKI_SKIP_REPO_CONTEXT_FOR_PAGES=1
+    # Structured JSON analysis instead of verbose markdown (~10x token reduction)
+      - DEEPWIKI_USE_STRUCTURED_REPO_ANALYSIS=1
+    # Query-optimized context extraction from structured analysis
+      - DEEPWIKI_ASK_USE_OPTIMIZED_CONTEXT=1
+    # =============================================================================
+    # Doc/Code Separation
+    # =============================================================================
+    # Route docs to vector store only (not graph) — reduces RAM by ~3x
+      - DEEPWIKI_DOC_SEPARATE_INDEX=1
+    # Semantic retrieval (Ensemble + EmbeddingsFilter) for docs
+      - DEEPWIKI_DOC_SEMANTIC_RETRIEVAL=1
+    # Auto-retrieve docs during generation using retrieval_query
+      - DEEPWIKI_AUTO_TARGET_DOCS=1
+    # =============================================================================
+    # Unified Graph & Clustering (Phases 1-6)
+    # =============================================================================
+    # These flags enable the mathematical clustering pipeline.
+    # To activate: uncomment all three AND set DEEPWIKI_STRUCTURE_PLANNER=cluster above.
+    # To revert to legacy: comment these out AND set DEEPWIKI_STRUCTURE_PLANNER=deepagents.
+    #
+    # DEEPWIKI_UNIFIED_DB=1           — Single SQLite DB with FTS5 + sqlite-vec (Phase 1)
+    # DEEPWIKI_UNIFIED_RETRIEVER=1    — Route search_codebase through unified DB (Phase 5)
+    # DEEPWIKI_LEGACY_INDEXES=0       — Skip legacy vectorstore + graph cache builds (saves RAM/disk)
+    #
+    # Algorithm selection for clustering (Phase 3):
+    # DEEPWIKI_CLUSTER_MACRO_ALGORITHM  — "leiden" (default, connected communities via igraph),
+    #                                     "louvain" (pure-Python fallback), or "auto"
+    # DEEPWIKI_CLUSTER_MICRO_ALGORITHM  — "infomap" (default, flow-based page boundaries via igraph),
+    #                                     "leiden", "louvain", or "auto"
+    #
+      - DEEPWIKI_UNIFIED_DB=1
+      - DEEPWIKI_UNIFIED_RETRIEVER=1
+      - DEEPWIKI_LEGACY_INDEXES=0
+      - DEEPWIKI_CLUSTER_MACRO_ALGORITHM=leiden
+      - DEEPWIKI_CLUSTER_MICRO_ALGORITHM=infomap
+    # =============================================================================
+    # Structural Clustering Quality Pipeline (Phases 0-7)
+    # =============================================================================
+    # These flags enable incremental improvements to the cluster-based planner.
+    # Each flag is independent and defaults to OFF if not set.
+    #
+    # Phase 1: Hierarchical Leiden — two-level resolution (sections + pages)
+      - DEEPWIKI_CLUSTER_HIERARCHICAL_LEIDEN=1
+    #
+    # Phase 4: Smart expansion — per-symbol-type bidirectional P0→P1→P2 strategies
+      - DEEPWIKI_CLUSTER_SMART_EXPANSION=1
+    #
+    # Phase 5: Candidate validation — deterministic quality checks before LLM naming
+      - DEEPWIKI_CLUSTER_CAPABILITY_VALIDATION=1
+    #
+    # Phase 6: Coverage ledger — track symbol/doc/directory coverage gaps
+      - DEEPWIKI_CLUSTER_COVERAGE_LEDGER=1
+    #
+    # Phase 7: Language heuristics — C++/Rust/Go/Python/Java/C#/TS/JS tuning
+      - DEEPWIKI_CLUSTER_LANGUAGE_HINTS=1
+    # Exclude tests feature flag for testing which will require the UI option afterward
+    # Still preserve test nodes for the testing questions via ask and deep_research
+      - DEEPWIKI_EXCLUDE_TESTS=1
     volumes:
       - ./pylon_deepwiki:/data
     ports:

@@ -1,8 +1,23 @@
 /.venv/
 /.cadence/
 /.idea
+/.vscode/
+.DS_Store
+/.tmp_*
 /envs/override.env
 /pylon_deepwiki/cache/*
 /pylon_deepwiki/requirements/*
 /pylon_deepwiki/plugins/*
 /pylon_deepwiki/wiki_builder/*
+/pylon_deepwiki/*.db
+
+# Local scratch / analysis scripts (not part of infra)
+/analyze_clusters.py
+/diagnose_graph.py
+/inspect_db.py
+
+# Local planning / investigation notes (kept out of the orphan infra branch)
+/PLANNING_*.md
+/INVESTIGATION_*.md
+/FUTURE_THOUGHTS.md
+/GRAPH_SEARCH_COMPARISON_SPEC.md

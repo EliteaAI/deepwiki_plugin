@@ -85,8 +85,8 @@ spec:
             # K8s Jobs-based scaling configuration
             - name: DEEPWIKI_JOBS_ENABLED
               value: "true"
-            - name: POD_SERVICE_ACCOUNT
-              value: {{ include "deepwiki.serviceAccountName" . }}
+            - name: DEEPWIKI_WORKER_SERVICE_ACCOUNT
+              value: {{ .Values.jobs.workerServiceAccount | default "default" | quote }}
             - name: DEEPWIKI_MAX_CONCURRENT_JOBS
               value: {{ .Values.jobs.maxConcurrentJobs | quote }}
             - name: DEEPWIKI_NAMESPACE
@@ -97,6 +97,8 @@ spec:
               value: {{ include "deepwiki.pvcName" . }}
             - name: DEEPWIKI_WORKER_IMAGE
               value: {{ .Values.jobs.workerImage | default (printf "%s:%s" .Values.image.repository .Values.image.tag) | quote }}
+            - name: DEEPWIKI_WORKER_IMAGE_PULL_POLICY
+              value: {{ .Values.jobs.workerImagePullPolicy | default .Values.image.pullPolicy | quote }}
             - name: DEEPWIKI_JOB_MEMORY_REQUEST
               value: {{ .Values.jobs.resources.requests.memory | quote }}
             - name: DEEPWIKI_JOB_CPU_REQUEST
@@ -105,6 +107,19 @@ spec:
               value: {{ .Values.jobs.resources.limits.memory | quote }}
             - name: DEEPWIKI_JOB_CPU_LIMIT
               value: {{ .Values.jobs.resources.limits.cpu | quote }}
+            # Plugin bootstrap credentials for worker init container.
+            # The init container clones the plugin and pip-installs deps
+            # so each Job pod is self-contained (no PVC dependency for code).
+            - name: DEEPWIKI_PLUGIN_BRANCH
+              value: {{ .Values.config.pluginBranch | default .Values.config.alitaRelease | quote }}
+            {{- if .Values.config.licenseUsername }}
+            - name: DEEPWIKI_LICENSE_USERNAME
+              value: {{ .Values.config.licenseUsername | quote }}
+            {{- end }}
+            {{- if .Values.config.licensePassword }}
+            - name: DEEPWIKI_LICENSE_PASSWORD
+              value: {{ .Values.config.licensePassword | quote }}
+            {{- end }}
             {{- end }}
           livenessProbe:
             httpGet:
