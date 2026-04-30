@@ -93,21 +93,24 @@ def _deserialize_float32_vec(blob: Optional[bytes]) -> Optional[List[float]]:
 
 
 def _attach_score_norm(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Add a normalised BM25 score in ``(0, 1)`` to an FTS5 hit row.
+    """Add a normalised BM25 score in ``[0, 1]`` to an FTS5 hit row.
 
     SQLite FTS5 ``rank`` (``bm25()``) is "more negative = better": strong
     matches land at e.g. -10, marginal hits near 0. We map it via the
-    logistic ``1 / (1 + exp(rank))`` so the result is **strictly
-    monotone-decreasing in rank** — i.e. better hits get a higher
+    logistic ``1 / (1 + exp(rank))`` so better hits get a higher
     ``score_norm``. The previous mapping ``1 / (1 + |rank|)`` was
     non-monotone (it folded the sign of rank), making strong hits look
     weaker than mediocre ones and inverting any threshold/RRF that
     consumed ``score_norm``.
 
     Properties:
-      - rank → -∞ ⇒ score_norm → 1.0  (best possible match)
+            - rank → -∞ ⇒ score_norm → 1.0  (best possible match)
       - rank =  0 ⇒ score_norm = 0.5   (no relevance)
       - rank → +∞ ⇒ score_norm → 0.0  (anti-match, theoretical)
+
+        Floating-point saturation can produce exact ``1.0`` / ``0.0`` at
+        extreme finite ranks. Missing, unparsable, or non-finite ranks fall
+        back to ``0.0`` so downstream threshold/sort logic never sees NaN.
 
     Idempotent — a pre-attached ``score_norm`` is left untouched.
     """
@@ -120,6 +123,9 @@ def _attach_score_norm(row: Dict[str, Any]) -> Dict[str, Any]:
     try:
         r = float(rank)
     except (TypeError, ValueError):
+        row["score_norm"] = 0.0
+        return row
+    if not math.isfinite(r):
         row["score_norm"] = 0.0
         return row
     try:

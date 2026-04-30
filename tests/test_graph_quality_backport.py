@@ -153,6 +153,37 @@ def test_fts_score_norm_monotone_in_rank():
     assert _attach_score_norm({})["score_norm"] == 0.0
 
 
+def test_fts_score_norm_monotone_in_rank():
+    """``score_norm`` must be strictly monotone-decreasing in FTS5 rank.
+
+    SQLite FTS5 ``bm25()`` returns smaller (more negative) values for
+    stronger matches, so a *better* hit must yield a *higher*
+    ``score_norm`` after normalisation. Regression guard for the prior
+    ``1/(1+|rank|)`` mapping which folded the sign and inverted the
+    relevance order for strong hits (rank ≤ -1).
+    """
+    from plugin_implementation.unified_db import _attach_score_norm
+
+    ranks = [-15.0, -8.0, -3.0, -1.0, -0.1, 0.0, 1.0]
+    norms = [_attach_score_norm({"fts_rank": r})["score_norm"] for r in ranks]
+    for prev, curr in zip(norms, norms[1:]):
+        assert prev > curr, f"score_norm not monotone-decreasing: {norms}"
+    # Sanity: common finite values stay inside (0, 1).
+    for n in norms:
+        assert 0.0 < n < 1.0
+    # Idempotent: pre-attached score_norm is preserved.
+    pre = {"fts_rank": -5.0, "score_norm": 0.42}
+    assert _attach_score_norm(pre)["score_norm"] == 0.42
+    # Missing rank → 0.0 (unchanged behaviour).
+    assert _attach_score_norm({})["score_norm"] == 0.0
+    # Non-finite ranks are treated as invalid input instead of leaking NaN.
+    for rank in (float("nan"), float("inf"), float("-inf")):
+        assert _attach_score_norm({"fts_rank": rank})["score_norm"] == 0.0
+    # Extreme finite ranks may saturate to the closed interval endpoints.
+    assert _attach_score_norm({"fts_rank": -1000.0})["score_norm"] == 1.0
+    assert _attach_score_norm({"fts_rank": 1000.0})["score_norm"] == 0.0
+
+
 def test_search_fts_with_path_prefix(db: UnifiedWikiDB):
     _seed_node(db, "python::a::foo", "needle hay", rel_path="api/foo.py")
     _seed_node(db, "python::b::bar", "needle hay", rel_path="util/bar.py")
