@@ -121,6 +121,7 @@ class FilesystemRepositoryIndexer:
         self.code_documents = []
         self.all_documents = []
         self.relationship_graph = None
+        self._parser_cross_language_relationships = []
         self.vectorstore = None
         self.last_index_stats = None
         self._doc_type_counts = {
@@ -299,6 +300,12 @@ class FilesystemRepositoryIndexer:
             documents_iter = getattr(analysis, 'documents_iter', None)
             self.all_documents = analysis.documents
             self.relationship_graph = analysis.unified_graph
+            # Parser-resolved cross-language relationships (REST/gRPC/FFI
+            # endpoints with both endpoints in the graph). Consumed by
+            # ``run_cross_language_linker`` as L0 evidence in Phase 1c.
+            self._parser_cross_language_relationships = list(
+                getattr(analysis, 'cross_language_relationships', []) or []
+            )
             
             # Apply post-processing to add repository metadata
             self._add_repository_metadata()
@@ -581,6 +588,78 @@ class FilesystemRepositoryIndexer:
                         _embed_batch_fn = _emb_obj.embed_documents
 
                 with UnifiedWikiDB(db_path) as udb:
+                    # ── Phase 1c — Cross-language linking & API-surface
+                    # extraction & test-link enrichment.
+                    # Runs BEFORE ``from_networkx`` so the new edges and
+                    # ``api_surface`` node attributes are persisted via
+                    # the same bulk path. All three passes are
+                    # flag-gated and side-effect-free w.r.t. the DB.
+                    try:
+                        from .feature_flags import get_feature_flags
+
+                        _flags = get_feature_flags()
+                        surfaces_by_node: dict = {}
+                        if _flags.api_surface_extraction:
+                            from .code_graph.api_surface_extractor import (
+                                extract_api_surfaces_for_graph,
+                            )
+
+                            surfaces_by_node = extract_api_surfaces_for_graph(
+                                self.relationship_graph,
+                                repo_root=repo_path,
+                            )
+                            logger.info(
+                                "Phase 1c: extracted API surfaces for %d nodes",
+                                len(surfaces_by_node),
+                            )
+
+                        if _flags.cross_language_linking:
+                            from .code_graph.cross_language_linker import (
+                                run_cross_language_linker,
+                            )
+
+                            cl_edges = run_cross_language_linker(
+                                self.relationship_graph,
+                                cross_language_relationships=(
+                                    self._parser_cross_language_relationships or None
+                                ),
+                                surfaces_by_node=surfaces_by_node or None,
+                                flags=_flags,
+                            )
+                            for src, tgt, attrs in cl_edges:
+                                if not (
+                                    self.relationship_graph.has_node(src)
+                                    and self.relationship_graph.has_node(tgt)
+                                ):
+                                    continue
+                                self.relationship_graph.add_edge(src, tgt, **attrs)
+                            logger.info(
+                                "Phase 1c: cross-language linker added %d edges "
+                                "(parser L0 inputs: %d)",
+                                len(cl_edges),
+                                len(self._parser_cross_language_relationships),
+                            )
+
+                        if _flags.test_linker:
+                            from .code_graph.test_linker import run_test_linker
+
+                            tl_edges = run_test_linker(
+                                self.relationship_graph, flags=_flags,
+                            )
+                            for src, tgt, attrs in tl_edges:
+                                if not (
+                                    self.relationship_graph.has_node(src)
+                                    and self.relationship_graph.has_node(tgt)
+                                ):
+                                    continue
+                                self.relationship_graph.add_edge(src, tgt, **attrs)
+                            logger.info(
+                                "Phase 1c: test linker added %d edges",
+                                len(tl_edges),
+                            )
+                    except Exception as exc:
+                        logger.warning("Phase 1c enrichment failed (non-fatal): %s", exc)
+
                     udb.from_networkx(self.relationship_graph)
 
                     # Phase 1b — Populate vector embeddings (repo_vec table).
