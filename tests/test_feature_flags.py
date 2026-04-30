@@ -17,12 +17,17 @@ from plugin_implementation.constants import (
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+# These flags are now hard-coded ON in the dataclass and are no longer read
+# from the environment. The list below is kept so tests can scrub any stale
+# values that might leak in from a developer's shell.
 _FLAG_ENVVARS = [
     "DEEPWIKI_CLUSTER_HIERARCHICAL_LEIDEN",
     "DEEPWIKI_CLUSTER_CAPABILITY_VALIDATION",
     "DEEPWIKI_CLUSTER_SMART_EXPANSION",
     "DEEPWIKI_CLUSTER_COVERAGE_LEDGER",
     "DEEPWIKI_CLUSTER_LANGUAGE_HINTS",
+    "DEEPWIKI_EXCLUDE_TESTS",
+    "DEEPWIKI_TEST_LINKER",
 ]
 
 
@@ -39,56 +44,49 @@ def _clean_env(monkeypatch):
 
 
 class TestFeatureFlagsDefaults:
-    """All flags must default to False (zero behaviour change)."""
+    """Cluster-planner flags are now baseline ON; user-facing flags default OFF."""
 
-    def test_defaults_all_false(self):
+    def test_cluster_baseline_on(self):
         flags = get_feature_flags()
-        assert flags.hierarchical_leiden is False
-        assert flags.capability_validation is False
-        assert flags.smart_expansion is False
-        assert flags.coverage_ledger is False
-        assert flags.language_hints is False
+        assert flags.hierarchical_leiden is True
+        assert flags.capability_validation is True
+        assert flags.smart_expansion is True
+        assert flags.coverage_ledger is True
+        assert flags.language_hints is True
+
+    def test_user_facing_flags_default_off(self):
+        flags = get_feature_flags()
+        assert flags.exclude_tests is False
+        assert flags.test_linker is False
 
     def test_frozen_dataclass(self):
         flags = get_feature_flags()
         with pytest.raises(AttributeError):
-            flags.hierarchical_leiden = True  # type: ignore[misc]
+            flags.hierarchical_leiden = False  # type: ignore[misc]
 
 
 class TestFeatureFlagsFromEnv:
-    """Each env-var ↔ flag mapping works correctly."""
+    """Only ``exclude_tests`` and ``test_linker`` remain env-driven."""
 
     @pytest.mark.parametrize("value", ["1", "true", "True", "TRUE", "yes", "YES"])
-    def test_truthy_values(self, monkeypatch, value):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_HIERARCHICAL_LEIDEN", value)
-        assert get_feature_flags().hierarchical_leiden is True
+    def test_exclude_tests_truthy_values(self, monkeypatch, value):
+        monkeypatch.setenv("DEEPWIKI_EXCLUDE_TESTS", value)
+        assert get_feature_flags().exclude_tests is True
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "anything", ""])
-    def test_falsy_values(self, monkeypatch, value):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_HIERARCHICAL_LEIDEN", value)
-        assert get_feature_flags().hierarchical_leiden is False
+    def test_exclude_tests_falsy_values(self, monkeypatch, value):
+        monkeypatch.setenv("DEEPWIKI_EXCLUDE_TESTS", value)
+        assert get_feature_flags().exclude_tests is False
 
-    def test_capability_validation_flag(self, monkeypatch):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_CAPABILITY_VALIDATION", "1")
-        flags = get_feature_flags()
-        assert flags.capability_validation is True
-        assert flags.hierarchical_leiden is False  # others unchanged
+    def test_test_linker_flag(self, monkeypatch):
+        monkeypatch.setenv("DEEPWIKI_TEST_LINKER", "1")
+        assert get_feature_flags().test_linker is True
 
-    def test_smart_expansion_flag(self, monkeypatch):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_SMART_EXPANSION", "true")
-        assert get_feature_flags().smart_expansion is True
-
-    def test_coverage_ledger_flag(self, monkeypatch):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_COVERAGE_LEDGER", "yes")
-        assert get_feature_flags().coverage_ledger is True
-
-    def test_language_hints_flag(self, monkeypatch):
-        monkeypatch.setenv("DEEPWIKI_CLUSTER_LANGUAGE_HINTS", "1")
-        assert get_feature_flags().language_hints is True
-
-    def test_all_flags_enabled(self, monkeypatch):
-        for var in _FLAG_ENVVARS:
-            monkeypatch.setenv(var, "1")
+    def test_cluster_envs_no_longer_consulted(self, monkeypatch):
+        # Setting the legacy cluster env vars must not flip the flags off —
+        # they're hard-coded ON regardless of environment.
+        for var in _FLAG_ENVVARS[:5]:
+            monkeypatch.setenv(var, "0")
         flags = get_feature_flags()
         assert flags.hierarchical_leiden is True
         assert flags.capability_validation is True

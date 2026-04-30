@@ -10,11 +10,18 @@ Verifies that:
 import pytest
 from unittest.mock import MagicMock, patch
 
+from plugin_implementation.feature_flags import FeatureFlags
 from plugin_implementation.state.wiki_state import PageSpec
 from plugin_implementation.cluster_expansion import (
     expand_for_page,
     _collect_expansion_neighbors,
 )
+
+
+# Helper used by ``expand_for_page`` tests below: pin to the legacy
+# (non-smart) expansion path so the MagicMock DB \u2014 which doesn't simulate
+# the language-detection / smart-expansion SQL \u2014 isn't exercised.
+_LEGACY_FLAGS = FeatureFlags(smart_expansion=False, language_hints=False)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -229,14 +236,18 @@ class TestPageBoundaryExpansion:
         db = _mock_db_with_nodes([node_a, node_b], edges)
 
         # With cluster_node_ids = only "a", expansion should NOT include "b"
-        docs = expand_for_page(
-            db=db,
-            page_symbols=["ClassA"],
-            macro_id=1,
-            micro_id=0,
-            cluster_node_ids=["a"],
-            token_budget=50000,
-        )
+        with patch(
+            "plugin_implementation.cluster_expansion.get_feature_flags",
+            return_value=_LEGACY_FLAGS,
+        ):
+            docs = expand_for_page(
+                db=db,
+                page_symbols=["ClassA"],
+                macro_id=1,
+                micro_id=0,
+                cluster_node_ids=["a"],
+                token_budget=50000,
+            )
 
         # Only ClassA should be in docs (initial), no expansion to ClassB
         doc_names = [d.metadata.get("symbol_name", "") for d in docs]
@@ -254,12 +265,16 @@ class TestPageBoundaryExpansion:
         db = _mock_db_with_nodes([node_a, node_b], edges)
 
         # Without cluster_node_ids, macro boundary allows B
-        docs = expand_for_page(
-            db=db,
-            page_symbols=["ClassA"],
-            macro_id=1,
-            token_budget=50000,
-        )
+        with patch(
+            "plugin_implementation.cluster_expansion.get_feature_flags",
+            return_value=_LEGACY_FLAGS,
+        ):
+            docs = expand_for_page(
+                db=db,
+                page_symbols=["ClassA"],
+                macro_id=1,
+                token_budget=50000,
+            )
 
         doc_names = [d.metadata.get("symbol_name", "") for d in docs]
         assert "ClassA" in doc_names

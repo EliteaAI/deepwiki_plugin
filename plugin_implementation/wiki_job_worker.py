@@ -170,6 +170,17 @@ def run_wiki_generation(input_data: Dict[str, Any]) -> Dict[str, Any]:
     os.environ["HF_HOME"] = model_cache_dir
     os.environ["SENTENCE_TRANSFORMERS_HOME"] = model_cache_dir
 
+    # Bridge user-facing wiki-generation knobs from the K8s Job payload to the
+    # environment so feature_flags.get_feature_flags() and the agent's
+    # _resolve_planner_choice helper can pick them up. Mirrors the equivalent
+    # bridge in wiki_subprocess_worker.main so K8s and subprocess modes
+    # honour the UI-selected planner_type / exclude_tests identically.
+    _planner_mode = input_data.get("planner_mode") or input_data.get("planner_type")
+    if _planner_mode:
+        os.environ["DEEPWIKI_STRUCTURE_PLANNER"] = str(_planner_mode).strip().lower()
+    if "exclude_tests" in input_data and input_data.get("exclude_tests") is not None:
+        os.environ["DEEPWIKI_EXCLUDE_TESTS"] = "1" if input_data.get("exclude_tests") else "0"
+
     query = input_data.get("query")
     if not query:
         raise ValueError("query is required")

@@ -34,7 +34,7 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 # Feature flag
-UNIFIED_RETRIEVER_ENABLED = os.getenv("DEEPWIKI_UNIFIED_RETRIEVER", "0") == "1"
+UNIFIED_RETRIEVER_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # Constants

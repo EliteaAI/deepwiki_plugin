@@ -423,7 +423,7 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                 _print(f"Filesystem root (on-demand clone): {filesystem_root_dir}")
         
         # Phase 6: Check for unified DB mode before loading legacy indexes
-        _unified_retriever_enabled = os.environ.get('DEEPWIKI_UNIFIED_RETRIEVER', '0') == '1'
+        _unified_retriever_enabled = True  # always-on — UnifiedWikiDB is the only retrieval store
         _unified_retriever_active = False
         retriever_stack = None
 

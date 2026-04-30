@@ -294,10 +294,10 @@ class WikiStructurePlannerEngine:
         self.tool_calls = []
         
         start_time = time.time()
-        # Enable logging by default, can be disabled with DEEPWIKI_DEEPAGENTS_LOG_STREAM=0
-        log_stream = os.getenv("DEEPWIKI_DEEPAGENTS_LOG_STREAM", "1") == "1"
-        # Use invoke instead of stream for faster execution (stream has overhead)
-        use_stream = os.getenv("DEEPWIKI_DEEPAGENTS_USE_STREAM", "0") == "1"
+        # DeepAgents planner defaults: streaming + log_stream both on.
+        # Power users can disable via DEEPWIKI_DEEPAGENTS_LOG_STREAM=0 / DEEPWIKI_DEEPAGENTS_USE_STREAM=0.
+        log_stream = os.getenv("DEEPWIKI_DEEPAGENTS_LOG_STREAM", "1") != "0"
+        use_stream = os.getenv("DEEPWIKI_DEEPAGENTS_USE_STREAM", "1") != "0"
         
         try:
             from .structure_prompts import get_structure_task_prompt

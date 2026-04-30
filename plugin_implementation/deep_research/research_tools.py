@@ -33,7 +33,7 @@ from .hybrid_fusion import (
 logger = logging.getLogger(__name__)
 
 # Feature flag: use UnifiedWikiDB for deep-research graph search
-UNIFIED_RETRIEVER_ENABLED = os.environ.get('DEEPWIKI_UNIFIED_RETRIEVER', '0') == '1'
+UNIFIED_RETRIEVER_ENABLED = True
 
 # Container types that can own child methods/functions via 'defines' edges.
 # Used by orphan FTS fallback to discover string-based references.

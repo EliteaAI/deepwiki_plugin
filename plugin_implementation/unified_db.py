@@ -52,9 +52,11 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature flag — module-level so the indexer can check cheaply
+# UnifiedWikiDB is the only persistence layer. Kept as a module-level
+# constant for backward compatibility with code paths that still imported
+# the old feature flag — every call site behaves as if it is enabled.
 # ---------------------------------------------------------------------------
-UNIFIED_DB_ENABLED = os.getenv("DEEPWIKI_UNIFIED_DB", "0") == "1"
+UNIFIED_DB_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # sqlite-vec availability (graceful degradation)
@@ -846,22 +848,48 @@ class UnifiedWikiDB:
     # ══════════════════════════════════════════════════════════════════
 
     def upsert_embedding(self, node_id: str, embedding: List[float]) -> None:
-        """Insert or replace a single embedding."""
+        """Insert or replace a single embedding.
+
+        Note: sqlite-vec ``vec0`` virtual tables do NOT honour the
+        ``OR REPLACE`` conflict resolver when the primary key is a TEXT
+        column — they raise ``UNIQUE constraint failed`` instead. We
+        therefore explicitly DELETE any existing row before INSERT.
+        """
         if not self._vec_available:
             return
         blob = _serialize_float32_vec(embedding)
         self.conn.execute(
-            "INSERT OR REPLACE INTO repo_vec (node_id, embedding) VALUES (?, ?)",
+            "DELETE FROM repo_vec WHERE node_id = ?", (node_id,),
+        )
+        self.conn.execute(
+            "INSERT INTO repo_vec (node_id, embedding) VALUES (?, ?)",
             (node_id, blob),
         )
 
     def upsert_embeddings_batch(
         self, embeddings: List[Tuple[str, List[float]]]
     ) -> None:
-        """Bulk insert embeddings as (node_id, vector) pairs."""
+        """Bulk insert embeddings as (node_id, vector) pairs.
+
+        See :meth:`upsert_embedding` for why we DELETE-then-INSERT instead
+        of relying on ``INSERT OR REPLACE`` (sqlite-vec ``vec0`` PK quirk).
+        """
         if not self._vec_available or not embeddings:
             return
-        sql = "INSERT OR REPLACE INTO repo_vec (node_id, embedding) VALUES (?, ?)"
+        node_ids = [nid for nid, _ in embeddings]
+        # Chunk the DELETE to stay well below SQLite's default
+        # SQLITE_MAX_VARIABLE_NUMBER (typically 32766/999) — populate
+        # callers use batch_size 64 by default but external callers may
+        # pass arbitrarily large lists.
+        _CHUNK = 500
+        for i in range(0, len(node_ids), _CHUNK):
+            chunk = node_ids[i : i + _CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            self.conn.execute(
+                f"DELETE FROM repo_vec WHERE node_id IN ({placeholders})",
+                chunk,
+            )
+        sql = "INSERT INTO repo_vec (node_id, embedding) VALUES (?, ?)"
         rows = [(nid, _serialize_float32_vec(vec)) for nid, vec in embeddings]
         self.conn.executemany(sql, rows)
 
@@ -1201,6 +1229,25 @@ class UnifiedWikiDB:
                 f"DELETE FROM repo_nodes WHERE node_id IN ({placeholders})",
                 stale_list,
             )
+            # Purge stale embeddings too — repo_vec is not auto-cascaded
+            # when repo_nodes rows go away, and a stale row will trigger
+            # a UNIQUE constraint failure when populate_embeddings tries
+            # to (re-)insert under the same node_id (vec0 PK quirk).
+            if self._vec_available:
+                try:
+                    # Chunk to stay below SQLITE_MAX_VARIABLE_NUMBER.
+                    _CHUNK = 500
+                    for i in range(0, len(stale_list), _CHUNK):
+                        chunk = stale_list[i : i + _CHUNK]
+                        chunk_ph = ",".join("?" * len(chunk))
+                        self.conn.execute(
+                            f"DELETE FROM repo_vec WHERE node_id IN ({chunk_ph})",
+                            chunk,
+                        )
+                except sqlite3.OperationalError as exc:
+                    logger.debug(
+                        "from_networkx: repo_vec stale purge skipped: %s", exc,
+                    )
             self.conn.commit()
             logger.info(
                 "Purged %d stale nodes from previous run", len(stale_ids),

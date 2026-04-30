@@ -323,14 +323,15 @@ class TestFeatureFlagGating:
         assert "algorithm_metadata" in result
         assert result["algorithm_metadata"]["algorithm"] == "hierarchical_leiden_file_contracted"
 
-    def test_flag_default_uses_legacy(self):
-        """Default flags → legacy pipeline."""
+    def test_flag_default_uses_hierarchical(self):
+        """Default flags → hierarchical pipeline (cluster baseline is now ON)."""
         G, _ = _build_domain_graph(2, 2, 5)
         db = _mock_db()
-        flags = FeatureFlags()  # all defaults = False
+        flags = FeatureFlags()  # cluster baseline defaults are now True
 
         result = run_phase3(db, G, feature_flags=flags)
-        assert result.get("algorithm_metadata") is None
+        assert "algorithm_metadata" in result
+        assert result["algorithm_metadata"]["algorithm"] == "hierarchical_leiden_file_contracted"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
