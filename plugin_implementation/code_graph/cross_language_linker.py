@@ -2,7 +2,7 @@
 
 Side-effect-free 4-level cascade that returns the list of edges to add
 to the graph. The caller (Phase 1c pipeline integration, gated by
-``WIKI_CROSS_LANGUAGE_LINKING``) is responsible for actually invoking
+``DEEPWIKI_CROSS_LANGUAGE_LINKING``) is responsible for actually invoking
 ``graph.add_edge`` and persisting the edges.
 
 Cascade
