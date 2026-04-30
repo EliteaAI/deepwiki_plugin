@@ -256,8 +256,10 @@ def collect_orphan_embeddings(
     Uses :meth:`get_embedding_by_id` (added alongside this module).
     Falls back to ``None`` per node when the storage layer cannot
     return a vector; callers should treat ``None`` as
-    "embed on demand" — but the v2 cascade aborts hybrid Pass 2 in
-    that case rather than re-embedding synchronously.
+    "embedding unavailable from storage". Downstream hybrid Pass 2
+    may then either use a provided embedding fallback to
+    re-embed synchronously or skip/abort that work when no
+    embedding function is available.
     """
     ids = list(orphan_ids)
     if not ids or db is None:
