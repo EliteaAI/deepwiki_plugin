@@ -612,17 +612,20 @@ def resolve_orphans(
     vec_prefix_depth: Optional[int] = None,
     embed_max_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """3-pass orphan resolution cascade (batched for performance).
+    """Mode-dependent orphan resolution cascade (batched for performance).
 
-    Mirrors the wikis ``graph_topology.resolve_orphans`` exactly:
+    Mirrors the wikis ``graph_topology.resolve_orphans`` exactly. The
+    enabled feature flags determine which passes run and in what order:
 
-    * Mode A (``orphan_cascade_v2`` on, default) — explicit-ref →
-      hybrid RRF → tiered lexical → directory proximity.
-    * Mode B (cascade off, ``orphan_lexical_tiered`` on) — tiered
-      lexical T1–T4 → batched semantic vector → directory proximity.
-    * Mode C (both off) — legacy flat FTS (stopword gate +
-      ``fts_min_score_norm``) → batched semantic vector → directory
+    * Mode A (``orphan_cascade_v2`` on, default) — 4-pass cascade:
+      explicit-ref → hybrid RRF → tiered lexical → directory
       proximity.
+    * Mode B (cascade off, ``orphan_lexical_tiered`` on) — 3-pass
+      cascade: tiered lexical T1–T4 → batched semantic vector →
+      directory proximity.
+    * Mode C (both off) — 3-pass cascade: legacy flat FTS (stopword
+      gate + ``fts_min_score_norm``) → batched semantic vector →
+      directory proximity.
 
     Edge writes are graph-only (skip_db=True); persist_weights_to_db
     rewrites all edges at the end of Phase 2.
