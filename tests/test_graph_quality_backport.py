@@ -480,9 +480,8 @@ def test_attach_graph_indexes_builds_qualified_and_fqn_index():
 
 
 def test_node_id_disambiguation_suffix_uses_rel_path_when_flag_on(monkeypatch):
-    """When ``node_id_style='rel_path'`` collisions append a stable
-    rel_path-derived suffix instead of an unstable hash."""
-    monkeypatch.setenv("DEEPWIKI_NODE_ID_STYLE", "rel_path")
+    """``node_id_style='rel_path'`` is now the always-on baseline. Collisions
+    append a stable rel_path-derived suffix instead of an unstable hash."""
     flags = get_feature_flags()
     assert flags.node_id_style == "rel_path"
 

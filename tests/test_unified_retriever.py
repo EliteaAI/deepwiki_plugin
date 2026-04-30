@@ -529,16 +529,14 @@ class TestEmbeddingHelper:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFeatureFlag:
-    def test_flag_default_off(self):
-        # Default is "0" unless env var is set
-        # Just verify the import worked and the flag is a bool
-        assert isinstance(UNIFIED_RETRIEVER_ENABLED, bool)
+    """``UNIFIED_RETRIEVER_ENABLED`` is now hard-coded to ``True``.
 
-    def test_flag_reads_env(self):
-        with patch.dict("os.environ", {"DEEPWIKI_UNIFIED_RETRIEVER": "1"}):
-            # Re-evaluate the flag
-            flag = os.environ.get("DEEPWIKI_UNIFIED_RETRIEVER", "0") == "1"
-            assert flag is True
+    The ``DEEPWIKI_UNIFIED_RETRIEVER`` env switch has been removed because
+    UnifiedWikiDB is the only retrieval store.
+    """
+
+    def test_flag_is_always_on(self):
+        assert UNIFIED_RETRIEVER_ENABLED is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

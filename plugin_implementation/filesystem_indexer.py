@@ -25,9 +25,10 @@ from .unified_db import UnifiedWikiDB, UNIFIED_DB_ENABLED
 from .graph_topology import run_phase2
 from .graph_clustering import run_phase3
 
-# When DEEPWIKI_LEGACY_INDEXES=0 and DEEPWIKI_UNIFIED_DB=1, skip writing legacy
-# cache files (.code_graph.gz). Default: 1 (write legacy files for backward compat).
-LEGACY_INDEXES_ENABLED = os.getenv('DEEPWIKI_LEGACY_INDEXES', '1') == '1'
+# Legacy multi-component artifacts (FAISS / BM25 / .code_graph.gz) are no
+# longer written — UnifiedWikiDB is the single source of truth. Kept as a
+# module-level constant so existing tests that import it continue to work.
+LEGACY_INDEXES_ENABLED = False
 
 logger = logging.getLogger(__name__)
 
@@ -358,11 +359,11 @@ class FilesystemRepositoryIndexer:
             )
         
         # Step 3: Build or load vector store (allow cache reuse)
-        # When DEEPWIKI_LEGACY_INDEXES=0 + DEEPWIKI_UNIFIED_DB=1, skip legacy
-        # FAISS/BM25/docstore — the unified .wiki.db is the single retrieval store.
-        _skip_legacy_vectorstore = (not LEGACY_INDEXES_ENABLED and UNIFIED_DB_ENABLED)
+        # Legacy FAISS/BM25/docstore artifacts are not built — UnifiedWikiDB
+        # is the single retrieval store.
+        _skip_legacy_vectorstore = True
         if _skip_legacy_vectorstore:
-            logger.info("Skipping legacy vectorstore build (DEEPWIKI_LEGACY_INDEXES=0, UNIFIED_DB=1)")
+            logger.info("Skipping legacy vectorstore build (UnifiedWikiDB only)")
             # Materialize streaming iterator so self.all_documents is populated
             # (needed for stats and unified DB write).
             if documents_iter and not self.all_documents:
@@ -421,16 +422,10 @@ class FilesystemRepositoryIndexer:
                     "but semantic search will not be functional. This may be due to empty "
                     "documents or embedding model issues."
                 )
-                
-                # Save graph even if vectorstore failed (with commit hash)
-                if self.relationship_graph:
-                    logger.info("Saving relationship graph to cache...")
-                    self.graph_manager.save_graph(
-                        self.relationship_graph, repo_path, 
-                        commit_hash=self._last_commit_hash,
-                        repo_identifier=repo_identifier
-                    )
-                
+
+                # Note: legacy .code_graph.gz writes are no longer produced; the
+                # unified .wiki.db is written below in Step 4b on the success path.
+
                 # Return partial results
                 index_stats = self._generate_index_stats(repo_identifier, from_cache=False)
                 index_stats['vectorstore_error'] = str(e)
@@ -439,19 +434,10 @@ class FilesystemRepositoryIndexer:
                     index_stats['repository_info']['commit_hash'] = self._last_commit_hash
                 return index_stats
         
-        # Step 4: Save relationship graph to cache (with commit hash for stability)
-        # When DEEPWIKI_LEGACY_INDEXES=0 + unified DB is enabled, skip legacy
-        # .code_graph.gz writes — the unified .wiki.db is the single source of truth.
-        if self.relationship_graph and (LEGACY_INDEXES_ENABLED or not UNIFIED_DB_ENABLED):
-            logger.info("Saving relationship graph to cache...")
-            with resource_monitor("index.graph_cache_save", logger):
-                self.graph_manager.save_graph(
-                    self.relationship_graph, repo_path,
-                    commit_hash=self._last_commit_hash,
-                    repo_identifier=repo_identifier
-                )
-        elif self.relationship_graph:
-            logger.info("Skipping legacy graph cache save (DEEPWIKI_LEGACY_INDEXES=0)")
+        # Step 4: Legacy .code_graph.gz writes are no longer produced — the
+        # unified .wiki.db is the single source of truth.
+        if self.relationship_graph:
+            logger.debug("Skipping legacy graph cache save (UnifiedWikiDB only)")
         
         # Step 4b: Write Unified SQLite DB (feature-flagged dual-write)
         if UNIFIED_DB_ENABLED and self.relationship_graph:

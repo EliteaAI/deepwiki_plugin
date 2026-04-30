@@ -408,13 +408,15 @@ class TestRefinerOutputParsing:
 class TestFlagGating:
 
     def test_coverage_ledger_not_invoked_when_flag_off(self):
-        """When coverage_ledger flag is off, plan_structure skips step 1c."""
+        """When coverage_ledger flag is overridden off, plan_structure skips step 1c."""
         from plugin_implementation.feature_flags import FeatureFlags
 
-        flags = FeatureFlags()
+        # Cluster baseline is now ON; verify the dataclass still allows an
+        # explicit override for tests that need to simulate the flag being off.
+        flags = FeatureFlags(coverage_ledger=False)
         assert flags.coverage_ledger is False
 
-        # With all flags off, CoverageLedger should not be instantiated.
+        # With the flag overridden off, CoverageLedger should not be instantiated.
         # This is verified by the existing test_cluster_planner.py tests
         # which pass without a repo_edges table → proves CoverageLedger
         # (which reads repo_nodes) is never reached.

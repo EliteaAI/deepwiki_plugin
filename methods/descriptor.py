@@ -115,6 +115,16 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                                     "type": "String",
                                     "required": True,
                                     "description": "Query or description of what wiki content to generate"
+                                },
+                                "planner_type": {
+                                    "type": "String",
+                                    "required": False,
+                                    "description": "Structure planner to use: 'cluster' (default, deterministic graph-clustering planner) or 'deepagents' (agentic loop). Aliases 'agent'/'agentic' are accepted."
+                                },
+                                "exclude_tests": {
+                                    "type": "Boolean",
+                                    "required": False,
+                                    "description": "When using the cluster planner, skip test files so they don't form their own wiki pages. Test nodes are still indexed and available to ask/deep_research."
                                 }
                             },
                             "description": "Generate comprehensive wiki from repository analysis",

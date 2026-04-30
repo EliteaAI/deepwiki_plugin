@@ -474,15 +474,16 @@ class TestSmartExpansionWithLanguageHints:
 
 class TestFlagGating:
 
-    def test_language_hints_flag_off_by_default(self):
+    def test_language_hints_on_by_default(self):
+        """Cluster baseline is now ON; language_hints is part of that baseline."""
         from plugin_implementation.feature_flags import FeatureFlags
         flags = FeatureFlags()
-        assert flags.language_hints is False
+        assert flags.language_hints is True
 
-    def test_language_hints_do_not_affect_legacy_path(self):
-        """When smart_expansion is off, language hints are irrelevant."""
+    def test_language_hints_can_be_disabled_explicitly(self):
+        """Explicit override still works for tests that need the legacy path."""
         from plugin_implementation.feature_flags import FeatureFlags
-        flags = FeatureFlags()
+        flags = FeatureFlags(smart_expansion=False, language_hints=False)
         assert flags.smart_expansion is False
         assert flags.language_hints is False
         # Both off = purely legacy expansion, no lang hints code reached

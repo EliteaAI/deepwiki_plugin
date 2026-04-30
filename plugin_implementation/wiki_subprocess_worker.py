@@ -193,6 +193,16 @@ def main(argv=None) -> int:
         os.environ["HF_HOME"] = model_cache_dir
         os.environ["SENTENCE_TRANSFORMERS_HOME"] = model_cache_dir
 
+        # Bridge user-facing wiki-generation knobs from the payload to the
+        # environment so feature_flags.get_feature_flags() and the agent's
+        # _resolve_planner_choice helper can pick them up without an
+        # additional plumbing layer.
+        _planner_mode = payload.get("planner_mode") or payload.get("planner_type")
+        if _planner_mode:
+            os.environ["DEEPWIKI_STRUCTURE_PLANNER"] = str(_planner_mode).strip().lower()
+        if "exclude_tests" in payload and payload.get("exclude_tests") is not None:
+            os.environ["DEEPWIKI_EXCLUDE_TESTS"] = "1" if payload.get("exclude_tests") else "0"
+
         query = payload.get("query")
         if not query:
             raise ValueError("query is required")
