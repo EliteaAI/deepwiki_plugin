@@ -301,8 +301,9 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             canonical_repo_identifier = repo_identifier
 
-        # Phase 6: Check for unified DB mode before loading legacy indexes
-        _unified_retriever_enabled = os.environ.get('DEEPWIKI_UNIFIED_RETRIEVER', '0') == '1'
+        # Phase 6: Always prefer UnifiedRetriever (UnifiedWikiDB is the
+        # single retrieval store).
+        _unified_retriever_enabled = True
         _unified_retriever_active = False
         retriever_stack = None
 
@@ -706,8 +707,9 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Initialize retriever stack with graph
         _print("Initializing retriever stack...")
 
-        # Phase 6: prefer UnifiedRetriever when flag is set and .wiki.db exists
-        _unified_retriever_enabled = os.environ.get('DEEPWIKI_UNIFIED_RETRIEVER', '0') == '1'
+        # Phase 6: Always prefer UnifiedRetriever (UnifiedWikiDB is the
+        # single retrieval store).
+        _unified_retriever_enabled = True
         retriever_stack = None
         if _unified_retriever_enabled:
             try:

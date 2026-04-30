@@ -594,32 +594,22 @@ class TestExtractMacroId:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Tests: DEEPWIKI_LEGACY_INDEXES flag
+# Tests: legacy-index disablement (always-off baseline)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestLegacyIndexesFlag:
-    """Verify the DEEPWIKI_LEGACY_INDEXES env var is read correctly."""
+    """The legacy ``.code_graph.gz`` / ``.faiss`` writes are now permanently off.
 
-    def test_default_is_enabled(self):
-        """Default (no env var) → legacy indexes enabled."""
+    UnifiedWikiDB is the single index store. The previous
+    ``DEEPWIKI_LEGACY_INDEXES`` env switch has been removed; only the
+    ``LEGACY_INDEXES_ENABLED`` constant survives for backward-compatible
+    imports.
+    """
+
+    def test_legacy_indexes_disabled_by_default(self):
         from plugin_implementation import filesystem_indexer
-        # When DEEPWIKI_LEGACY_INDEXES is unset or '1', should be True
-        # We can't easily control os.environ at import time, so just verify
-        # the constant exists and is a boolean
-        assert isinstance(filesystem_indexer.LEGACY_INDEXES_ENABLED, bool)
 
-    def test_flag_reads_env(self, monkeypatch):
-        """When DEEPWIKI_LEGACY_INDEXES=0, the flag should be False."""
-        monkeypatch.setenv("DEEPWIKI_LEGACY_INDEXES", "0")
-        # Re-evaluate the expression
-        result = os.getenv("DEEPWIKI_LEGACY_INDEXES", "1") == "1"
-        assert result is False
-
-    def test_flag_default_true(self, monkeypatch):
-        """When DEEPWIKI_LEGACY_INDEXES is unset, default is '1' → True."""
-        monkeypatch.delenv("DEEPWIKI_LEGACY_INDEXES", raising=False)
-        result = os.getenv("DEEPWIKI_LEGACY_INDEXES", "1") == "1"
-        assert result is True
+        assert filesystem_indexer.LEGACY_INDEXES_ENABLED is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

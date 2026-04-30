@@ -315,10 +315,14 @@ class OptimizedWikiGenerationAgent:
 
             repository_files = self._get_repository_file_paths()
 
+            # Read planner choice from request config; env vars are no longer
+            # consulted. Accepted values: "agent"/"deepagents"/"agentic",
+            # "cluster", "auto" (default — file-count based).
+            _planner_choice = self._resolve_planner_choice(config)
+
             # ── Cluster-based path (Phase 4 — cheapest) ─────────
-            _cluster_mode = os.getenv("DEEPWIKI_STRUCTURE_PLANNER", "auto").strip().lower()
-            if _cluster_mode == "cluster":
-                logger.info("Structure planner: cluster (DEEPWIKI_STRUCTURE_PLANNER=cluster)")
+            if _planner_choice == "cluster":
+                logger.info("Structure planner: cluster (planner_mode=cluster)")
                 try:
                     response = self._generate_wiki_structure_with_clusters(config=config)
                     logger.info("WikiStructureSpec created successfully (cluster)")
@@ -346,45 +350,10 @@ class OptimizedWikiGenerationAgent:
             use_deepagents = self._should_use_deepagents_structure_planner(
                 repo_context=repo_context,
                 repository_files=repository_files,
+                planner_choice=_planner_choice,
             )
 
             if use_deepagents:
-                # ── Graph-First path (feature-flagged) ────────────────
-                use_graph_first = os.getenv("DEEPWIKI_USE_GRAPH_FIRST", "0") == "1"
-                _gf_graph = (
-                    getattr(self.retriever_stack, 'relationship_graph', None)
-                    or getattr(self.indexer, 'relationship_graph', None)
-                )
-                if use_graph_first and _gf_graph is not None:
-                    logger.info("Structure planner: graph-first (DEEPWIKI_USE_GRAPH_FIRST=1)")
-                    try:
-                        response = self._generate_wiki_structure_graph_first(
-                            repository_files=repository_files,
-                            target_audience=TARGET_AUDIENCES.get(
-                                self.target_audience.value,
-                                "Mixed audience with varied technical backgrounds",
-                            ),
-                            wiki_type=self.wiki_style.value,
-                            config=config,
-                        )
-                        logger.info("WikiStructureSpec created successfully (graph-first)")
-                        logger.info(f"Wiki structure sections: {len(response.sections)}")
-                        if this and getattr(this, 'module', None):
-                            total_pages = sum(len(s.pages) for s in response.sections)
-                            this.module.invocation_thinking(
-                                f"I am on phase structure_planning\nStructure designed: {len(response.sections)} sections / {total_pages} pages (graph-first)\nReasoning: Deterministic skeleton from code graph with LLM refinement.\nNext: Parallelize page drafting with focused context windows."
-                            )
-                        return {
-                            "wiki_structure_spec": response,
-                            "structure_planning_complete": True,
-                            "current_phase": "structure_complete",
-                        }
-                    except Exception as gf_error:
-                        logger.warning(
-                            "Graph-first structure planner failed, "
-                            "falling back to deepagents: %s", gf_error,
-                        )
-
                 # ── DeepAgents path (default) ─────────────────────────
                 logger.info("Structure planner: deepagents (auto)")
                 try:
@@ -1392,16 +1361,48 @@ class OptimizedWikiGenerationAgent:
             return []
         return [item.strip() for item in raw.split(",") if item.strip()]
 
+    def _resolve_planner_choice(self, config: Optional[RunnableConfig]) -> str:
+        """Read the planner choice from the request configuration.
+
+        Returns one of ``"agent"`` / ``"cluster"`` / ``"auto"`` (lower-case).
+        ``"agent"``, ``"deepagents"`` and ``"agentic"`` are aliases. Unknown
+        values fall back to ``"auto"``.
+
+        Resolution order:
+        1. ``config["configurable"]["planner_mode" | "planner_type"]`` —
+           preferred path; comes from the per-request RunnableConfig.
+        2. ``DEEPWIKI_STRUCTURE_PLANNER`` env var — bridges the choice
+           through the subprocess worker which serialises payload → env.
+        3. ``"auto"`` — file-count based decision in
+           :func:`_should_use_deepagents_structure_planner`.
+        """
+        raw: Any = None
+        if isinstance(config, dict):
+            configurable = config.get("configurable") if isinstance(config.get("configurable"), dict) else None
+            if configurable:
+                raw = configurable.get("planner_mode") or configurable.get("planner_type")
+        if not raw:
+            raw = os.environ.get("DEEPWIKI_STRUCTURE_PLANNER", "").strip()
+        if not raw:
+            return "auto"
+        choice = str(raw).strip().lower()
+        if choice in {"agent", "agentic", "deepagents"}:
+            return "agent"
+        if choice == "cluster":
+            return "cluster"
+        return "auto"
+
     def _should_use_deepagents_structure_planner(
         self,
         repo_context: Optional[str],
         repository_files: List[str],
+        planner_choice: Optional[str] = None,
     ) -> bool:
         """Decide whether to use deepagents for structure planning."""
-        mode = os.getenv("DEEPWIKI_STRUCTURE_PLANNER", "auto").strip().lower()
-        if mode in {"deepagents", "agentic"}:
+        choice = (planner_choice or "auto").strip().lower()
+        if choice in {"agent", "deepagents", "agentic"}:
             return True
-        if mode in {"llm", "classic", "standard"}:
+        if choice in {"llm", "classic", "standard"}:
             return False
 
         file_threshold = self._get_env_int("DEEPWIKI_DEEPAGENTS_FILE_THRESHOLD", 2000)

@@ -40,7 +40,9 @@ import {
   Snackbar,
   Grid,
   Tab,
-  Tabs
+  Tabs,
+  ToggleButton,
+  ToggleButtonGroup
 } from '@mui/material';
 import {
   AutoAwesome as GenerateIcon,
@@ -370,6 +372,11 @@ function DeepWikiApp() {
   const [deletingWiki, setDeletingWiki] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  // Planner mode (mirrors the wikis Generate dialog): "agent" = DeepAgents
+  // structure planner, "cluster" = graph-clustering planner. The cluster
+  // planner exposes the optional "smart skip tests" toggle.
+  const [plannerMode, setPlannerMode] = useState('agent');
+  const [excludeTests, setExcludeTests] = useState(true);
   const [lastModifiedDate, setLastModifiedDate] = useState(null);
   const [resolvedRepoName, setResolvedRepoName] = useState(null);
 
@@ -2038,7 +2045,14 @@ function DeepWikiApp() {
           settings: originalSettings,
         },
         tool_name: 'generate_wiki',
-        tool_params: { query: 'GO' },
+        tool_params: {
+          query: 'GO',
+          // Forward the user-selected planner choice + (cluster-only) test
+          // exclusion. The backend bridges these into the subprocess worker
+          // env / RunnableConfig.
+          planner_type: plannerMode,
+          exclude_tests: plannerMode === 'cluster' ? excludeTests : null,
+        },
         llm_model: llmModel,
         llm_settings: {
           max_tokens: maxTokens,
@@ -2064,7 +2078,7 @@ function DeepWikiApp() {
       });
       cleanupGeneration(socketUnsubscribeRef.current);
     }
-  }, [toolkit, projectId, toolkitId, socketSubscribe, socketEmit, cleanupGeneration, slots, refreshSlots]);
+  }, [toolkit, projectId, toolkitId, socketSubscribe, socketEmit, cleanupGeneration, slots, refreshSlots, plannerMode, excludeTests]);
 
   // Create theme with EliteA design tokens
   const theme = useMemo(
@@ -4149,6 +4163,51 @@ ${errorInfo.mermaidCode}
               'This will regenerate all wiki documentation from your repository. This may take several minutes.'
             )}
           </DialogContentText>
+          <Box sx={{ mt: 2.5 }}>
+            <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600 }}>
+              Structure planner
+            </Typography>
+            <ToggleButtonGroup
+              exclusive
+              value={plannerMode}
+              onChange={(_e, next) => { if (next) setPlannerMode(next); }}
+              size="small"
+              fullWidth
+              aria-label="Structure planner mode"
+            >
+              <ToggleButton value="agent" aria-label="Agentic planner">
+                Agentic
+              </ToggleButton>
+              <ToggleButton value="cluster" aria-label="Graph-clustering planner">
+                Graph clustering
+              </ToggleButton>
+            </ToggleButtonGroup>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75 }}>
+              {plannerMode === 'cluster'
+                ? 'Builds the wiki outline from code-graph clusters. Faster on large repos.'
+                : 'Lets a planner agent draft the outline. Best for small/medium repos with rich docs.'}
+            </Typography>
+            {plannerMode === 'cluster' && (
+              <FormControlLabel
+                sx={{ mt: 1 }}
+                control={
+                  <Switch
+                    checked={excludeTests}
+                    onChange={(e) => setExcludeTests(e.target.checked)}
+                    size="small"
+                  />
+                }
+                label={
+                  <Box>
+                    <Typography variant="body2">Smart skip tests</Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Excludes test files from the cluster planner to keep the outline focused.
+                    </Typography>
+                  </Box>
+                }
+              />
+            )}
+          </Box>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setUpdateDialogOpen(false)}>

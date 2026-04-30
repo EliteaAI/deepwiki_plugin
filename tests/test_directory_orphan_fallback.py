@@ -12,11 +12,14 @@ and applies SYNTHETIC_WEIGHT_FLOOR to synthetic edge classes.
 
 import math
 import os
+from contextlib import contextmanager
+from dataclasses import replace as _dc_replace
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
 import pytest
 
+from plugin_implementation import feature_flags as _ff
 from plugin_implementation.graph_topology import (
     SYNTHETIC_WEIGHT_FLOOR,
     _resolve_orphans_by_directory,
@@ -24,6 +27,25 @@ from plugin_implementation.graph_topology import (
     find_orphans,
     resolve_orphans,
 )
+
+
+@contextmanager
+def _patched_flags(**overrides):
+    """Override fields on the singleton ``FeatureFlags`` for a test block.
+
+    Several flags that used to be env-driven are now hard-coded as part of
+    the always-on graph-quality baseline. Tests that need to disable a
+    specific resolver pass override the relevant boolean directly via this
+    helper instead of munging ``os.environ``.
+    """
+    base = _ff.get_feature_flags()
+    patched = _dc_replace(base, **overrides)
+    with patch.object(_ff, "get_feature_flags", return_value=patched):
+        # graph_topology imports get_feature_flags at module load — patch
+        # there too so calls go through the override.
+        from plugin_implementation import graph_topology as _gt
+        with patch.object(_gt, "get_feature_flags", return_value=patched):
+            yield patched
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -325,13 +347,10 @@ class TestResolveOrphansIntegration:
         db.get_node = get_node
         db.search_fts5 = search_fts5
 
-        with patch.dict(
-            os.environ,
-            {
-                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
-                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
-                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
-            },
+        with _patched_flags(
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            fts_stopword_gate=False,
         ):
             stats = resolve_orphans(db, G, embedding_fn=None)
 
@@ -387,13 +406,10 @@ class TestResolveOrphansIntegration:
         db.get_node = get_node
         db.search_fts5 = search_fts5
 
-        with patch.dict(
-            os.environ,
-            {
-                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
-                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
-                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
-            },
+        with _patched_flags(
+            orphan_cascade_v2=False,
+            orphan_lexical_tiered=False,
+            fts_stopword_gate=False,
         ):
             stats = resolve_orphans(db, G, embedding_fn=None)
 

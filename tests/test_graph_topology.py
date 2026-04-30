@@ -20,9 +20,29 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from unittest.mock import MagicMock, patch
+
+
+@contextmanager
+def _patched_flags(**overrides):
+    """Override hard-coded ``FeatureFlags`` fields for the duration of a test.
+
+    The graph-quality baseline flags (cascade v2, tiered lexical, stopword
+    gate, …) are no longer env-driven, so tests that need to disable them
+    flip the dataclass fields directly.
+    """
+    from plugin_implementation import feature_flags as _ff
+    from plugin_implementation import graph_topology as _gt
+
+    base = _ff.get_feature_flags()
+    patched = _dc_replace(base, **overrides)
+    with patch.object(_ff, "get_feature_flags", return_value=patched), \
+         patch.object(_gt, "get_feature_flags", return_value=patched):
+        yield patched
 
 import networkx as nx
 
@@ -336,14 +356,7 @@ class TestResolveOrphans(unittest.TestCase):
 
     def test_lexical_resolution_via_fts5(self):
         """Orphan matched by symbol name via FTS5."""
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            os.environ,
-            {
-                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
-                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
-                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
-            },
-        ):
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(orphan_cascade_v2=False, orphan_lexical_tiered=False, fts_stopword_gate=False):
             nodes = [
                 _make_node_dict("connected_a", symbol_name="UserService",
                                 source_text="class UserService: pass"),
@@ -384,14 +397,7 @@ class TestResolveOrphans(unittest.TestCase):
 
     def test_vector_resolution_fallback(self):
         """When lexical fails, vector pass should kick in."""
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            os.environ,
-            {
-                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
-                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
-                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
-            },
-        ):
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(orphan_cascade_v2=False, orphan_lexical_tiered=False, fts_stopword_gate=False):
             nodes = [
                 _make_node_dict("connected_a", symbol_name="AlphaProcessor",
                                 source_text="process alpha data here"),
@@ -454,14 +460,7 @@ class TestResolveOrphans(unittest.TestCase):
 
     def test_edges_added_to_both_graph_and_db(self):
         """Synthetic edges should appear in both DB and NetworkX."""
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(
-            os.environ,
-            {
-                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
-                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
-                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
-            },
-        ):
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(orphan_cascade_v2=False, orphan_lexical_tiered=False, fts_stopword_gate=False):
             nodes = [
                 _make_node_dict("target_a", symbol_name="AuthHandler",
                                 source_text="authentication handler"),

@@ -1330,6 +1330,9 @@ Do not include any explanation or other text."""
                     active_branch=params.get('active_branch', 'main'),
                     force_rebuild_index=params.get('force_rebuild_index', True),
                     indexing_method=params.get('indexing_method', 'filesystem'),
+                    # Optional user-facing knobs surfaced from the UI/tool params.
+                    planner_mode=params.get('planner_mode') or params.get('planner_type'),
+                    exclude_tests=params.get('exclude_tests'),
                     run_in_subprocess=True,
                 )
             elif tool_name == "ask":

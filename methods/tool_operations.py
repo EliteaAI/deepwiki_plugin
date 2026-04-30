@@ -652,6 +652,10 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                     "active_branch": kwargs.get("active_branch") or repo_config.get("branch", "main"),
                     "force_rebuild_index": kwargs.get("force_rebuild_index", True),
                     "indexing_method": kwargs.get("indexing_method", "filesystem"),
+                    # User-facing structure planner choice + test exclusion.
+                    # Forwarded as env vars by wiki_subprocess_worker.
+                    "planner_mode": kwargs.get("planner_mode") or kwargs.get("planner_type"),
+                    "exclude_tests": kwargs.get("exclude_tests"),
                 }
                 
                 # Route to K8s Jobs or subprocess based on environment

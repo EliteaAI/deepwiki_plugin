@@ -52,9 +52,11 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature flag — module-level so the indexer can check cheaply
+# UnifiedWikiDB is the only persistence layer. Kept as a module-level
+# constant for backward compatibility with code paths that still imported
+# the old feature flag — every call site behaves as if it is enabled.
 # ---------------------------------------------------------------------------
-UNIFIED_DB_ENABLED = os.getenv("DEEPWIKI_UNIFIED_DB", "0") == "1"
+UNIFIED_DB_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # sqlite-vec availability (graceful degradation)
