@@ -108,11 +108,10 @@ env:
   DEEPWIKI_ASK_AGENTIC: "1"
   
   # Structure planner
-  DEEPWIKI_STRUCTURE_PLANNER: "deepagents"
-  DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK: "1"
-  DEEPWIKI_DEEPAGENTS_COVERAGE_LLM: "1"
-  DEEPWIKI_DEEPAGENTS_USE_STREAM: "1"
-  DEEPWIKI_DEEPAGENTS_LOG_STREAM: "1"
+  # The default planner is now picked from the request payload (UI toggle / API).
+  # Uncomment DEEPWIKI_STRUCTURE_PLANNER below to force a global default; leave
+  # it unset to let each request decide. Cluster is the recommended default.
+  # DEEPWIKI_STRUCTURE_PLANNER: "cluster"
   
   # Agentic generation settings
   DEEPWIKI_AGENTIC_PLAN_MAX_OUTPUT_TOKENS: "8096"
@@ -142,9 +141,6 @@ env:
   DEEPWIKI_AGENTIC_PAGE_CONTEXT_PER_SECTION: "4"
   DEEPWIKI_AGENTIC_PAGE_CONTEXT_SECTIONS_MAX: "8"
   DEEPWIKI_AGENTIC_DROP_EXPANDED_DOCS: "1"
-  DEEPWIKI_DEEPAGENTS_FILESYSTEM: "1"
-  DEEPWIKI_DEEPAGENTS_DISABLE_TRUNCATED_CONTEXT: "1"
-  DEEPWIKI_DEEPAGENTS_READ_DOCS_ONLY: "1"
   
   # Performance optimizations
   DEEPWIKI_SKIP_REPO_CONTEXT_FOR_PAGES: "1"

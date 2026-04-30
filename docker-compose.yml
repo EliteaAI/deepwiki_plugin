@@ -27,6 +27,26 @@ services:
       - DEEPWIKI_SMART_EXPANSION=1          # Graph-aware expansion: inheritance, composition, creates, alias chains
       - DEEPWIKI_HYBRID_FUSION=1            # RRF hybrid fusion in search_codebase (FTS5 + vector store)
       - DEEPWIKI_ASK_AGENTIC=1              # Agentic ask tool with tool-calling
+      # =========================================================================
+      # Graph quality back-port (defaults match wikis/feature_flags.py).
+      # Listed here for visibility / docker-level overrides; identical to
+      # the dataclass defaults so stripping them keeps the same behaviour.
+      # =========================================================================
+      - DEEPWIKI_ORPHAN_CASCADE_V2=1            # Pass1 explicit refs → Pass2 hybrid RRF → tiered FTS → directory
+      - DEEPWIKI_ORPHAN_REUSE_EMBEDDINGS=1      # Reuse persisted vectors instead of re-embedding orphans
+      - DEEPWIKI_ORPHAN_HYBRID_SEARCH=1         # FTS5+Vec RRF fusion in orphan resolution Pass 2
+      - DEEPWIKI_ORPHAN_RRF_K=60                # RRF k constant for orphan hybrid fusion
+      - DEEPWIKI_ORPHAN_RRF_THRESHOLD=0.02      # Minimum RRF score for an orphan→target edge
+      - DEEPWIKI_FTS_MIN_SCORE_NORM=0.15        # Min normalized FTS score for orphan/lexical edges
+      - DEEPWIKI_NODE_ID_STYLE=rel_path         # Stable rel_path-derived collision suffix
+      - DEEPWIKI_QUALIFIED_NAME_INDEX=1         # Build _qualified_name_index + _fqn_index on graphs
+      - DEEPWIKI_CROSS_LANGUAGE_LINKING=1       # L0–L3 cross-language linker in Phase 1c
+      - DEEPWIKI_API_SURFACE_EXTRACTION=1       # Extract REST/gRPC/GraphQL/FFI/CLI surfaces per node
+      - DEEPWIKI_TEST_LINKER=0                  # Off by default — pair test↔production via heuristics
+      - DEEPWIKI_FTS_STOPWORD_GATE=1            # Skip FTS lookups for short / generic tokens (init/main/api/...)
+      - DEEPWIKI_ORPHAN_LEXICAL_TIERED=1        # Tiered lexical T1–T4 cascade with directory + ARCH filtering
+      - DEEPWIKI_ORPHAN_LEXICAL_IDF_GATE=1      # Gate eligible tiers by symbol IDF
+      - DEEPWIKI_ORPHAN_REST_DISAMBIG=1         # Rewrite generic REST class queries to "<file_stem> <symbol>"
     # =============================================================================
     # Wiki Structure Planner — SWITCH BETWEEN MODES HERE
     # =============================================================================
@@ -35,20 +55,10 @@ services:
     #   cluster     — Unified DB + mathematical clustering (Louvain/sub-Louvain, 1 LLM call per cluster)
     #   auto        — Auto-detect (falls back to deepagents if no unified DB available)
     #
-    # To test CLUSTER mode: set DEEPWIKI_STRUCTURE_PLANNER=cluster and enable
-    # the "Unified Graph & Clustering" section below.
-    # To test DEEPAGENTS mode (current default): keep as deepagents.
-      - DEEPWIKI_STRUCTURE_PLANNER=cluster
-    # =============================================================================
-    # DeepAgents Settings (active when DEEPWIKI_STRUCTURE_PLANNER=cluster
-    # =============================================================================
-      - DEEPWIKI_DEEPAGENTS_COVERAGE_CHECK=1
-      - DEEPWIKI_DEEPAGENTS_COVERAGE_LLM=1
-      - DEEPWIKI_DEEPAGENTS_USE_STREAM=1
-      - DEEPWIKI_DEEPAGENTS_LOG_STREAM=1
-      - DEEPWIKI_DEEPAGENTS_FILESYSTEM=1
-      - DEEPWIKI_DEEPAGENTS_DISABLE_TRUNCATED_CONTEXT=1
-      - DEEPWIKI_DEEPAGENTS_READ_DOCS_ONLY=1
+    # Default planner is now picked from the request payload (UI toggle / API).
+    # The env var below stays as a power-user override; leave it commented to
+    # let each request choose. Cluster is the recommended default for most repos.
+#      - DEEPWIKI_STRUCTURE_PLANNER=cluster
     # =============================================================================
     # Agentic V2 Page Generation Tuning
     # =============================================================================
@@ -98,50 +108,20 @@ services:
     # Auto-retrieve docs during generation using retrieval_query
       - DEEPWIKI_AUTO_TARGET_DOCS=1
     # =============================================================================
-    # Unified Graph & Clustering (Phases 1-6)
+    # Unified Graph & Clustering
     # =============================================================================
-    # These flags enable the mathematical clustering pipeline.
-    # To activate: uncomment all three AND set DEEPWIKI_STRUCTURE_PLANNER=cluster above.
-    # To revert to legacy: comment these out AND set DEEPWIKI_STRUCTURE_PLANNER=deepagents.
-    #
-    # DEEPWIKI_UNIFIED_DB=1           — Single SQLite DB with FTS5 + sqlite-vec (Phase 1)
-    # DEEPWIKI_UNIFIED_RETRIEVER=1    — Route search_codebase through unified DB (Phase 5)
-    # DEEPWIKI_LEGACY_INDEXES=0       — Skip legacy vectorstore + graph cache builds (saves RAM/disk)
-    #
-    # Algorithm selection for clustering (Phase 3):
-    # DEEPWIKI_CLUSTER_MACRO_ALGORITHM  — "leiden" (default, connected communities via igraph),
-    #                                     "louvain" (pure-Python fallback), or "auto"
-    # DEEPWIKI_CLUSTER_MICRO_ALGORITHM  — "infomap" (default, flow-based page boundaries via igraph),
-    #                                     "leiden", "louvain", or "auto"
-    #
+    # Single SQLite DB with FTS5 + sqlite-vec, used by the cluster planner and
+    # the unified retriever. Hard-coded ON in production deployments.
       - DEEPWIKI_UNIFIED_DB=1
       - DEEPWIKI_UNIFIED_RETRIEVER=1
       - DEEPWIKI_LEGACY_INDEXES=0
-      - DEEPWIKI_CLUSTER_MACRO_ALGORITHM=leiden
-      - DEEPWIKI_CLUSTER_MICRO_ALGORITHM=infomap
     # =============================================================================
-    # Structural Clustering Quality Pipeline (Phases 0-7)
+    # User-facing planner overrides
     # =============================================================================
-    # These flags enable incremental improvements to the cluster-based planner.
-    # Each flag is independent and defaults to OFF if not set.
-    #
-    # Phase 1: Hierarchical Leiden — two-level resolution (sections + pages)
-      - DEEPWIKI_CLUSTER_HIERARCHICAL_LEIDEN=1
-    #
-    # Phase 4: Smart expansion — per-symbol-type bidirectional P0→P1→P2 strategies
-      - DEEPWIKI_CLUSTER_SMART_EXPANSION=1
-    #
-    # Phase 5: Candidate validation — deterministic quality checks before LLM naming
-      - DEEPWIKI_CLUSTER_CAPABILITY_VALIDATION=1
-    #
-    # Phase 6: Coverage ledger — track symbol/doc/directory coverage gaps
-      - DEEPWIKI_CLUSTER_COVERAGE_LEDGER=1
-    #
-    # Phase 7: Language heuristics — C++/Rust/Go/Python/Java/C#/TS/JS tuning
-      - DEEPWIKI_CLUSTER_LANGUAGE_HINTS=1
-    # Exclude tests feature flag for testing which will require the UI option afterward
-    # Still preserve test nodes for the testing questions via ask and deep_research
-      - DEEPWIKI_EXCLUDE_TESTS=1
+    # exclude_tests is now driven from the request payload (UI toggle). The env
+    # var below stays as a power-user/global override; leave it commented to
+    # let each request decide. Test nodes are still indexed for ask/deep_research.
+#      - DEEPWIKI_EXCLUDE_TESTS=1
     volumes:
       - ./pylon_deepwiki:/data
     ports:
