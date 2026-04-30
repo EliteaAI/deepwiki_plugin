@@ -1175,6 +1175,14 @@ class EnhancedUnifiedGraphBuilder:
         graph._suffix_index = defaultdict(list)
         graph._decl_impl_index = defaultdict(list)
         graph._constant_def_index = defaultdict(list)
+        # ── Disambiguation indexes (rel_path-aware) ──
+        # ``_qualified_name_index`` maps "language::qualified_name" → node_id
+        # for fast unambiguous lookup of dotted names like ``models.User``.
+        # ``_fqn_index`` maps "language::rel_path::qualified_name" →
+        # node_id and is the canonical disambiguator when the same simple
+        # name exists in multiple files.
+        graph._qualified_name_index = {}
+        graph._fqn_index = {}
 
         def _symbol_type_of(node_id: str) -> str:
             node_data = graph.nodes.get(node_id, {})
@@ -1210,6 +1218,30 @@ class EnhancedUnifiedGraphBuilder:
                     full_name = getattr(symbol_obj, 'full_name', None) if symbol_obj else None
                 if full_name:
                     _maybe_set(graph._full_name_index, full_name, node_id)
+
+                # Disambiguation indexes (rel_path-aware).
+                rel_path_n = (node_data.get('rel_path') or '').replace('\\', '/')
+                # Prefer parser-supplied ``qualified_name``/``symbol_name``
+                # so the index uses the canonical dotted form even when
+                # the node_id carries a rel_path collision suffix.
+                qual_parts = node_id.split('::', 2)
+                qualified_name = (
+                    node_data.get('qualified_name')
+                    or symbol_name
+                    or (qual_parts[2] if len(qual_parts) == 3 else '')
+                )
+                if qualified_name:
+                    _maybe_set(
+                        graph._qualified_name_index,
+                        f"{language}::{qualified_name}",
+                        node_id,
+                    )
+                    if rel_path_n:
+                        _maybe_set(
+                            graph._fqn_index,
+                            f"{language}::{rel_path_n}::{qualified_name}",
+                            node_id,
+                        )
 
                 graph._name_index[symbol_name].append(node_id)
 
@@ -1473,10 +1505,22 @@ class EnhancedUnifiedGraphBuilder:
                     # True duplicate from same file, skip
                     continue
                 else:
-                    # Different file (e.g., declaration vs implementation)
-                    # Create unique node_id by appending file hash
-                    file_hash = hash(file_path) & 0xFFFF
-                    node_id = f"{node_id}_{file_hash:04x}"
+                    # Different file (e.g., declaration vs implementation).
+                    # When ``node_id_style == "rel_path"`` use a stable
+                    # rel_path-derived suffix so the disambiguator is
+                    # deterministic across runs (and across machines)
+                    # rather than a non-portable Python ``hash()`` value.
+                    try:
+                        from ..feature_flags import get_feature_flags as _gff
+                        _style = _gff().node_id_style
+                    except Exception:  # noqa: BLE001
+                        _style = "file_name"
+                    if _style == "rel_path" and rel_path:
+                        safe_path = rel_path.replace('\\', '/').replace('/', '__').replace('.', '_')
+                        node_id = f"{node_id}__{safe_path}"
+                    else:
+                        file_hash = hash(file_path) & 0xFFFF
+                        node_id = f"{node_id}_{file_hash:04x}"
             
             # Extract line numbers from Range object for flat access
             _range = getattr(symbol, 'range', None)

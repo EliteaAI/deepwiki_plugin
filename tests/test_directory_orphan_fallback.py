@@ -11,7 +11,8 @@ and applies SYNTHETIC_WEIGHT_FLOOR to synthetic edge classes.
 """
 
 import math
-from unittest.mock import MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 import networkx as nx
 import pytest
@@ -324,7 +325,15 @@ class TestResolveOrphansIntegration:
         db.get_node = get_node
         db.search_fts5 = search_fts5
 
-        stats = resolve_orphans(db, G, embedding_fn=None)
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
+                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
+                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
+            },
+        ):
+            stats = resolve_orphans(db, G, embedding_fn=None)
 
         assert stats["lexical_edges_added"] >= 1
         assert stats["directory_edges_added"] == 0
@@ -378,7 +387,15 @@ class TestResolveOrphansIntegration:
         db.get_node = get_node
         db.search_fts5 = search_fts5
 
-        stats = resolve_orphans(db, G, embedding_fn=None)
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPWIKI_ORPHAN_CASCADE_V2": "0",
+                "DEEPWIKI_ORPHAN_LEXICAL_TIERED": "0",
+                "DEEPWIKI_FTS_STOPWORD_GATE": "0",
+            },
+        ):
+            stats = resolve_orphans(db, G, embedding_fn=None)
 
         assert stats["orphan_count"] == 2
         assert stats["lexical_edges_added"] >= 1
