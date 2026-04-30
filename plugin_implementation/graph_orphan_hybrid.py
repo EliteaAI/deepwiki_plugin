@@ -11,9 +11,10 @@ Public surface
 * :func:`resolve_orphans_hybrid` — orphan-level Pass 2 used by the v2
   cascade. Returns ``[hit, ...]`` ranked by ``rrf_score`` desc.
 
-Embeddings are reused from the persisted ``repo_vec`` table via
-``db.get_embedding_by_id`` — the cascade never re-embeds an orphan
-synchronously.
+Embeddings are preferred from the persisted ``repo_vec`` table via
+``db.get_embedding_by_id``. If no persisted embedding is available,
+the cascade may fall back to synchronous embedding when ``embed_fn``
+is provided.
 """
 
 from __future__ import annotations
