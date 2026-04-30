@@ -1,5 +1,5 @@
 """
-Tests for the graph-quality backport (PLANNING_GRAPH_QUALITY_BACKPORT.md):
+Tests for the graph-quality backport coverage:
 
 - TypeScript ``type_alias`` carries ``source_text``.
 - ``UnifiedWikiDB`` exposes ``get_embedding_by_id``,
