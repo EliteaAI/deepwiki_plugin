@@ -1,4 +1,4 @@
-"""Tests for ``OptimizedWikiAgent._resolve_planner_choice``.
+"""Tests for ``OptimizedWikiGenerationAgent._resolve_planner_choice``.
 
 The planner choice is configuration-driven: it flows from the UI
 (``tool_params.planner_type``) through the worker payload, gets bridged
