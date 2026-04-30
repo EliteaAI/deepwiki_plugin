@@ -72,6 +72,45 @@ def _serialize_float32_vec(vec: List[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
+def _deserialize_float32_vec(blob: Optional[bytes]) -> Optional[List[float]]:
+    """Deserialize a packed float32 blob back into a Python ``list[float]``.
+
+    Returns ``None`` for empty / malformed blobs so callers can treat
+    "no embedding" uniformly.
+    """
+    if not blob:
+        return None
+    try:
+        n = len(blob) // 4
+        if n == 0:
+            return None
+        return list(struct.unpack(f"{n}f", blob))
+    except struct.error:
+        logger.debug("Failed to deserialize embedding blob (len=%d)", len(blob))
+        return None
+
+
+def _attach_score_norm(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a normalised BM25 score in ``(0, 1]`` to an FTS5 hit row.
+
+    SQLite ``rank`` is "more negative = better"; we map it via
+    ``1.0 / (1.0 + |rank|)`` so callers that fuse heterogeneous result
+    lists (RRF / hybrid) can use a comparable score. Idempotent — a
+    pre-attached ``score_norm`` is left untouched.
+    """
+    if "score_norm" in row and row["score_norm"] is not None:
+        return row
+    rank = row.get("fts_rank")
+    if rank is None:
+        row["score_norm"] = 0.0
+    else:
+        try:
+            row["score_norm"] = 1.0 / (1.0 + abs(float(rank)))
+        except (TypeError, ValueError):
+            row["score_norm"] = 0.0
+    return row
+
+
 def _can_load_extensions() -> bool:
     """Check if the active sqlite3 driver supports loading extensions."""
     try:
@@ -745,7 +784,7 @@ class UnifiedWikiDB:
 
         try:
             rows = self.conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            return [_attach_score_norm(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
             # FTS5 query syntax errors — fall back to prefix search
             logger.debug("FTS5 query failed (%s), trying prefix match", exc)
@@ -753,9 +792,54 @@ class UnifiedWikiDB:
             params[0] = safe_query
             try:
                 rows = self.conn.execute(sql, params).fetchall()
-                return [dict(r) for r in rows]
+                return [_attach_score_norm(dict(r)) for r in rows]
             except sqlite3.OperationalError:
                 return []
+
+    def search_fts_with_path(
+        self,
+        query: str,
+        path_prefix: str,
+        *,
+        symbol_types: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """FTS5 search restricted to a non-empty ``path_prefix``.
+
+        Thin wrapper around :meth:`search_fts5` that enforces the
+        path-prefix invariant so callers (orphan-resolution Pass 1/2)
+        cannot accidentally fall through to a global scan.
+        """
+        if not path_prefix:
+            raise ValueError("search_fts_with_path requires a non-empty path_prefix")
+        return self.search_fts5(
+            query=query,
+            path_prefix=path_prefix,
+            symbol_types=symbol_types,
+            limit=limit,
+        )
+
+    def count_fts_matches(self, query: str, *, exact_match: bool = False) -> int:
+        """Return the number of FTS5 rows matching ``query``.
+
+        Used by the orphan-cascade IDF gate to estimate how generic a
+        symbol name is — generic names spray edges and are clamped to
+        local-scope tiers only.
+        """
+        if not query or not query.strip():
+            return 0
+        if exact_match:
+            q = '"' + query.replace('"', '""') + '"'
+        else:
+            q = query.replace('"', '""')
+        try:
+            row = self.conn.execute(
+                "SELECT count(*) AS c FROM repo_fts WHERE repo_fts MATCH ?", (q,)
+            ).fetchone()
+            return int(row["c"]) if row else 0
+        except sqlite3.OperationalError as exc:
+            logger.debug("count_fts_matches failed for '%s': %s", query, exc)
+            return 0
 
     # ══════════════════════════════════════════════════════════════════
     # VECTOR search (sqlite-vec)
@@ -892,6 +976,27 @@ class UnifiedWikiDB:
     def vec_available(self) -> bool:
         """Whether sqlite-vec is loaded and repo_vec table exists."""
         return self._vec_available
+
+    def get_embedding_by_id(self, node_id: str) -> Optional[List[float]]:
+        """Return the persisted embedding for ``node_id`` or ``None``.
+
+        Lets the orphan-cascade reuse already-computed embeddings
+        instead of re-embedding the symbol's source text every pass.
+        Returns ``None`` when sqlite-vec is unavailable, the row is
+        missing, or the blob is malformed.
+        """
+        if not self._vec_available:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT embedding FROM repo_vec WHERE node_id = ?", (node_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.debug("get_embedding_by_id failed for '%s': %s", node_id, exc)
+            return None
+        if not row:
+            return None
+        return _deserialize_float32_vec(row["embedding"])
 
     # ══════════════════════════════════════════════════════════════════
     # HYBRID search (RRF fusion)

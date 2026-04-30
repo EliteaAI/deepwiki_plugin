@@ -626,6 +626,7 @@ class TypeScriptEnhancedParser(BaseParser):
                     parent_symbol=parent_symbol,
                     full_name=full_name,
                     return_type=aliased_type,
+                    source_text=self.parser._get_node_text(node),  # Bug fix: type aliases were missing source_text
                     metadata={
                         'is_type_alias': True,
                         'aliased_type': aliased_type,
