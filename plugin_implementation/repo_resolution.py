@@ -25,7 +25,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_RESERVED_TOP_LEVEL_KEYS = {"graphs", "refs", "docs", "bm25"}
+_RESERVED_TOP_LEVEL_KEYS = {"graphs", "refs", "docs", "bm25", "fts5", "unified_db"}
 _COMMIT_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
@@ -114,6 +114,22 @@ def has_combined_graph(index: Dict[str, Any], canonical_repo_id: str) -> bool:
     if not isinstance(graphs, dict):
         return False
     return bool(graphs.get(f"{canonical_repo_id}:combined"))
+
+
+def cache_index_has_repo(index: Dict[str, Any], canonical_repo_id: str) -> bool:
+    """Return True when any cache family has entries for a canonical repo id."""
+    if not isinstance(index, dict) or not canonical_repo_id:
+        return False
+    if isinstance(index.get(canonical_repo_id), str):
+        return True
+    refs = index.get("refs")
+    if isinstance(refs, dict) and canonical_repo_id in refs.values():
+        return True
+    for map_name in ("docs", "bm25", "fts5", "unified_db"):
+        value = index.get(map_name)
+        if isinstance(value, dict) and isinstance(value.get(canonical_repo_id), str):
+            return True
+    return has_combined_graph(index, canonical_repo_id)
 
 
 def repository_clone_candidates(repositories_dir: str | Path, repo: str, branch: str) -> List[str]:

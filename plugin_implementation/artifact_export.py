@@ -29,6 +29,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 import logging
 import zipfile
+from urllib.parse import urlparse
 
 from .state.wiki_state import WikiStructureSpec, WikiPage
 
@@ -60,17 +61,30 @@ def normalize_wiki_id(owner: str = None, repo: str = None, branch: str = None,
     """
     from .registry_manager import normalize_wiki_id as _canonical_normalize
     
-    # Build repo_identifier string in the format expected by registry_manager
-    if repository and '/' in repository:
-        parts = repository.split('/')
-        if len(parts) >= 2:
-            owner = parts[0]
-            repo = parts[1]
+    branch = branch or 'main'
+
+    if repository:
+        repo_path = repository.strip()
+        if repo_path.startswith(('http://', 'https://')):
+            parsed = urlparse(repo_path)
+            repo_path = parsed.path.strip('/')
+            if '/_git/' in repo_path:
+                project_path, repo_name = repo_path.split('/_git/', 1)
+                hostname = parsed.hostname or ''
+                if hostname.endswith('.visualstudio.com'):
+                    org = hostname.split('.', 1)[0]
+                    repo_path = f"{org}/{project_path}/{repo_name}"
+                else:
+                    repo_path = f"{project_path}/{repo_name}"
+        elif repo_path.startswith('git@') and ':' in repo_path:
+            repo_path = repo_path.split(':', 1)[1]
+
+        repo_path = repo_path.rstrip('/').removesuffix('.git')
+        if repo_path:
+            return _canonical_normalize(f"{repo_path}:{branch}")
     
     if not owner or not repo:
         raise ValueError("Could not determine owner and repo from provided arguments")
-    
-    branch = branch or 'main'
     
     repo_identifier = f"{owner}/{repo}:{branch}"
     return _canonical_normalize(repo_identifier)

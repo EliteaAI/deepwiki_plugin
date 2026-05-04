@@ -23,6 +23,7 @@ def _payload_contains_provider_key(params: Dict[str, Any], provider_key: str) ->
         params,
         params.get('code_toolkit'),
         params.get('toolkit_configuration_code_toolkit'),
+        params.get('toolkit_configuration_code_repository'),
         params.get('code_repository'),
     ]
 
@@ -31,11 +32,67 @@ def _payload_contains_provider_key(params: Dict[str, Any], provider_key: str) ->
             continue
         if provider_key in source:
             return True
-        settings = source.get('settings')
-        if isinstance(settings, dict) and provider_key in settings:
-            return True
+        for nested in (source.get('settings'), source.get('toolkit_config'), _extract_configuration_parameters(source)):
+            if isinstance(nested, dict) and provider_key in nested:
+                return True
 
     return False
+
+
+def _merge_dicts(*values: Any) -> Dict[str, Any]:
+    """Shallow-merge dict values, ignoring non-dicts."""
+    merged: Dict[str, Any] = {}
+    for value in values:
+        if isinstance(value, dict):
+            merged.update(value)
+    return merged
+
+
+def _extract_configuration_parameters(source: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract toolkit configuration payload from known wrapper shapes."""
+    configuration = source.get('configuration')
+    if isinstance(configuration, dict) and isinstance(configuration.get('parameters'), dict):
+        return configuration.get('parameters') or {}
+    return {}
+
+
+def _merge_provider_configs(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge prefixed/unprefixed provider configs that may be split by UI/API shape."""
+    merged = dict(settings)
+    for provider_key in _TOOLKIT_PROVIDER_KEYS:
+        prefixed_key = f'toolkit_configuration_{provider_key}'
+        provider_config = _merge_dicts(settings.get(provider_key), settings.get(prefixed_key))
+        if provider_config:
+            merged[provider_key] = provider_config
+            merged[prefixed_key] = provider_config
+    return merged
+
+
+def _merge_toolkit_payload(source: Any) -> Dict[str, Any]:
+    """Merge toolkit_config/configuration/settings into one repo-config payload."""
+    if not isinstance(source, dict):
+        return {}
+
+    wrapper_fields = {key: value for key, value in source.items() if key not in ('settings', 'toolkit_config', 'configuration')}
+    sources = (
+        wrapper_fields,
+        source.get('toolkit_config'),
+        _extract_configuration_parameters(source),
+        source.get('settings'),
+    )
+    merged = _merge_dicts(*sources)
+
+    for provider_key in _TOOLKIT_PROVIDER_KEYS:
+        prefixed_key = f'toolkit_configuration_{provider_key}'
+        provider_config = _merge_dicts(
+            *(candidate.get(provider_key) for candidate in sources if isinstance(candidate, dict)),
+            *(candidate.get(prefixed_key) for candidate in sources if isinstance(candidate, dict)),
+        )
+        if provider_config:
+            merged[provider_key] = provider_config
+            merged[prefixed_key] = provider_config
+
+    return merged
 
 
 def create_llm(
@@ -259,6 +316,7 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
     code_toolkit = (
         params.get('code_toolkit')
         or params.get('toolkit_configuration_code_toolkit')
+        or params.get('toolkit_configuration_code_repository')
         or params.get('code_repository')
         or {}
     )
@@ -275,57 +333,81 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
     
     repo_settings = {}
     if isinstance(code_toolkit, dict):
-        if isinstance(code_toolkit.get('settings'), dict):
-            repo_settings = code_toolkit.get('settings', {})
-        else:
-            repo_settings = code_toolkit
+        repo_settings = _merge_toolkit_payload(code_toolkit)
 
     if not repo_settings and isinstance(params, dict):
-        repo_settings = params
+        repo_settings = _merge_provider_configs(params)
 
     if isinstance(repo_settings, dict) and any(
         key in repo_settings
-        for key in ('github_configuration', 'gitlab_configuration', 'bitbucket_configuration', 'ado_configuration')
+        for key in (
+            'github_configuration', 'gitlab_configuration', 'bitbucket_configuration', 'ado_configuration',
+            'toolkit_configuration_github_configuration', 'toolkit_configuration_gitlab_configuration',
+            'toolkit_configuration_bitbucket_configuration', 'toolkit_configuration_ado_configuration',
+        )
     ):
-        if 'github_configuration' in repo_settings:
+        if 'github_configuration' in repo_settings or 'toolkit_configuration_github_configuration' in repo_settings:
+            github_config = repo_settings.get('github_configuration') or repo_settings.get('toolkit_configuration_github_configuration') or {}
             repo_config['provider_type'] = 'github'
-            repo_config['provider_config'] = repo_settings.get('github_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('github_repository')
+            repo_config['provider_config'] = github_config
+            repo_config['repository'] = (
+                repo_settings.get('repository')
+                or repo_settings.get('github_repository')
+                or repo_settings.get('toolkit_configuration_github_repository')
+            )
             repo_config['branch'] = (
                 repo_settings.get('active_branch')
+                or repo_settings.get('toolkit_configuration_active_branch')
                 or repo_settings.get('base_branch')
+                or repo_settings.get('toolkit_configuration_base_branch')
                 or repo_settings.get('branch', 'main')
             )
-        elif 'gitlab_configuration' in repo_settings:
+        elif 'gitlab_configuration' in repo_settings or 'toolkit_configuration_gitlab_configuration' in repo_settings:
+            gitlab_config = repo_settings.get('gitlab_configuration') or repo_settings.get('toolkit_configuration_gitlab_configuration') or {}
             repo_config['provider_type'] = 'gitlab'
-            repo_config['provider_config'] = repo_settings.get('gitlab_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository')
+            repo_config['provider_config'] = gitlab_config
+            repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('toolkit_configuration_repository')
             repo_config['branch'] = (
                 repo_settings.get('branch')
+                or repo_settings.get('toolkit_configuration_branch')
                 or repo_settings.get('active_branch')
-                or repo_settings.get('base_branch', 'main')
+                or repo_settings.get('toolkit_configuration_active_branch')
+                or repo_settings.get('base_branch')
+                or repo_settings.get('toolkit_configuration_base_branch', 'main')
             )
-        elif 'bitbucket_configuration' in repo_settings:
+        elif 'bitbucket_configuration' in repo_settings or 'toolkit_configuration_bitbucket_configuration' in repo_settings:
+            bitbucket_config = repo_settings.get('bitbucket_configuration') or repo_settings.get('toolkit_configuration_bitbucket_configuration') or {}
             repo_config['provider_type'] = 'bitbucket'
-            repo_config['provider_config'] = repo_settings.get('bitbucket_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository')
+            repo_config['provider_config'] = bitbucket_config
+            repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('toolkit_configuration_repository')
             repo_config['branch'] = (
                 repo_settings.get('branch')
+                or repo_settings.get('toolkit_configuration_branch')
                 or repo_settings.get('active_branch')
-                or repo_settings.get('base_branch', 'main')
+                or repo_settings.get('toolkit_configuration_active_branch')
+                or repo_settings.get('base_branch')
+                or repo_settings.get('toolkit_configuration_base_branch', 'main')
             )
-            repo_config['project'] = repo_settings.get('project')
-            repo_config['is_cloud'] = repo_settings.get('cloud')
-        elif 'ado_configuration' in repo_settings:
+            repo_config['project'] = repo_settings.get('project') or repo_settings.get('toolkit_configuration_project')
+            repo_config['is_cloud'] = repo_settings.get('cloud') or repo_settings.get('toolkit_configuration_cloud')
+        elif 'ado_configuration' in repo_settings or 'toolkit_configuration_ado_configuration' in repo_settings:
+            ado_config = repo_settings.get('ado_configuration') or repo_settings.get('toolkit_configuration_ado_configuration') or {}
             repo_config['provider_type'] = 'ado_repos'
-            repo_config['provider_config'] = repo_settings.get('ado_configuration', {})
-            repo_config['repository'] = repo_settings.get('repository_id') or repo_settings.get('repository')
+            repo_config['provider_config'] = ado_config
+            repo_config['repository'] = (
+                repo_settings.get('repository_id')
+                or repo_settings.get('toolkit_configuration_repository_id')
+                or repo_settings.get('repository')
+                or repo_settings.get('toolkit_configuration_repository')
+            )
             repo_config['branch'] = (
                 repo_settings.get('active_branch')
+                or repo_settings.get('toolkit_configuration_active_branch')
                 or repo_settings.get('base_branch')
+                or repo_settings.get('toolkit_configuration_base_branch')
                 or repo_settings.get('branch', 'main')
             )
-            repo_config['project'] = repo_config['provider_config'].get('project') or repo_settings.get('project')
+            repo_config['project'] = ado_config.get('project') or repo_settings.get('project') or repo_settings.get('toolkit_configuration_project')
         else:
             # Fallback: assume GitHub with legacy structure
             repo_config['provider_type'] = 'github'
@@ -806,8 +888,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             'branch': wiki_branch,
         }
         
-        # Build the repo_identifier_override using just base_repo:branch
-        repo_identifier_override = f"{base_repo}:{wiki_branch}"
+        repo_identifier_override = wiki_entry.get("canonical_repo_identifier") or f"{base_repo}:{wiki_branch}"
         log.info(f"[resolve_and_ask] Using repo_identifier_override: {repo_identifier_override}")
         
         # Call the ask tool with resolved wiki (llm_settings already validated at start)
@@ -820,6 +901,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                 chat_history=params.get('chat_history', []),
                 k=params.get('k', 15),
                 repo_identifier_override=repo_identifier_override,
+                analysis_key_override=wiki_entry.get("analysis_key"),
             )
             
             if isinstance(result, dict) and result.get("success"):
@@ -995,8 +1077,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             'branch': wiki_branch,
         }
         
-        # Build the repo_identifier_override using just base_repo:branch
-        repo_identifier_override = f"{base_repo}:{wiki_branch}"
+        repo_identifier_override = wiki_entry.get("canonical_repo_identifier") or f"{base_repo}:{wiki_branch}"
         log.info(f"[resolve_and_deep_research] Using repo_identifier_override: {repo_identifier_override}")
         
         # Ensure max_tokens is set for deep_research - wiki_query doesn't have toolkit config,
@@ -1017,6 +1098,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                 research_type=research_type,
                 enable_subagents=params.get('enable_subagents', True),
                 repo_identifier_override=repo_identifier_override,
+                analysis_key_override=wiki_entry.get("analysis_key"),
             )
             
             if isinstance(result, dict) and result.get("success"):
@@ -1613,6 +1695,8 @@ Do not include any explanation or other text."""
                                 display_name=wiki_title or canonical_repo,
                                 description=wiki_description,
                                 commit_hash=commit_hash,
+                                canonical_repo_identifier=canonical_repo_full or None,
+                                analysis_key=result.get("analysis_key"),
                                 stats={"page_count": page_count} if page_count else None,
                             )
                             log.info(f"Registered wiki in registry: {wiki_id}")

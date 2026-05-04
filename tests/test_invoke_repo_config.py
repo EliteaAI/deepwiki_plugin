@@ -104,6 +104,24 @@ def test_extract_repo_config_from_flat_top_level_ado_payload():
     assert repo_config['project'] == 'TestProject'
 
 
+def test_extract_repo_config_from_prefixed_ado_toolkit_payload():
+    invoke = _load_invoke_module()
+
+    params = {
+        'toolkit_configuration_ado_configuration': _make_ado_config(),
+        'toolkit_configuration_repository_id': 'mb-java',
+        'toolkit_configuration_base_branch': 'mb-java',
+    }
+
+    repo_config = invoke._extract_repo_config_from_toolkit(params)
+
+    assert repo_config['provider_type'] == 'ado_repos'
+    assert repo_config['provider_config']['organization_url'] == 'https://dev.azure.com/epameliteatest/'
+    assert repo_config['repository'] == 'mb-java'
+    assert repo_config['branch'] == 'mb-java'
+    assert repo_config['project'] == 'TestProject'
+
+
 def test_extract_repo_config_from_flat_code_toolkit_payload_without_settings_wrapper():
     invoke = _load_invoke_module()
 
@@ -112,6 +130,55 @@ def test_extract_repo_config_from_flat_code_toolkit_payload_without_settings_wra
             'ado_configuration': _make_ado_config(),
             'repository_id': 'TestRepo',
             'base_branch': 'main',
+            'active_branch': 'develop',
+        }
+    }
+
+    repo_config = invoke._extract_repo_config_from_toolkit(params)
+
+    assert repo_config['provider_type'] == 'ado_repos'
+    assert repo_config['provider_config']['organization_url'] == 'https://dev.azure.com/epameliteatest/'
+    assert repo_config['repository'] == 'TestRepo'
+    assert repo_config['branch'] == 'develop'
+    assert repo_config['project'] == 'TestProject'
+
+
+def test_extract_repo_config_merges_split_ado_settings_and_toolkit_config():
+    invoke = _load_invoke_module()
+
+    params = {
+        'code_toolkit': {
+            'toolkit_config': {
+                'ado_configuration': _make_ado_config(),
+            },
+            'settings': {
+                'ado_configuration': {
+                    'elitea_title': 'Ado_test',
+                    'private': True,
+                },
+                'repository_id': 'TestRepo',
+                'active_branch': 'develop',
+            },
+        }
+    }
+
+    repo_config = invoke._extract_repo_config_from_toolkit(params)
+
+    assert repo_config['provider_type'] == 'ado_repos'
+    assert repo_config['provider_config']['organization_url'] == 'https://dev.azure.com/epameliteatest/'
+    assert repo_config['provider_config']['elitea_title'] == 'Ado_test'
+    assert repo_config['repository'] == 'TestRepo'
+    assert repo_config['branch'] == 'develop'
+    assert repo_config['project'] == 'TestProject'
+
+
+def test_extract_repo_config_from_legacy_toolkit_configuration_code_repository_payload():
+    invoke = _load_invoke_module()
+
+    params = {
+        'toolkit_configuration_code_repository': {
+            'ado_configuration': _make_ado_config(),
+            'repository_id': 'TestRepo',
             'active_branch': 'develop',
         }
     }

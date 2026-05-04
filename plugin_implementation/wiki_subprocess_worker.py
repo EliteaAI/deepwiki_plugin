@@ -301,11 +301,19 @@ def main(argv=None) -> int:
                 commit_hash = result.get("commit_hash")
                 
                 # Use identifier format with commit hash for cache isolation: "{repo}:{branch}:{commit_short}"
-                if commit_hash:
-                    commit_short = commit_hash[:8]
-                    repo_identifier = f"{repository}:{actual_branch}:{commit_short}"
-                else:
-                    repo_identifier = f"{repository}:{actual_branch}"
+                from plugin_implementation.repository_identity import (
+                    build_repo_identifier,
+                    canonical_repository_path,
+                    rebase_artifact_name,
+                )
+
+                canonical_repository = canonical_repository_path(repository, clone_config)
+                repo_identifier = build_repo_identifier(
+                    repository=repository,
+                    branch=actual_branch,
+                    commit_hash=commit_hash,
+                    clone_config=clone_config,
+                )
 
                 wiki_version_id = (
                     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -358,16 +366,9 @@ def main(argv=None) -> int:
                     for art in (result.get("artifacts") or []):
                         name = art.get("name")
                         if art.get("type") == "text/markdown" and isinstance(name, str) and name.endswith(".md"):
-                            # Check if already prefixed by artifact_export.py
-                            # If name already starts with wiki_id, don't add prefix again
-                            if name.startswith(f"{wiki_id}/"):
-                                # Already prefixed, just record it
-                                pages.append(name)
-                            else:
-                                # Legacy artifact without prefix - add it
-                                prefixed_name = f"{wiki_id}/wiki_pages/{name}"
-                                art["name"] = prefixed_name
-                                pages.append(prefixed_name)
+                            prefixed_name = rebase_artifact_name(name, wiki_id=wiki_id, subfolder="wiki_pages")
+                            art["name"] = prefixed_name
+                            pages.append(prefixed_name)
                 except Exception:
                     pages = []
                 
@@ -403,8 +404,7 @@ def main(argv=None) -> int:
                     for art in (result.get("artifacts") or []):
                         name = art.get("name")
                         if art.get("type") == "application/json" and isinstance(name, str) and "wiki_structure" in name:
-                            if not name.startswith(wiki_id):
-                                art["name"] = f"{wiki_id}/analysis/{name}"
+                            art["name"] = rebase_artifact_name(name, wiki_id=wiki_id, subfolder="analysis")
                 except Exception:
                     pass
 
@@ -416,7 +416,7 @@ def main(argv=None) -> int:
                     "wiki_version_id": wiki_version_id,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "canonical_repo_identifier": repo_identifier,
-                    "repository": repository,
+                    "repository": canonical_repository,
                     "branch": active_branch,
                     "commit_hash": commit_hash,
                     "analysis_key": analysis_key_override,

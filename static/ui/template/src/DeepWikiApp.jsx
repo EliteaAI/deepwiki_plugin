@@ -160,25 +160,228 @@ function validateBucketName(name) {
   return null;
 }
 
+function normalizeWikiIdPart(value) {
+  if (!value || typeof value !== 'string') return null;
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || null;
+}
+
+function parseRepositoryIdentity(value) {
+  if (!value) return { repository: null, branch: null };
+
+  if (typeof value === 'object') {
+    const nested = parseRepositoryIdentity(
+      value.repository || value.repo || value.canonical_repo_identifier || value.repo_identifier || value.identifier
+    );
+    return {
+      repository: nested.repository,
+      branch: value.branch || value.active_branch || value.base_branch || nested.branch || null,
+    };
+  }
+
+  if (typeof value !== 'string') return { repository: null, branch: null };
+
+  let repoPath = value.trim();
+  let branch = null;
+
+  if (!repoPath) return { repository: null, branch: null };
+
+  if (repoPath.startsWith('http://') || repoPath.startsWith('https://')) {
+    try {
+      const url = new URL(repoPath);
+      const hostname = url.hostname.toLowerCase();
+      repoPath = url.pathname.replace(/^\/+|\/+$/g, '');
+      if (repoPath.includes('/_git/')) {
+        const [projectPath, repoName] = repoPath.split('/_git/');
+        if (hostname.endsWith('.visualstudio.com')) {
+          const organization = hostname.split('.')[0];
+          repoPath = [organization, projectPath, repoName].filter(Boolean).join('/');
+        } else {
+          repoPath = `${projectPath}/${repoName}`;
+        }
+      }
+    } catch {
+      return { repository: null, branch: null };
+    }
+  } else if (repoPath.startsWith('git@') && repoPath.includes(':')) {
+    repoPath = repoPath.split(':').slice(1).join(':');
+  } else if (repoPath.includes(':')) {
+    const parts = repoPath.split(':');
+    repoPath = parts[0];
+    branch = parts[1] || null;
+  }
+
+  repoPath = repoPath.replace(/\.git$/, '').replace(/^\/+|\/+$/g, '');
+
+  return {
+    repository: repoPath || null,
+    branch,
+  };
+}
+
 /**
- * Normalize a repository string to the wiki_id format prefix.
- * wiki_id format: {owner}--{repo}--{branch}
- * This returns just {owner}--{repo} prefix for matching against wiki_id.
- * 
- * @param {string} repo - Repository string like "owner/repo" or "fmtlib/fmt"
- * @returns {string|null} - Normalized prefix like "owner--repo" or null if invalid
+ * Normalize a repository identity to the wiki_id format prefix.
+ * wiki_id format: {repo-path-components}--{branch}
+ * For GitHub this is owner--repo--branch; for ADO this can be org--project--repo--branch.
+ *
+ * @param {string|object} repoIdentity - Repository string/object, optionally with branch
+ * @returns {string|null} - Normalized prefix like "owner--repo" or "org--project--repo--branch"
  */
-function normalizeRepoToWikiIdPrefix(repo) {
-  if (!repo || typeof repo !== 'string') return null;
-  
-  // Split by '/' to get owner and repo name
-  const parts = repo.split('/');
-  if (parts.length < 2) return null;
-  
-  const owner = parts[0].toLowerCase().replace(/_/g, '-').replace(/\./g, '-');
-  const repoName = parts[1].toLowerCase().replace(/_/g, '-').replace(/\./g, '-');
-  
-  return `${owner}--${repoName}`;
+function normalizeRepoToWikiIdPrefix(repoIdentity) {
+  return getRepositoryMatchInfo(repoIdentity).prefix;
+}
+
+function getRepositoryMatchInfo(repoIdentity) {
+  const parsed = parseRepositoryIdentity(repoIdentity);
+  if (!parsed.repository) {
+    return {
+      parsed,
+      prefix: null,
+      repositoryLeaf: null,
+      branchPart: null,
+      leafBranchSuffix: null,
+      hasBranch: false,
+    };
+  }
+
+  const parts = parsed.repository.split('/').filter(Boolean).map(normalizeWikiIdPart).filter(Boolean);
+  const branchPart = normalizeWikiIdPart(parsed.branch);
+  const repositoryLeaf = parts.length > 0 ? parts[parts.length - 1] : null;
+
+  return {
+    parsed,
+    prefix: parts.length > 0 ? (branchPart ? [...parts, branchPart].join('--') : parts.join('--')) : null,
+    repositoryLeaf,
+    branchPart,
+    leafBranchSuffix: repositoryLeaf && branchPart ? `${repositoryLeaf}--${branchPart}` : null,
+    hasBranch: Boolean(parsed.branch),
+  };
+}
+
+function getBranchFromSettings(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+
+  return (
+    settings.active_branch ||
+    settings.toolkit_configuration_active_branch ||
+    settings.base_branch ||
+    settings.toolkit_configuration_base_branch ||
+    settings.github_base_branch ||
+    settings.toolkit_configuration_github_base_branch ||
+    settings.branch ||
+    settings.toolkit_configuration_branch ||
+    null
+  );
+}
+
+function mergePlainObjects(...values) {
+  return values.reduce((merged, value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return merged;
+    return { ...merged, ...value };
+  }, {});
+}
+
+function getAdoConfig(settings) {
+  if (!settings || typeof settings !== 'object') return {};
+  return mergePlainObjects(settings.ado_configuration, settings.toolkit_configuration_ado_configuration);
+}
+
+function getToolkitConfigPayload(toolkit) {
+  if (!toolkit || typeof toolkit !== 'object') return {};
+  const configurationParameters = toolkit.configuration?.parameters;
+  return mergePlainObjects(toolkit.toolkit_config, configurationParameters);
+}
+
+function mergeToolkitIdentitySettings(settings, toolkitConfig) {
+  const merged = mergePlainObjects(toolkitConfig, settings);
+  const adoConfig = mergePlainObjects(getAdoConfig(toolkitConfig), getAdoConfig(settings));
+  if (Object.keys(adoConfig).length > 0) {
+    merged.ado_configuration = adoConfig;
+    merged.toolkit_configuration_ado_configuration = adoConfig;
+  }
+  return merged;
+}
+
+function extractAdoOrganization(adoConfig) {
+  const organizationUrl = adoConfig?.organization_url || adoConfig?.url;
+  if (!organizationUrl || typeof organizationUrl !== 'string') return null;
+
+  try {
+    const parsedUrl = new URL(organizationUrl);
+    if (parsedUrl.hostname === 'dev.azure.com') {
+      return parsedUrl.pathname.split('/').filter(Boolean)[0] || null;
+    }
+    if (parsedUrl.hostname.endsWith('.visualstudio.com')) {
+      return parsedUrl.hostname.split('.')[0] || null;
+    }
+  } catch (e) {
+    return null;
+  }
+
+  return null;
+}
+
+function buildAdoRepositoryIdentifier(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+
+  const adoConfig = getAdoConfig(settings);
+  const repository = settings.toolkit_configuration_repository_id || settings.repository_id || settings.repository || settings.repo;
+  const project = adoConfig.project || settings.toolkit_configuration_project || settings.project;
+  const organization = adoConfig.organization || settings.organization || extractAdoOrganization(adoConfig);
+
+  if (organization && project && repository) {
+    return `${organization}/${project}/${repository}`;
+  }
+
+  return repository || null;
+}
+
+function getRepositoryFromSettings(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+
+  return (
+    settings.toolkit_configuration_github_repository ||
+    settings.github_repository ||
+    buildAdoRepositoryIdentifier(settings) ||
+    settings.repository ||
+    settings.repo ||
+    null
+  );
+}
+
+function getCodeToolkitReference(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+
+  return (
+    settings.toolkit_configuration_code_toolkit ||
+    settings.code_toolkit ||
+    settings.toolkit_configuration_code_repository ||
+    settings.code_repository ||
+    null
+  );
+}
+
+function getConfiguredRepoIdentity(toolkit, settings, resolvedRepoIdentity = null) {
+  if (resolvedRepoIdentity) {
+    const resolved = parseRepositoryIdentity(resolvedRepoIdentity);
+    if (resolved.repository) return resolved;
+  }
+
+  const cfg = getToolkitConfigPayload(toolkit);
+  const set = settings || toolkit?.settings || {};
+  const merged = mergeToolkitIdentitySettings(set, cfg);
+  const repository = getRepositoryFromSettings(merged) || getRepositoryFromSettings(set) || getRepositoryFromSettings(cfg);
+  const parsed = parseRepositoryIdentity(repository);
+
+  if (!parsed.repository) return null;
+
+  return {
+    repository: parsed.repository,
+    branch: getBranchFromSettings(merged) || getBranchFromSettings(set) || getBranchFromSettings(cfg) || parsed.branch || null,
+  };
 }
 
 /**
@@ -189,25 +392,81 @@ function normalizeRepoToWikiIdPrefix(repo) {
  * @param {string} configuredRepo - Configured repository like "owner/repo"
  * @returns {boolean} - True if manifest matches the configured repo
  */
-function manifestMatchesRepo(manifest, configuredRepo) {
-  if (!manifest || !configuredRepo) return false;
-  
-  const expectedPrefix = normalizeRepoToWikiIdPrefix(configuredRepo);
-  if (!expectedPrefix) return false;
-  
-  // Check wiki_id first (preferred method)
-  if (manifest.wiki_id) {
-    // wiki_id format: owner--repo--branch
-    // Check if it starts with owner--repo--
-    return manifest.wiki_id.toLowerCase().startsWith(expectedPrefix + '--');
+function manifestMatchesRepo(manifest, configuredRepoIdentity) {
+  if (!manifest || !configuredRepoIdentity) return false;
+
+  const expectedInfo = getRepositoryMatchInfo(configuredRepoIdentity);
+  const expectedPrefix = expectedInfo.prefix;
+  const matchesPrefix = prefix => {
+    if (!prefix) return false;
+    const normalizedPrefix = prefix.toLowerCase();
+    if (normalizedPrefix === expectedPrefix) return true;
+    return !expectedInfo.hasBranch && normalizedPrefix.startsWith(`${expectedPrefix}--`);
+  };
+
+  const matchedByPrefix = [
+    typeof manifest.wiki_id === 'string' ? manifest.wiki_id : null,
+    normalizeRepoToWikiIdPrefix({ repository: manifest.repository, branch: manifest.branch }),
+    normalizeRepoToWikiIdPrefix(manifest.canonical_repo_identifier),
+  ].some(matchesPrefix);
+
+  return matchedByPrefix;
+}
+
+function repositoryLeafAndBranchMatch(candidateRepoIdentity, expectedInfo) {
+  const candidateInfo = getRepositoryMatchInfo(candidateRepoIdentity);
+  if (!candidateInfo.repositoryLeaf || !expectedInfo.repositoryLeaf) return false;
+  if (candidateInfo.repositoryLeaf !== expectedInfo.repositoryLeaf) return false;
+  if (expectedInfo.branchPart && candidateInfo.branchPart !== expectedInfo.branchPart) return false;
+  return true;
+}
+
+function manifestRepoMatchKey(manifest) {
+  const candidates = [
+    manifest?.canonical_repo_identifier,
+    { repository: manifest?.repository, branch: manifest?.branch },
+  ];
+
+  for (const candidate of candidates) {
+    const info = getRepositoryMatchInfo(candidate);
+    if (info.parsed.repository && info.branchPart) {
+      return `${info.parsed.repository.toLowerCase()}:${info.branchPart}`;
+    }
   }
-  
-  // Fallback: check canonical_repo_identifier
-  if (manifest.canonical_repo_identifier) {
-    const manifestPrefix = normalizeRepoToWikiIdPrefix(manifest.canonical_repo_identifier);
-    return manifestPrefix === expectedPrefix;
+
+  return null;
+}
+
+function filterManifestsByRepo(manifests, configuredRepoIdentity) {
+  const strictMatches = manifests.filter(manifest => manifestMatchesRepo(manifest, configuredRepoIdentity));
+  if (strictMatches.length > 0) return strictMatches;
+
+  const expectedInfo = getRepositoryMatchInfo(configuredRepoIdentity);
+  const repoParts = expectedInfo.parsed.repository?.split('/').filter(Boolean) || [];
+  if (repoParts.length !== 1 || !expectedInfo.leafBranchSuffix) return [];
+
+  const leafMatches = manifests.filter(manifest => [
+    { repository: manifest.repository, branch: manifest.branch },
+    manifest.canonical_repo_identifier,
+  ].some(candidate => repositoryLeafAndBranchMatch(candidate, expectedInfo)));
+
+  const canonicalKeys = new Set(leafMatches.map(manifestRepoMatchKey).filter(Boolean));
+  return canonicalKeys.size === 1 ? leafMatches : [];
+}
+
+function artifactMatchesRepo(artifactName, configuredRepoIdentity) {
+  if (!artifactName || !configuredRepoIdentity) return false;
+
+  const expectedInfo = getRepositoryMatchInfo(configuredRepoIdentity);
+  const expectedPrefix = expectedInfo.prefix;
+  const normalizedName = artifactName.toLowerCase();
+  const artifactPrefix = normalizedName.split('/')[0];
+
+  if (expectedPrefix) {
+    if (artifactPrefix === expectedPrefix || normalizedName.startsWith(`${expectedPrefix}/`)) return true;
+    return !expectedInfo.hasBranch && artifactPrefix.startsWith(`${expectedPrefix}--`);
   }
-  
+
   return false;
 }
 
@@ -216,6 +475,8 @@ function manifestMatchesRepo(manifest, configuredRepo) {
 const FIELD_LABEL_OVERRIDES = {
   'toolkit_configuration_code_toolkit': 'Code Toolkit ID',
   'code_toolkit': 'Code Toolkit ID',
+  'toolkit_configuration_code_repository': 'Code Toolkit ID',
+  'code_repository': 'Code Toolkit ID',
 };
 
 function formatFieldLabel(key) {
@@ -322,21 +583,12 @@ function getBucketName(toolkit) {
 // This function checks direct fields only - toolkit reference resolution is handled separately
 function getConfiguredRepo(toolkit, settings, resolvedRepoName = null) {
   // If we have a resolved repository name from a toolkit reference, use it
-  if (resolvedRepoName) {
-    return resolvedRepoName;
+  const resolved = parseRepositoryIdentity(resolvedRepoName);
+  if (resolved.repository) {
+    return resolved.repository;
   }
 
-  const cfg = toolkit?.toolkit_config || {};
-  const set = settings || toolkit?.settings || {};
-  return (
-    set.toolkit_configuration_github_repository ||
-    set.github_repository ||
-    set.repository ||
-    set.repo ||
-    cfg.github_repository ||
-    cfg.repository ||
-    null
-  );
+  return getConfiguredRepoIdentity(toolkit, settings, null)?.repository || null;
 }
 
 function DeepWikiApp() {
@@ -387,6 +639,7 @@ function DeepWikiApp() {
   const [excludeTests, setExcludeTests] = useState(true);
   const [lastModifiedDate, setLastModifiedDate] = useState(null);
   const [resolvedRepoName, setResolvedRepoName] = useState(null);
+  const [resolvedRepoIdentity, setResolvedRepoIdentity] = useState(null);
 
   // Wiki versioning state
   const [bucketArtifacts, setBucketArtifacts] = useState([]);
@@ -475,8 +728,9 @@ function DeepWikiApp() {
 
   const wikiVersionStorageKey = useMemo(() => {
     if (!projectId || !bucketName) return null;
-    return `deepwiki.selected_manifest.${projectId}.${bucketName}`;
-  }, [projectId, bucketName]);
+    const repoKey = normalizeRepoToWikiIdPrefix(getConfiguredRepoIdentity(toolkit, settingsData, resolvedRepoIdentity));
+    return `deepwiki.selected_manifest.${projectId}.${bucketName}${repoKey ? `.${repoKey}` : ''}`;
+  }, [projectId, bucketName, resolvedRepoIdentity, settingsData, toolkit]);
 
   const manifestSelectValue = useMemo(() => {
     if (!Array.isArray(wikiManifests) || wikiManifests.length === 0) return 'legacy_latest';
@@ -532,29 +786,29 @@ function DeepWikiApp() {
 
   // Helper function to resolve toolkit reference and get repository name
   const resolveToolkitReference = async (toolkitRefId, headers) => {
-    if (!toolkitRefId || typeof toolkitRefId !== 'number') {
+    if (toolkitRefId && typeof toolkitRefId === 'object') {
+      const refSettings = toolkitRefId.settings || toolkitRefId.toolkit_config || toolkitRefId;
+      return getConfiguredRepoIdentity(toolkitRefId, refSettings, null);
+    }
+
+    const normalizedToolkitRefId = typeof toolkitRefId === 'string' ? Number(toolkitRefId) : toolkitRefId;
+    if (!normalizedToolkitRefId || !Number.isFinite(normalizedToolkitRefId)) {
       return null;
     }
 
     try {
-      const refUrl = `/api/v2/elitea_core/tool/prompt_lib/${projectId}/${toolkitRefId}`;
+      const refUrl = `/api/v2/elitea_core/tool/prompt_lib/${projectId}/${normalizedToolkitRefId}`;
       const refResponse = await fetch(refUrl, { headers });
 
       if (!refResponse.ok) {
-        console.warn(`Failed to fetch referenced toolkit ${toolkitRefId}`);
+        console.warn(`Failed to fetch referenced toolkit ${normalizedToolkitRefId}`);
         return null;
       }
 
       const refToolkit = await refResponse.json();
       const refSettings = refToolkit?.settings || {};
 
-      // Extract repository name from GitHub toolkit settings
-      // GitHub toolkit stores repository as 'repository' field
-      const repoName = refSettings.repository ||
-                       refSettings.github_repository ||
-                       refSettings.repo;
-
-      return repoName || null;
+      return getConfiguredRepoIdentity(refToolkit, refSettings, null);
     } catch (err) {
       console.warn('Error resolving toolkit reference:', err);
       return null;
@@ -587,20 +841,22 @@ function DeepWikiApp() {
         setSettingsData(settingsPayload);
         setSettingsSaved(false);
 
-        // Check if there's a toolkit reference (code_toolkit) that needs to be resolved
-        // The field is stored as toolkit_configuration_code_toolkit after schema transformation
-        const codeToolkitRef = settingsPayload.toolkit_configuration_code_toolkit || settingsPayload.code_toolkit;
+        // Check if there's a toolkit reference that needs to be resolved.
+        // Older saved configurations may call this field code_repository.
+        const codeToolkitRef = getCodeToolkitReference(settingsPayload);
         let resolvedRepo = null;
-        if (codeToolkitRef && typeof codeToolkitRef === 'number') {
+        if (codeToolkitRef) {
           resolvedRepo = await resolveToolkitReference(codeToolkitRef, headers);
-          setResolvedRepoName(resolvedRepo);
+          setResolvedRepoName(resolvedRepo?.repository || null);
+          setResolvedRepoIdentity(resolvedRepo);
         } else {
           setResolvedRepoName(null);
+          setResolvedRepoIdentity(null);
         }
         
         // Compute configured repo for filtering manifests
         // Priority: resolved repo from code_toolkit > direct settings > null
-        const currentConfiguredRepo = resolvedRepo || getConfiguredRepo(data, settingsPayload, null);
+        const currentConfiguredRepo = getConfiguredRepoIdentity(data, settingsPayload, resolvedRepo);
 
         // Determine bucket name using the getBucketName helper
         const bucketName = getBucketName(data);
@@ -872,6 +1128,9 @@ function DeepWikiApp() {
               wiki_version_id: parsed?.wiki_version_id || null,
               created_at: createdAt,
               commit_hash: parsed?.commit_hash || null,
+              repository: parsed?.repository || null,
+              branch: parsed?.branch || null,
+              provider_type: parsed?.provider_type || null,
               canonical_repo_identifier: parsed?.canonical_repo_identifier || null,
               analysis_key: parsed?.analysis_key || null,
               pages: Array.isArray(parsed?.pages) ? parsed.pages.filter(x => typeof x === 'string') : [],
@@ -961,12 +1220,15 @@ function DeepWikiApp() {
 
   // Load artifacts and parse into structured sections based on filenames
   // When forceSelectLatest=true, always pick the newest manifest (used after generation completes)
-  // configuredRepoParam: optional repository to filter manifests by (e.g., "owner/repo")
+  // configuredRepoParam: optional repository identity to filter manifests by (e.g., "owner/repo" or { repository, branch })
   const loadArtifactsList = async (bucket, forceSelectLatest = false, configuredRepoParam = null) => {
     try {
       const sanitizedBucket = sanitizeBucketName(bucket);
       const url = `/api/v2/artifacts/artifacts/default/${projectId}/${sanitizedBucket}`;
-      const storageKey = projectId ? `deepwiki.selected_manifest.${projectId}.${sanitizedBucket}` : null;
+      const repoStorageKey = normalizeRepoToWikiIdPrefix(configuredRepoParam);
+      const storageKey = projectId
+        ? `deepwiki.selected_manifest.${projectId}.${sanitizedBucket}${repoStorageKey ? `.${repoStorageKey}` : ''}`
+        : null;
       
       const headers = isDevelopment && import.meta.env.VITE_DEV_TOKEN
         ? { 'Authorization': `Bearer ${import.meta.env.VITE_DEV_TOKEN}` }
@@ -997,12 +1259,12 @@ function DeepWikiApp() {
         // This ensures we only show wikis for the currently configured repo, not other repos in the shared bucket
         let filteredManifests = manifests;
         if (configuredRepoParam) {
-          filteredManifests = manifests.filter(m => manifestMatchesRepo(m, configuredRepoParam));
+          filteredManifests = filterManifestsByRepo(manifests, configuredRepoParam);
           console.log('[DeepWiki] Filtered manifests by configuredRepo', {
             configuredRepo: configuredRepoParam,
             beforeFilter: manifests.length,
             afterFilter: filteredManifests.length,
-            filteredOut: manifests.filter(m => !manifestMatchesRepo(m, configuredRepoParam)).map(m => m.wiki_id)
+            filteredOut: manifests.filter(m => !filteredManifests.includes(m)).map(m => m.wiki_id)
           });
         }
         
@@ -1055,30 +1317,40 @@ function DeepWikiApp() {
           return;
         }
 
+        const expectedPrefix = configuredRepoParam ? normalizeRepoToWikiIdPrefix(configuredRepoParam) : null;
+        if (configuredRepoParam && manifests.length > 0) {
+          console.log('[DeepWiki] No matching manifests for configured repo; refusing bucket-wide fallback', {
+            expectedPrefix,
+            configuredRepo: configuredRepoParam,
+            manifestsCount: manifests.length,
+          });
+          setWikiVersionMode('legacy');
+          setSelectedWikiManifestName('');
+          setRepoIdentifierOverride(null);
+          setAnalysisKeyOverride(null);
+          setWikiStructure(null);
+          setArtifactsList(null);
+          setCurrentPage(null);
+          setPageContent('');
+          setPageHeadings([]);
+          setLegacyVersionLabel('No versions for this repository');
+          return;
+        }
+
         // Legacy mode: no matching manifests found for this repository
         // Filter artifacts by expected wiki_id prefix if we have a configured repo
         setWikiVersionMode('legacy');
         setSelectedWikiManifestName('');
         setRepoIdentifierOverride(null);
         setAnalysisKeyOverride(null);
-
-        // Compute expected wiki_id prefix from configured repo
-        const expectedPrefix = configuredRepoParam ? normalizeRepoToWikiIdPrefix(configuredRepoParam) : null;
         
         // Filter artifacts to only include those belonging to this repo
         let repoArtifacts = artifacts;
-        if (expectedPrefix) {
-          // wiki_id format: owner--repo--branch, so artifacts would be at owner--repo--branch/...
-          // Filter to only include artifacts starting with the expected prefix
-          repoArtifacts = artifacts.filter(a => {
-            if (!a?.name) return false;
-            // Check if artifact path starts with expected wiki_id pattern
-            // e.g., "fmtlib--fmt--main/wiki_pages/..." should match "fmtlib--fmt"
-            const artifactPath = a.name.toLowerCase();
-            return artifactPath.startsWith(expectedPrefix + '--');
-          });
+        if (configuredRepoParam) {
+          repoArtifacts = artifacts.filter(a => artifactMatchesRepo(a?.name, configuredRepoParam));
           console.log('[DeepWiki] Filtered legacy artifacts by repo prefix', {
             expectedPrefix,
+            configuredRepo: configuredRepoParam,
             beforeFilter: artifacts.length,
             afterFilter: repoArtifacts.length
           });
@@ -1383,7 +1655,7 @@ function DeepWikiApp() {
         const checkBucket = getBucketName(toolkit);
         if (checkBucket) {
           const sanitizedBucket = sanitizeBucketName(checkBucket);
-          loadArtifactsList(sanitizedBucket, true, configuredRepo); // forceSelectLatest=true
+          loadArtifactsList(sanitizedBucket, true, configuredRepoIdentity); // forceSelectLatest=true
         }
       } else {
         const errorText = await response.text();
@@ -1606,7 +1878,7 @@ function DeepWikiApp() {
         // Refresh artifacts list and auto-select the newest manifest
         const nextBucketName = getBucketName(toolkit);
         if (nextBucketName) {
-          loadArtifactsList(nextBucketName, true, configuredRepo); // forceSelectLatest=true after generation
+          loadArtifactsList(nextBucketName, true, configuredRepoIdentity); // forceSelectLatest=true after generation
         }
         cleanupGeneration(socketUnsubscribeRef.current);
         break;
@@ -1783,7 +2055,7 @@ function DeepWikiApp() {
               // Refresh artifacts and cleanup
               if (checkBucket) {
                 const sanitizedBucket = sanitizeBucketName(checkBucket);
-                loadArtifactsList(sanitizedBucket, true, configuredRepo); // forceSelectLatest=true
+                loadArtifactsList(sanitizedBucket, true, configuredRepoIdentity); // forceSelectLatest=true
               }
               cleanupGeneration(socketUnsubscribeRef.current);
               return;
@@ -1818,7 +2090,7 @@ function DeepWikiApp() {
                         timestamp: Date.now(),
                         type: 'success',
                       }]);
-                      loadArtifactsList(sanitizedBucket, true, configuredRepo); // forceSelectLatest=true
+                      loadArtifactsList(sanitizedBucket, true, configuredRepoIdentity); // forceSelectLatest=true
                       cleanupGeneration(socketUnsubscribeRef.current);
                       return;
                     }
@@ -1882,7 +2154,7 @@ function DeepWikiApp() {
                   
                   if (hasNewArtifacts) {
                     setGenerationStatus({ status: 'completed', message: 'Wiki generation completed!' });
-                    loadArtifactsList(sanitizedBucket, false, configuredRepo);
+                    loadArtifactsList(sanitizedBucket, false, configuredRepoIdentity);
                     cleanupGeneration(socketUnsubscribeRef.current);
                     return;
                   }
@@ -1936,7 +2208,7 @@ function DeepWikiApp() {
               
               if (hasNewArtifacts) {
                 setGenerationStatus({ status: 'completed', message: 'Wiki generation completed!' });
-                loadArtifactsList(sanitizedBucket, false, configuredRepo);
+                loadArtifactsList(sanitizedBucket, false, configuredRepoIdentity);
                 cleanupGeneration(socketUnsubscribeRef.current);
                 return;
               }
@@ -3117,6 +3389,10 @@ ${errorInfo.mermaidCode}
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastErrorInfo, lastFix, handleQuickFix]);
 
+  const configuredRepoIdentity = useMemo(
+    () => getConfiguredRepoIdentity(toolkit, settingsData, resolvedRepoIdentity),
+    [resolvedRepoIdentity, settingsData, toolkit]
+  );
   const configuredRepo = useMemo(() => getConfiguredRepo(toolkit, settingsData, resolvedRepoName), [toolkit, settingsData, resolvedRepoName]);
 
   const handleOpenSettings = () => setSettingsOpen(true);
