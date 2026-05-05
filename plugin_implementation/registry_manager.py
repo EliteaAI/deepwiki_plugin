@@ -30,24 +30,27 @@ def normalize_wiki_id(repo_identifier: str) -> str:
     
     Examples:
         owner/repo:main:abc123 → owner--repo--main
+        org/project/repo:main:abc123 → org--project--repo--main
         Owner/Repo:feature/test:abc123 → owner--repo--feature-test
         owner/repo → owner--repo--main
         Owner/sdk_plugin:main → owner--sdk-plugin--main
     """
     # Parse repo_identifier: owner/repo:branch:commit or owner/repo:branch or owner/repo
-    parts = repo_identifier.split(":")
+    parts = repo_identifier.rsplit(":", 2)
     repo_part = parts[0]  # owner/repo
     branch = parts[1] if len(parts) > 1 else "main"
     
     # Normalize repo: lowercase, special chars → -, / → --
-    # Split owner/repo to normalize each part independently
-    repo_parts = repo_part.lower().split("/", 1)
+    # Split every path segment independently so multi-provider paths like
+    # Azure DevOps org/project/repo stay structurally distinct.
+    repo_parts = [part for part in repo_part.lower().strip("/").split("/") if part]
     normalized_parts = []
     for part in repo_parts:
         part = re.sub(r'[^a-z0-9-]', '-', part)  # underscores, dots, etc. → dash
         part = re.sub(r'-+', '-', part)  # collapse multiple -
         part = part.strip('-')
-        normalized_parts.append(part)
+        if part:
+            normalized_parts.append(part)
     normalized_repo = "--".join(normalized_parts)
     
     # Normalize branch: lowercase, / → -, remove special chars
@@ -73,8 +76,8 @@ def parse_wiki_id(wiki_id: str) -> Dict[str, str]:
     parts = wiki_id.split("--")
     if len(parts) >= 3:
         owner = parts[0]
-        repo = parts[1]
-        branch = "--".join(parts[2:])  # branch might have -- in it
+        repo = "--".join(parts[1:-1])
+        branch = parts[-1]
         return {"owner": owner, "repo": repo, "branch": branch}
     elif len(parts) == 2:
         # No branch in wiki_id - shouldn't happen with normalize_wiki_id
@@ -177,6 +180,8 @@ class WikiRegistryManager:
         description: Optional[str] = None,
         topics: Optional[List[str]] = None,
         commit_hash: Optional[str] = None,
+        canonical_repo_identifier: Optional[str] = None,
+        analysis_key: Optional[str] = None,
         stats: Optional[Dict[str, int]] = None,
     ) -> Dict:
         """
@@ -218,6 +223,8 @@ class WikiRegistryManager:
             "topics": topics or [],
             "folder_path": f"{wiki_id}/",
             "commit_hash": commit_hash,
+            "canonical_repo_identifier": canonical_repo_identifier,
+            "analysis_key": analysis_key,
             "artifact_status": {
                 "graph": True,
                 "vectorstore": True,
@@ -437,6 +444,7 @@ class WikiRegistryManager:
                 "description": wiki.get("description", ""),
                 "repo": wiki.get("repo", ""),
                 "branch": wiki.get("branch", "main"),
+                "canonical_repo_identifier": wiki.get("canonical_repo_identifier"),
             })
         
         return result

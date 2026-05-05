@@ -1852,6 +1852,8 @@ const ChatDrawer = memo(function ChatDrawer({
           tool_params: { 
             question,
             chat_history: buildChatHistory(messagesBeforeUser),
+            ...(repoIdentifierOverride ? { repo_identifier_override: repoIdentifierOverride } : {}),
+            ...(analysisKeyOverride ? { analysis_key_override: analysisKeyOverride } : {}),
             ...(chatMode === 'research' ? { research_type: 'general', enable_subagents: true } : {}),
           },
           llm_model: llmModel,

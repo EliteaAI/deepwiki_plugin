@@ -219,7 +219,12 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not repository:
         return {"success": False, "error": "No repository specified"}
 
-    repo_identifier = f"{repository}:{branch}"
+    from .repository_identity import build_query_repo_identifier
+    repo_identifier = build_query_repo_identifier(
+        repository=repository,
+        branch=branch,
+        repo_config=repo_config,
+    )
     _print(f"[AGENTIC ASK] Processing question for: {repo_identifier} (provider: {provider_type})")
     _emit_thinking_step("start", "Agentic Ask Started", f"Question: {question[:200]}...")
 
@@ -253,8 +258,15 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                     artifacts_client=_art_client,
                     bucket=get_artifact_bucket() if _art_client else "",
                 )
-                # Derive wiki_id from repository (same convention as generate_wiki)
-                _wiki_id = normalize_wiki_id(repo_identifier)
+                # Prefer the manifest-selected canonical id. ADO raw repo fields can be
+                # only the repository name, while generated artifacts are keyed by
+                # provider-normalized org/project/repo.
+                _index_repo_id = (
+                    repo_identifier_override.strip()
+                    if isinstance(repo_identifier_override, str) and repo_identifier_override.strip()
+                    else repo_identifier
+                )
+                _wiki_id = normalize_wiki_id(_index_repo_id)
                 ok = art_mgr.ensure_indexes_for_wiki(wiki_id=_wiki_id)
                 if ok:
                     _print("[ask] Index verification: OK")
@@ -270,21 +282,17 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Resolve canonical repo identifier
         canonical_repo_identifier = repo_identifier
         try:
-            from .repo_resolution import resolve_canonical_repo_identifier, load_cache_index
+            from .repo_resolution import cache_index_has_repo, resolve_canonical_repo_identifier, load_cache_index
 
             if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
                 override_candidate = repo_identifier_override.strip()
                 idx = load_cache_index(cache_dir)
-                if idx.get(override_candidate):
+                if cache_index_has_repo(idx, override_candidate):
                     canonical_repo_identifier = override_candidate
                     _print(f"Using repo_identifier_override: {canonical_repo_identifier}")
                 else:
-                    _print(f"Override '{override_candidate}' not found, resolving...")
-                    canonical_repo_identifier = resolve_canonical_repo_identifier(
-                        repo_identifier=repo_identifier,
-                        cache_dir=cache_dir,
-                        repositories_dir=os.path.join(cache_dir, 'repositories'),
-                    )
+                    canonical_repo_identifier = override_candidate
+                    _print(f"Using repo_identifier_override not yet registered in cache index: {canonical_repo_identifier}")
             else:
                 canonical_repo_identifier = resolve_canonical_repo_identifier(
                     repo_identifier=repo_identifier,
@@ -563,9 +571,12 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not repository:
         return {"success": False, "error": "No repository specified"}
     
-    # Build repo_identifier matching the format used during wiki generation
-    # Format: "{repository}:{branch}"
-    repo_identifier = f"{repository}:{branch}"
+    from .repository_identity import build_query_repo_identifier
+    repo_identifier = build_query_repo_identifier(
+        repository=repository,
+        branch=branch,
+        repo_config=repo_config,
+    )
     
     _print(f"Processing question for repository: {repo_identifier} (provider: {provider_type})")
     
@@ -576,24 +587,18 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Resolve canonical commit-scoped identifier where possible (or use override).
     canonical_repo_identifier = repo_identifier
     try:
-        from .repo_resolution import resolve_canonical_repo_identifier
-        from .repo_resolution import load_cache_index
+        from .repo_resolution import cache_index_has_repo, load_cache_index, resolve_canonical_repo_identifier
 
         if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
             # Validate override exists in cache before using it
             override_candidate = repo_identifier_override.strip()
             idx = load_cache_index(cache_dir)
-            if idx.get(override_candidate):
+            if cache_index_has_repo(idx, override_candidate):
                 canonical_repo_identifier = override_candidate
                 _print(f"Using repo_identifier_override: {canonical_repo_identifier}")
             else:
-                # Override not in cache, fall back to resolution from repo_identifier
-                _print(f"Override '{override_candidate}' not found in cache, resolving from repo_identifier...")
-                canonical_repo_identifier = resolve_canonical_repo_identifier(
-                    repo_identifier=repo_identifier,
-                    cache_dir=cache_dir,
-                    repositories_dir=os.path.join(cache_dir, 'repositories'),
-                )
+                canonical_repo_identifier = override_candidate
+                _print(f"Using repo_identifier_override not yet registered in cache index: {canonical_repo_identifier}")
         else:
             canonical_repo_identifier = resolve_canonical_repo_identifier(
                 repo_identifier=repo_identifier,
