@@ -187,15 +187,23 @@ def _search_framework_fts(
     """Run FTS search through whichever search protocol the DB exposes."""
     search_fts = getattr(db, "search_fts", None)
     if callable(search_fts):
-        rows = search_fts(query=term, cluster_id=cluster_id, limit=limit)
-        if rows:
-            return rows
+        try:
+            return search_fts(query=term, cluster_id=cluster_id, limit=limit)
+        except Exception as exc:
+            logger.debug(
+                "[CLUSTER_EXPANSION] search_fts failed for '%s': %s",
+                term, exc,
+            )
 
     search_fts5 = getattr(db, "search_fts5", None)
     if callable(search_fts5):
-        rows = search_fts5(query=term, cluster_id=cluster_id, limit=limit)
-        if rows:
-            return rows
+        try:
+            return search_fts5(query=term, cluster_id=cluster_id, limit=limit)
+        except Exception as exc:
+            logger.debug(
+                "[CLUSTER_EXPANSION] search_fts5 failed for '%s': %s",
+                term, exc,
+            )
 
     try:
         conditions = ["LOWER(source_text) LIKE ?"]

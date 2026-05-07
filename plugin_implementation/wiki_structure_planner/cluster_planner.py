@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models import BaseLanguageModel
@@ -609,20 +608,6 @@ class ClusterStructurePlanner:
                 or f"Section covering {len(all_node_ids)} symbols"
             )
 
-        try:
-            naming_workers = max(
-                1,
-                int(
-                    _env_value(
-                        "DEEPWIKI_NAMING_CONCURRENCY",
-                        "WIKI_NAMING_CONCURRENCY",
-                        "1",
-                    )
-                ),
-            )
-        except (TypeError, ValueError):
-            naming_workers = 1
-
         ordered_micros = sorted(micro_map.keys())
         prompts: Dict[int, Tuple[List[str], str]] = {}
         for micro_id in ordered_micros:
@@ -659,14 +644,9 @@ class ClusterStructurePlanner:
             return micro_id, parsed
 
         page_naming_by_micro: Dict[int, Dict[str, Any]] = {}
-        if naming_workers > 1 and len(ordered_micros) > 1:
-            with ThreadPoolExecutor(max_workers=naming_workers) as executor:
-                for micro_id, parsed in executor.map(_invoke_page_naming, ordered_micros):
-                    page_naming_by_micro[micro_id] = parsed
-        else:
-            for micro_id in ordered_micros:
-                parsed_micro_id, parsed = _invoke_page_naming(micro_id)
-                page_naming_by_micro[parsed_micro_id] = parsed
+        for micro_id in ordered_micros:
+            parsed_micro_id, parsed = _invoke_page_naming(micro_id)
+            page_naming_by_micro[parsed_micro_id] = parsed
 
         if pages_first:
             pages_payload = []

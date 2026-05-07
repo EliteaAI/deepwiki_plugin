@@ -41,6 +41,7 @@ from plugin_implementation.cluster_expansion import (
     _node_to_document,
     _estimate_tokens,
     _fts_fallback,
+    _search_framework_fts,
     DEFAULT_TOKEN_BUDGET,
     MAX_NEIGHBORS_PER_SYMBOL,
     MAX_EXPANSION_TOTAL,
@@ -835,6 +836,27 @@ class TestFindFrameworkReferences:
         )
 
         assert any(reason.startswith("fts_framework_ref:") for _, _, reason in results)
+
+    def test_empty_fts_result_does_not_fall_back_to_sql_scan(self):
+        class ConnSpy:
+            def __init__(self):
+                self.executed = False
+
+            def execute(self, *_args, **_kwargs):
+                self.executed = True
+                raise AssertionError("SQL fallback should not run")
+
+        class EmptyFtsDB:
+            def __init__(self):
+                self.conn = ConnSpy()
+
+            def search_fts5(self, query, cluster_id=None, limit=20):
+                return []
+
+        db = EmptyFtsDB()
+
+        assert _search_framework_fts(db, "configuration_created", None, 3) == []
+        assert db.conn.executed is False
 
 
 class TestFrameworkReferenceExpansion:

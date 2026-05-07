@@ -118,6 +118,21 @@ def test_get_embedding_by_id_roundtrip(db: UnifiedWikiDB):
     assert db.get_embedding_by_id("python::a::missing") is None
 
 
+def test_get_nodes_by_ids_batch_fetch(db: UnifiedWikiDB):
+    _seed_node(db, "python::a::foo", "def foo(): pass")
+    _seed_node(db, "python::a::bar", "def bar(): pass")
+
+    rows = db.get_nodes_by_ids([
+        "python::a::foo",
+        "python::a::missing",
+        "python::a::bar",
+    ])
+    node_ids = {row["node_id"] for row in rows}
+
+    assert node_ids == {"python::a::foo", "python::a::bar"}
+    assert db.get_nodes_by_ids([]) == []
+
+
 def test_fts_score_norm_present(db: UnifiedWikiDB):
     _seed_node(db, "python::a::foo", "alpha bravo charlie alpha")
     _seed_node(db, "python::a::bar", "bravo bravo bravo")

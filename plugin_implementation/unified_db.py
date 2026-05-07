@@ -584,6 +584,17 @@ class UnifiedWikiDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_nodes_by_ids(self, node_ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch multiple nodes by ID in one query."""
+        if not node_ids:
+            return []
+        placeholders = ",".join("?" for _ in node_ids)
+        rows = self.conn.execute(
+            f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+            node_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_nodes_by_path_prefix(self, prefix: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Get nodes whose ``rel_path`` starts with *prefix* (B-tree GLOB)."""
         rows = self.conn.execute(
