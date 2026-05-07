@@ -100,6 +100,13 @@ _P2_REL_TYPES = frozenset({
 # Measured across several real repos: 1 token ≈ 3.5 chars for code.
 _CHARS_PER_TOKEN = 3.5
 
+# Framework reference discovery — for expansion orphans.  Frameworks often
+# dispatch handlers by string names rather than explicit constructor/call edges,
+# so these symbols can look orphaned to AST/LSP graph construction.
+MAX_FRAMEWORK_REFS_PER_ORPHAN = 3
+ORPHAN_EDGE_THRESHOLD = 1
+_MIN_FTS_NAME_LEN = 4
+
 
 # ---------------------------------------------------------------------------
 # Token estimation
@@ -110,6 +117,225 @@ def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, int(len(text) / _CHARS_PER_TOKEN))
+
+
+# ---------------------------------------------------------------------------
+# Framework reference discovery helpers
+# ---------------------------------------------------------------------------
+
+def _count_structural_edges(db, node_id: str) -> int:
+    """Count AST-derived structural edges for a node.
+
+    Synthetic edges from orphan/doc resolution are intentionally ignored so
+    framework-dispatched handlers with only ``defines`` links still qualify as
+    expansion orphans.
+    """
+    get_edges_from = getattr(db, "get_edges_from", None)
+    get_edges_to = getattr(db, "get_edges_to", None)
+    if callable(get_edges_from) and callable(get_edges_to):
+        outgoing = get_edges_from(node_id) or []
+        incoming = get_edges_to(node_id) or []
+    else:
+        try:
+            outgoing = [
+                dict(row) for row in db.conn.execute(
+                    "SELECT edge_class FROM repo_edges WHERE source_id = ?",
+                    (node_id,),
+                ).fetchall()
+            ]
+            incoming = [
+                dict(row) for row in db.conn.execute(
+                    "SELECT edge_class FROM repo_edges WHERE target_id = ?",
+                    (node_id,),
+                ).fetchall()
+            ]
+        except Exception as exc:
+            logger.debug(
+                "[CLUSTER_EXPANSION] structural edge count failed for '%s': %s",
+                node_id, exc,
+            )
+            return 0
+    return sum(
+        1 for edge in outgoing if edge.get("edge_class") == "structural"
+    ) + sum(
+        1 for edge in incoming if edge.get("edge_class") == "structural"
+    )
+
+
+def _get_nodes_by_ids(db, node_ids: List[str]) -> List[Dict[str, Any]]:
+    """Fetch nodes by ID using a DB helper when present, SQL otherwise."""
+    if not node_ids:
+        return []
+    helper = getattr(db, "get_nodes_by_ids", None)
+    if callable(helper):
+        return helper(node_ids)
+
+    placeholders = ",".join("?" for _ in node_ids)
+    rows = db.conn.execute(
+        f"SELECT * FROM repo_nodes WHERE node_id IN ({placeholders})",
+        node_ids,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _search_framework_fts(
+    db,
+    term: str,
+    cluster_id: Optional[int],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Run FTS search through whichever search protocol the DB exposes."""
+    search_fts = getattr(db, "search_fts", None)
+    if callable(search_fts):
+        rows = search_fts(query=term, cluster_id=cluster_id, limit=limit)
+        if rows:
+            return rows
+
+    search_fts5 = getattr(db, "search_fts5", None)
+    if callable(search_fts5):
+        rows = search_fts5(query=term, cluster_id=cluster_id, limit=limit)
+        if rows:
+            return rows
+
+    try:
+        conditions = ["LOWER(source_text) LIKE ?"]
+        params: List[Any] = [f"%{term.lower()}%"]
+        if cluster_id is not None:
+            conditions.append("macro_cluster = ?")
+            params.append(cluster_id)
+        params.append(limit)
+        rows = db.conn.execute(
+            "SELECT * FROM repo_nodes WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY rel_path, start_line LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.debug(
+            "[CLUSTER_EXPANSION] source_text fallback search failed for '%s': %s",
+            term, exc,
+        )
+
+    return []
+
+
+def _collect_search_terms(
+    db,
+    orphan_id: str,
+    orphan_node: Dict[str, Any],
+) -> List[str]:
+    """Build FTS search terms for an expansion orphan.
+
+    Container symbols include child method names because framework dispatch
+    sites usually reference the method string, not the owning class name.
+    """
+    symbol_name = (orphan_node.get("symbol_name") or "").strip()
+    terms: List[str] = []
+    if len(symbol_name) >= _MIN_FTS_NAME_LEN:
+        terms.append(symbol_name)
+
+    symbol_type = (orphan_node.get("symbol_type") or "").lower()
+    if symbol_type in ("class", "interface", "struct"):
+        try:
+            edges = db.get_edges_from(orphan_id, rel_types=["defines"]) or []
+            child_ids = [
+                edge["target_id"] for edge in edges
+                if edge.get("edge_class") == "structural"
+            ]
+            for child in _get_nodes_by_ids(db, child_ids):
+                child_name = (child.get("symbol_name") or "").strip()
+                if len(child_name) >= _MIN_FTS_NAME_LEN and child_name not in terms:
+                    terms.append(child_name)
+        except Exception as exc:
+            logger.debug(
+                "[CLUSTER_EXPANSION] child term collection failed for '%s': %s",
+                orphan_id, exc,
+            )
+
+    return terms
+
+
+def _find_framework_references(
+    db,
+    orphan_nodes: Dict[str, Dict[str, Any]],
+    seen_ids: Set[str],
+    macro_id: Optional[int] = None,
+    limit_per_orphan: int = MAX_FRAMEWORK_REFS_PER_ORPHAN,
+) -> List[Tuple[str, Dict[str, Any], str]]:
+    """Find code that references orphan symbols through string dispatch.
+
+    Searches repo-wide first because framework dispatchers often live outside
+    the handler's own cluster, then repeats cluster-scoped as a secondary pass.
+    """
+    results: List[Tuple[str, Dict[str, Any], str]] = []
+    found_ids: Set[str] = set()
+    all_orphan_ids = set(orphan_nodes.keys())
+
+    for orphan_id, orphan_node in orphan_nodes.items():
+        search_terms = _collect_search_terms(db, orphan_id, orphan_node)
+        if not search_terms:
+            continue
+
+        scope_ids = [None, macro_id] if macro_id is not None else [None]
+        hits: List[Dict[str, Any]] = []
+
+        for term in search_terms:
+            if len(hits) >= limit_per_orphan:
+                break
+            term_lower = term.lower()
+
+            for scope_id in scope_ids:
+                if len(hits) >= limit_per_orphan:
+                    break
+                try:
+                    rows = _search_framework_fts(
+                        db,
+                        term,
+                        cluster_id=scope_id,
+                        limit=limit_per_orphan * 3,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[CLUSTER_EXPANSION] FTS framework ref failed for '%s': %s",
+                        term, exc,
+                    )
+                    continue
+
+                for node in rows:
+                    node_id = node.get("node_id", "")
+                    if (
+                        node_id == orphan_id
+                        or node_id in seen_ids
+                        or node_id in found_ids
+                        or node_id in all_orphan_ids
+                    ):
+                        continue
+
+                    hit_name = (node.get("symbol_name") or "").lower()
+                    if hit_name == term_lower:
+                        continue
+
+                    source_text = (node.get("source_text") or "").lower()
+                    if term_lower not in source_text:
+                        continue
+
+                    hits.append(node)
+                    found_ids.add(node_id)
+                    if len(hits) >= limit_per_orphan:
+                        break
+
+        for hit in hits:
+            hit_name = hit.get("symbol_name", "?")
+            hit_path = hit.get("rel_path", "?")
+            description = (
+                f"fts_framework_ref:"
+                f"{orphan_node.get('symbol_name', '?')}"
+                f"→{hit_name}@{hit_path}"
+            )
+            results.append((hit["node_id"], hit, description))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +625,44 @@ def expand_for_page(
             "(budget remaining: %d)",
             augmented_count, len(result_docs), budget_remaining,
         )
+
+    # ── Step 2.75: Framework reference discovery for orphans ─────
+    #    For symbols with few structural graph edges (event handlers,
+    #    DI-injected classes, signal receivers, etc.), find other code that
+    #    references them via string literals or framework dispatch.
+    if budget_remaining > 0:
+        orphan_nodes: Dict[str, Dict[str, Any]] = {}
+        for node_id in list(seen_ids):
+            if node_id in matched_nodes:
+                edge_count = _count_structural_edges(db, node_id)
+                if edge_count <= ORPHAN_EDGE_THRESHOLD:
+                    orphan_nodes[node_id] = matched_nodes[node_id]
+
+        if orphan_nodes:
+            framework_refs = _find_framework_references(
+                db, orphan_nodes, seen_ids, macro_id,
+            )
+            framework_ref_count = 0
+            for node_id, node, reason in framework_refs:
+                if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
+                    break
+                if node_id in seen_ids:
+                    continue
+                doc = _node_to_document(node, is_initial=False, expanded_from=reason)
+                cost = _estimate_tokens(doc.page_content)
+                if cost > budget_remaining:
+                    continue
+                result_docs.append(doc)
+                seen_ids.add(node_id)
+                budget_remaining -= cost
+                framework_ref_count += 1
+
+            if framework_ref_count:
+                logger.info(
+                    "[CLUSTER_EXPANSION] Framework ref discovery: "
+                    "%d orphans → %d refs (budget remaining: %d)",
+                    len(orphan_nodes), framework_ref_count, budget_remaining,
+                )
 
     # ── Step 3: 1-hop expansion within cluster boundary ──────────
     #    When cluster_node_ids is provided, use it as the authoritative

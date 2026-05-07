@@ -34,6 +34,9 @@ from plugin_implementation.cluster_expansion import (
     expand_for_page,
     _resolve_symbols,
     _collect_expansion_neighbors,
+    _collect_search_terms,
+    _count_structural_edges,
+    _find_framework_references,
     _get_cluster_docs,
     _node_to_document,
     _estimate_tokens,
@@ -237,6 +240,157 @@ def _populate_test_graph(db: UnifiedWikiDB):
         )
 
     conn.commit()
+
+
+def _insert_framework_node(db: UnifiedWikiDB, node_id: str, **kwargs):
+    defaults = {
+        "rel_path": f"src/{node_id.replace('::', '_')}.py",
+        "file_name": f"{node_id}.py",
+        "language": "python",
+        "symbol_name": node_id,
+        "symbol_type": "class",
+        "start_line": 1,
+        "end_line": 5,
+        "source_text": f"class {node_id}:\n    pass",
+        "docstring": "",
+        "signature": "",
+        "is_architectural": 1,
+        "is_doc": 0,
+        "macro_cluster": 0,
+        "micro_cluster": 0,
+    }
+    defaults.update(kwargs)
+
+    cols = [
+        "node_id", "rel_path", "file_name", "language", "symbol_name",
+        "symbol_type", "start_line", "end_line", "source_text", "docstring",
+        "signature", "is_architectural", "is_doc", "macro_cluster", "micro_cluster",
+    ]
+    placeholders = ",".join("?" for _ in cols)
+    db.conn.execute(
+        f"INSERT INTO repo_nodes ({','.join(cols)}) VALUES ({placeholders})",
+        [node_id] + [defaults.get(col, "") for col in cols[1:]],
+    )
+
+
+def _insert_framework_edge(
+    db: UnifiedWikiDB,
+    source_id: str,
+    target_id: str,
+    rel_type: str = "calls",
+    edge_class: str = "structural",
+    weight: float = 1.0,
+):
+    db.conn.execute(
+        "INSERT INTO repo_edges (source_id, target_id, rel_type, edge_class, weight) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (source_id, target_id, rel_type, edge_class, weight),
+    )
+
+
+@pytest.fixture
+def framework_db(tmp_path):
+    """Graph modelled after framework string dispatch.
+
+    Cluster 0 has handler-like classes with child methods. Cluster 1 has
+    dispatcher/source nodes that mention those method names as strings.
+    """
+    _db = UnifiedWikiDB(tmp_path / "framework.wiki.db", embedding_dim=4)
+
+    _insert_framework_node(
+        _db,
+        "python::Event",
+        symbol_name="Event",
+        symbol_type="class",
+        macro_cluster=0,
+        source_text="class Event:\n    def configuration_created(self, ctx): pass",
+    )
+    _insert_framework_node(
+        _db,
+        "python::Event.configuration_created",
+        symbol_name="configuration_created",
+        symbol_type="method",
+        is_architectural=0,
+        macro_cluster=0,
+        source_text="def configuration_created(self, ctx): pass",
+    )
+    _insert_framework_edge(
+        _db,
+        "python::Event",
+        "python::Event.configuration_created",
+        rel_type="defines",
+    )
+
+    _insert_framework_node(
+        _db,
+        "python::AnotherHandler",
+        symbol_name="AnotherHandler",
+        symbol_type="class",
+        macro_cluster=0,
+        source_text="class AnotherHandler:\n    def handle_request(self, r): pass",
+    )
+    _insert_framework_node(
+        _db,
+        "python::AnotherHandler.handle_request",
+        symbol_name="handle_request",
+        symbol_type="method",
+        is_architectural=0,
+        macro_cluster=0,
+        source_text="def handle_request(self, r): pass",
+    )
+    _insert_framework_edge(
+        _db,
+        "python::AnotherHandler",
+        "python::AnotherHandler.handle_request",
+        rel_type="defines",
+    )
+
+    _insert_framework_node(
+        _db,
+        "python::get_tools_c0",
+        symbol_name="get_tools",
+        symbol_type="function",
+        macro_cluster=0,
+        source_text="def get_tools(): return []",
+    )
+
+    _insert_framework_node(
+        _db,
+        "python::create_configuration",
+        symbol_name="create_configuration",
+        symbol_type="function",
+        macro_cluster=1,
+        source_text="def create_configuration(ctx):\n    emit('configuration_created', data)",
+    )
+    _insert_framework_node(
+        _db,
+        "python::dispatch_util",
+        symbol_name="dispatch_util",
+        symbol_type="function",
+        macro_cluster=1,
+        source_text="def dispatch_util(r):\n    manager.handle_request(r)",
+    )
+    _insert_framework_node(
+        _db,
+        "python::get_tools_c1",
+        symbol_name="get_tools",
+        symbol_type="function",
+        macro_cluster=1,
+        source_text="def get_tools(): return toolkit.get_tools()",
+    )
+    _insert_framework_node(
+        _db,
+        "python::some_helper",
+        symbol_name="some_helper",
+        symbol_type="function",
+        macro_cluster=1,
+        source_text="def some_helper(): return 42",
+    )
+
+    _db._populate_fts5()
+    _db.conn.commit()
+    yield _db
+    _db.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -580,6 +734,124 @@ class TestExpandForPage:
         names = [d.metadata["symbol_name"] for d in expanded]
         if "authenticate" in names and "TokenValidator" in names:
             assert names.index("authenticate") < names.index("TokenValidator")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests: framework reference discovery (Step 2.75)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCountStructuralEdges:
+    def test_structural_edges_are_counted(self, framework_db):
+        count = _count_structural_edges(framework_db, "python::Event")
+        assert count == 1
+
+    def test_bridge_edges_are_ignored(self, framework_db):
+        _insert_framework_edge(
+            framework_db,
+            "python::Event",
+            "python::some_helper",
+            rel_type="references",
+            edge_class="bridge",
+        )
+        framework_db.conn.commit()
+
+        assert _count_structural_edges(framework_db, "python::Event") == 1
+
+    def test_leaf_without_edges_is_orphan(self, framework_db):
+        assert _count_structural_edges(framework_db, "python::some_helper") == 0
+
+
+class TestCollectSearchTerms:
+    def test_class_collects_child_method_names(self, framework_db):
+        node = framework_db.get_node("python::Event")
+        terms = _collect_search_terms(framework_db, "python::Event", node)
+
+        assert "Event" in terms
+        assert "configuration_created" in terms
+
+    def test_function_returns_only_own_name(self, framework_db):
+        node = framework_db.get_node("python::get_tools_c0")
+        terms = _collect_search_terms(framework_db, "python::get_tools_c0", node)
+
+        assert terms == ["get_tools"]
+
+    def test_short_name_is_excluded(self, framework_db):
+        terms = _collect_search_terms(
+            framework_db,
+            "python::ab",
+            {"symbol_name": "ab", "symbol_type": "function"},
+        )
+
+        assert terms == []
+
+
+class TestFindFrameworkReferences:
+    def test_finds_cross_cluster_dispatcher_via_child_method(self, framework_db):
+        orphan_node = framework_db.get_node("python::Event")
+        results = _find_framework_references(
+            framework_db,
+            {"python::Event": orphan_node},
+            seen_ids=set(),
+            macro_id=0,
+        )
+
+        hit_ids = {node_id for node_id, _, _ in results}
+        assert "python::create_configuration" in hit_ids
+
+    def test_filters_same_name_peer_definitions(self, framework_db):
+        orphan_node = framework_db.get_node("python::get_tools_c0")
+        results = _find_framework_references(
+            framework_db,
+            {"python::get_tools_c0": orphan_node},
+            seen_ids=set(),
+            macro_id=0,
+        )
+
+        hit_ids = {node_id for node_id, _, _ in results}
+        assert "python::get_tools_c1" not in hit_ids
+
+    def test_skips_other_orphans(self, framework_db):
+        results = _find_framework_references(
+            framework_db,
+            {
+                "python::Event": framework_db.get_node("python::Event"),
+                "python::AnotherHandler": framework_db.get_node("python::AnotherHandler"),
+            },
+            seen_ids=set(),
+            macro_id=0,
+        )
+
+        hit_ids = {node_id for node_id, _, _ in results}
+        assert "python::Event" not in hit_ids
+        assert "python::AnotherHandler" not in hit_ids
+
+    def test_expanded_from_reason_is_descriptive(self, framework_db):
+        orphan_node = framework_db.get_node("python::AnotherHandler")
+        results = _find_framework_references(
+            framework_db,
+            {"python::AnotherHandler": orphan_node},
+            seen_ids=set(),
+            macro_id=0,
+        )
+
+        assert any(reason.startswith("fts_framework_ref:") for _, _, reason in results)
+
+
+class TestFrameworkReferenceExpansion:
+    def test_expand_for_page_includes_framework_string_refs(self, framework_db):
+        docs = expand_for_page(
+            db=framework_db,
+            page_symbols=["Event"],
+            macro_id=0,
+            token_budget=50_000,
+        )
+
+        by_name = {doc.metadata["symbol_name"]: doc for doc in docs}
+        assert "Event" in by_name
+        assert "create_configuration" in by_name
+        assert by_name["create_configuration"].metadata["expanded_from"].startswith(
+            "fts_framework_ref:"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
