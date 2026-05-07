@@ -4,13 +4,9 @@ Phase 4 — Cluster-Based Structure Planner
 Converts pre-computed math clusters (Phases 1-3) into a full
 ``WikiStructureSpec`` with cheap LLM naming calls.
 
-**Two-pass naming** eliminates "centroid bleed" — where macro-cluster
-dominant symbols would shadow per-page content:
-
-- **Pass 1** (section naming): one LLM call per macro-cluster using
-  macro-level dominant symbols → section name + description.
-- **Pass 2** (page naming): one LLM call per micro-cluster using
-  *only that page's own* enriched symbols → page name + description.
+**Batched naming** eliminates "centroid bleed" by naming pages from their
+own symbols and deriving each section name from those page names in the same
+LLM call. The legacy two-pass section/page naming flow remains as fallback.
 
 Activation::
 
@@ -145,6 +141,105 @@ CLUSTER_NAMING_SYSTEM = SECTION_NAMING_SYSTEM
 CLUSTER_NAMING_USER = SECTION_NAMING_USER
 
 
+# ── Pages-first ordering (DEEPWIKI_NAMING_ORDER=pages_first) ────────
+# Used by the legacy multi-call fallback when section naming should be
+# derived from named pages instead of macro centroid symbols.
+
+SECTION_FROM_PAGES_SYSTEM = """\
+You are a documentation architect.  You are given the page titles and one-\
+sentence descriptions that belong to a section of a wiki.  Your job is to \
+produce a single short, user-facing **capability name** and a one-sentence \
+description that summarises ALL the listed pages.
+
+Rules:
+- Name the CAPABILITY or DOMAIN that ties the pages together — not the most \
+prominent class or file name.
+- Use plain language a non-developer stakeholder can understand.
+- Good: "Authentication & Session Management", "Pipeline Execution"
+- Bad: "AuthService and friends", "src/auth/*"
+- The name must be ≤ 8 words."""
+
+SECTION_FROM_PAGES_USER = """\
+SECTION (derived from {page_count} named pages, {node_count} symbols total)
+
+PAGES IN THIS SECTION:
+{pages_json}
+
+Output ONLY valid JSON (no markdown fences):
+{{
+    "section_name": "...",
+    "section_description": "..."
+}}"""
+
+
+# ── Batched per-macro naming (DEEPWIKI_NAMING_BATCHED=1) ────────────
+# Single LLM call returning the section name and every page name for one
+# macro-cluster.  This is the wikis flow: page titles are produced from
+# per-page symbols, and the section title is derived from those pages rather
+# than from the macro centroid.
+
+BATCHED_NAMING_SYSTEM = """\
+You are a documentation architect writing a wiki for a mixed audience: \
+product managers, team leads, and engineers.
+
+You are given a SECTION composed of several PAGES.  Each page is a small \
+group of related code symbols.  Your job, in ONE response, is to:
+    1. Name every page based ONLY on that page's own symbols.
+    2. Name the section based on the pages it contains (NOT individual \
+symbols).
+
+Rules for names:
+- Use plain language a non-developer stakeholder can understand.
+- Name the CAPABILITY or DOMAIN, not class names or file paths.
+- Page name ≤ 10 words.  Section name ≤ 8 words.
+- Good page: "Record Batch Decoding & Output Routing"
+- Bad page: "disk_space_manager and storage.h"
+- Good section: "Authentication & Session Management"
+- Bad section: "AuthService and friends"
+
+Output strictly valid JSON, no markdown fences, no extra prose."""
+
+BATCHED_NAMING_USER = """\
+SECTION CLUSTER — {node_count} symbols across {file_count} files
+
+PAGES IN THIS SECTION:
+{pages_json}
+
+Output ONLY valid JSON in this exact shape (no markdown fences):
+{{
+    "section_name": "...",
+    "section_description": "...",
+    "pages": [
+        {{
+            "page_id": <integer matching the input page_id>,
+            "page_name": "...",
+            "description": "...",
+            "retrieval_query": "..."
+        }}
+        /* one entry per input page, in the same order */
+    ]
+}}"""
+
+
+def _env_value(primary: str, fallback: str, default: str) -> str:
+    """Read a DeepWiki env var with optional wikis-compatible fallback."""
+    for name in (primary, fallback):
+        value = os.environ.get(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _env_bool(primary: str, fallback: str, default: bool) -> bool:
+    """Read a boolean env var using common true/false spellings."""
+    raw = _env_value(primary, fallback, "1" if default else "0").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Planner
 # ═══════════════════════════════════════════════════════════════════════════
@@ -167,9 +262,14 @@ class ClusterStructurePlanner:
         db: UnifiedWikiDB,
         llm: BaseLanguageModel,
         wiki_title: Optional[str] = None,
+        llm_low: Optional[BaseLanguageModel] = None,
     ):
         self.db = db
         self.llm = llm
+        # Naming is a compact, low-cognition task.  Keep accepting the
+        # original ``llm`` argument, but let callers pass a cheaper/faster
+        # model explicitly when available.
+        self.llm_low = llm_low or llm
         self.wiki_title = wiki_title or self._derive_wiki_title()
         self._cluster_graph: Optional[nx.MultiDiGraph] = None
         self._central_k: Optional[int] = None
@@ -419,61 +519,103 @@ class ClusterStructurePlanner:
         micro_map: Dict[int, List[str]],
         section_order: int,
     ) -> SectionSpec:
-        """Two-pass naming: section name first, then each page independently.
+        """Name one macro-cluster and assemble its pages.
 
-        Pass 1 — Section naming: one LLM call with macro-cluster dominant
-        symbols to produce section_name + section_description.
-
-        Pass 2 — Page naming: one LLM call **per micro-cluster** using
-        only that micro-cluster's own enriched symbols (with signatures
-        and docstrings).  This eliminates the "centroid bleed" problem
-        where macro-level dominant symbols would shadow page-level content.
+        The preferred path mirrors wikis: one LLM call per macro-cluster
+        names every page from its own symbols and then names the section from
+        the resulting pages.  If the batched response is malformed, fall back
+        to the older multi-call path.
         """
 
         all_node_ids = set()
         for nids in micro_map.values():
             all_node_ids.update(nids)
 
+        # Batch-fetch every node touched by this macro cluster up front.
+        # Missing helper support is harmless; the local fallback still uses
+        # ``get_node`` just like the previous implementation.
+        node_index: Dict[str, Dict[str, Any]] = {}
+        try:
+            batched = self.db.get_nodes_by_ids(list(all_node_ids))
+            for node in batched:
+                node_id = node.get("node_id")
+                if node_id:
+                    node_index[node_id] = node
+        except Exception:  # pragma: no cover - defensive compatibility path
+            node_index = {}
+
+        def _rel_path(node_id: str) -> str:
+            node = node_index.get(node_id)
+            if node is not None:
+                return node.get("rel_path", "") or ""
+            fallback_node = self.db.get_node(node_id) or {}
+            return fallback_node.get("rel_path", "") or ""
+
         file_count = len({
-            (self.db.get_node(nid) or {}).get("rel_path", "")
+            _rel_path(nid)
             for nid in list(all_node_ids)[:200]
         } - {""})
 
-        # ── Pass 1: Section naming ──────────────────────────────────
-        dominant = self._get_dominant_symbols(macro_id)
-        micro_summaries = self._get_micro_summaries(micro_map)
+        if _env_bool("DEEPWIKI_NAMING_BATCHED", "WIKI_NAMING_BATCHED", True):
+            batched = self._batched_macro_naming(
+                macro_id=macro_id,
+                micro_map=micro_map,
+                node_count=len(all_node_ids),
+                file_count=file_count,
+            )
+            if batched is not None:
+                section_name, section_desc, page_naming_by_micro = batched
+                return self._assemble_section(
+                    macro_id=macro_id,
+                    micro_map=micro_map,
+                    section_order=section_order,
+                    section_name=section_name,
+                    section_desc=section_desc,
+                    page_naming_by_micro=page_naming_by_micro,
+                    all_node_ids=all_node_ids,
+                    batched=True,
+                )
 
-        section_prompt = SECTION_NAMING_USER.format(
-            node_count=len(all_node_ids),
-            file_count=file_count,
-            dominant_symbols_json=json.dumps(dominant, indent=2),
-            micro_summaries_json=json.dumps(micro_summaries, indent=2),
-        )
+        naming_order = _env_value(
+            "DEEPWIKI_NAMING_ORDER",
+            "WIKI_NAMING_ORDER",
+            "pages_first",
+        ).lower()
+        pages_first = naming_order == "pages_first"
 
-        section_response = self.llm.invoke([
-            SystemMessage(content=SECTION_NAMING_SYSTEM),
-            HumanMessage(content=section_prompt),
-        ])
-        section_naming = _parse_json_response(_extract_text(section_response))
-        section_name = section_naming.get("section_name") or f"Section {macro_id}"
-        section_desc = (
-            section_naming.get("section_description")
-            or f"Section covering {len(all_node_ids)} symbols"
-        )
+        if pages_first:
+            section_name = f"Section {macro_id}"
+            section_desc = f"Section covering {len(all_node_ids)} symbols"
+        else:
+            dominant = self._get_dominant_symbols(macro_id)
+            micro_summaries = self._get_micro_summaries(micro_map)
 
-        # ── Pass 2: Page naming (one call per micro-cluster) ────────
-        pages: List[PageSpec] = []
-        page_order = 1
+            section_prompt = SECTION_NAMING_USER.format(
+                node_count=len(all_node_ids),
+                file_count=file_count,
+                dominant_symbols_json=json.dumps(dominant, indent=2),
+                micro_summaries_json=json.dumps(micro_summaries, indent=2),
+            )
 
-        for micro_id in sorted(micro_map.keys()):
+            section_response = self.llm.invoke([
+                SystemMessage(content=SECTION_NAMING_SYSTEM),
+                HumanMessage(content=section_prompt),
+            ])
+            section_naming = _parse_json_response(_extract_text(section_response))
+            section_name = section_naming.get("section_name") or f"Section {macro_id}"
+            section_desc = (
+                section_naming.get("section_description")
+                or f"Section covering {len(all_node_ids)} symbols"
+            )
+
+        ordered_micros = sorted(micro_map.keys())
+        prompts: Dict[int, Tuple[List[str], str]] = {}
+        for micro_id in ordered_micros:
             node_ids = micro_map[micro_id]
-
-            # Build enriched page-level symbols (with signatures + docstrings)
             page_symbols = self._get_page_symbols(node_ids)
             page_dirs = self._node_ids_to_folders(node_ids)
             page_file_count = len(set(
-                (self.db.get_node(nid) or {}).get("rel_path", "")
-                for nid in node_ids[:100]
+                _rel_path(nid) for nid in node_ids[:100]
             ) - {""})
 
             page_prompt = PAGE_NAMING_USER.format(
@@ -483,20 +625,172 @@ class ClusterStructurePlanner:
                 page_symbols_json=json.dumps(page_symbols, indent=2),
                 directories_json=json.dumps(page_dirs),
             )
+            prompts[micro_id] = (node_ids, page_prompt)
 
+        def _invoke_page_naming(micro_id: int) -> Tuple[int, Dict[str, Any]]:
+            _, page_prompt = prompts[micro_id]
             try:
-                page_response = self.llm.invoke([
+                response = self.llm.invoke([
                     SystemMessage(content=PAGE_NAMING_SYSTEM),
                     HumanMessage(content=page_prompt),
                 ])
-                page_naming = _parse_json_response(_extract_text(page_response))
+                parsed = _parse_json_response(_extract_text(response))
             except Exception as exc:
                 logger.warning(
                     "Page naming failed for macro %d micro %d: %s",
                     macro_id, micro_id, exc,
                 )
-                page_naming = {}
+                parsed = {}
+            return micro_id, parsed
 
+        page_naming_by_micro: Dict[int, Dict[str, Any]] = {}
+        for micro_id in ordered_micros:
+            parsed_micro_id, parsed = _invoke_page_naming(micro_id)
+            page_naming_by_micro[parsed_micro_id] = parsed
+
+        if pages_first:
+            pages_payload = []
+            for micro_id in ordered_micros:
+                page_naming = page_naming_by_micro.get(micro_id) or {}
+                node_ids = prompts[micro_id][0]
+                pages_payload.append({
+                    "page_name": page_naming.get("page_name") or f"Page {micro_id}",
+                    "description": page_naming.get("description")
+                    or f"Page covering {len(node_ids)} symbols",
+                })
+            try:
+                from_pages_prompt = SECTION_FROM_PAGES_USER.format(
+                    page_count=len(pages_payload),
+                    node_count=len(all_node_ids),
+                    pages_json=json.dumps(pages_payload, indent=2),
+                )
+                section_response = self.llm.invoke([
+                    SystemMessage(content=SECTION_FROM_PAGES_SYSTEM),
+                    HumanMessage(content=from_pages_prompt),
+                ])
+                section_naming = _parse_json_response(_extract_text(section_response))
+                section_name = section_naming.get("section_name") or section_name
+                section_desc = section_naming.get("section_description") or section_desc
+            except Exception as exc:
+                logger.warning(
+                    "Section-from-pages naming failed for macro %d: %s",
+                    macro_id, exc,
+                )
+
+            if (
+                section_name == f"Section {macro_id}"
+                and not any(page_naming_by_micro.values())
+            ):
+                raise RuntimeError(
+                    f"All naming calls failed for macro {macro_id}"
+                )
+
+        return self._assemble_section(
+            macro_id=macro_id,
+            micro_map=micro_map,
+            section_order=section_order,
+            section_name=section_name,
+            section_desc=section_desc,
+            page_naming_by_micro=page_naming_by_micro,
+            all_node_ids=all_node_ids,
+            batched=False,
+        )
+
+    # ── Batched single-call naming ───────────────────────────────────
+
+    def _batched_macro_naming(
+        self,
+        macro_id: int,
+        micro_map: Dict[int, List[str]],
+        node_count: int,
+        file_count: int,
+    ) -> Optional[Tuple[str, str, Dict[int, Dict[str, Any]]]]:
+        """Return section/page names from one LLM response for a macro cluster."""
+        ordered_micros = sorted(micro_map.keys())
+        pages_payload: List[Dict[str, Any]] = []
+        for micro_id in ordered_micros:
+            node_ids = micro_map[micro_id]
+            pages_payload.append({
+                "page_id": micro_id,
+                "symbol_count": len(node_ids),
+                "page_symbols": self._get_page_symbols(node_ids),
+            })
+
+        prompt = BATCHED_NAMING_USER.format(
+            node_count=node_count,
+            file_count=file_count,
+            pages_json=json.dumps(pages_payload, indent=2),
+        )
+
+        try:
+            response = self.llm_low.invoke([
+                SystemMessage(content=BATCHED_NAMING_SYSTEM),
+                HumanMessage(content=prompt),
+            ])
+            parsed = _parse_json_response(_extract_text(response))
+        except Exception as exc:
+            logger.warning(
+                "Batched naming failed for macro %d: %s; falling back to multi-call naming",
+                macro_id, exc,
+            )
+            return None
+
+        section_name = parsed.get("section_name")
+        section_desc = parsed.get("section_description")
+        raw_pages = parsed.get("pages") or []
+        if not section_name or not isinstance(raw_pages, list):
+            logger.warning(
+                "Batched naming response malformed for macro %d; falling back to multi-call naming",
+                macro_id,
+            )
+            return None
+
+        page_naming_by_micro: Dict[int, Dict[str, Any]] = {}
+        for entry in raw_pages:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                page_id = int(entry.get("page_id"))
+            except (TypeError, ValueError):
+                continue
+            page_naming_by_micro[page_id] = {
+                "page_name": entry.get("page_name"),
+                "description": entry.get("description"),
+                "retrieval_query": entry.get("retrieval_query"),
+            }
+
+        missing = [micro_id for micro_id in ordered_micros if micro_id not in page_naming_by_micro]
+        if missing:
+            logger.warning(
+                "Batched naming missing %d/%d pages for macro %d; falling back to multi-call naming",
+                len(missing), len(ordered_micros), macro_id,
+            )
+            return None
+
+        return (
+            section_name,
+            section_desc or f"Section covering {node_count} symbols",
+            page_naming_by_micro,
+        )
+
+    def _assemble_section(
+        self,
+        macro_id: int,
+        micro_map: Dict[int, List[str]],
+        section_order: int,
+        section_name: str,
+        section_desc: str,
+        page_naming_by_micro: Dict[int, Dict[str, Any]],
+        all_node_ids: set,
+        batched: bool,
+    ) -> SectionSpec:
+        """Build a SectionSpec from section and page naming results."""
+        pages: List[PageSpec] = []
+        page_order = 1
+
+        for micro_id in sorted(micro_map.keys()):
+            node_ids = micro_map[micro_id]
+            page_naming = page_naming_by_micro.get(micro_id) or {}
             page_name = (
                 page_naming.get("page_name")
                 or f"{section_name} — Page {micro_id}"
@@ -505,12 +799,8 @@ class ClusterStructurePlanner:
                 page_naming.get("description")
                 or f"Page covering {len(node_ids)} symbols"
             )
-            retrieval_query = (
-                page_naming.get("retrieval_query")
-                or page_name
-            )
+            retrieval_query = page_naming.get("retrieval_query") or page_name
 
-            # Select central symbols via PageRank (Phase 7F)
             central_ids = self._select_central_node_ids(
                 node_ids, k=self._adaptive_central_k(),
             )
@@ -539,11 +829,15 @@ class ClusterStructurePlanner:
             ))
             page_order += 1
 
+        rationale_suffix = " (batched naming)" if batched else ""
         return SectionSpec(
             section_name=section_name,
             section_order=section_order,
             description=section_desc,
-            rationale=f"Mathematical clustering: macro={macro_id}, {len(micro_map)} pages, {len(all_node_ids)} symbols",
+            rationale=(
+                f"Mathematical clustering: macro={macro_id}, {len(micro_map)} pages, "
+                f"{len(all_node_ids)} symbols{rationale_suffix}"
+            ),
             pages=pages,
         )
 

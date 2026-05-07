@@ -131,28 +131,34 @@ def _build_two_community_db(tmp_dir: str):
 
 
 def _mock_llm_response(section_name="Authentication", pages=None):
-    """Create a mock LLM that handles two-pass naming.
+    """Create a mock LLM that handles batched and two-pass naming.
 
-    The first call returns section naming; subsequent calls return page naming.
+    Batched naming returns section + all pages in one response. Legacy two-pass
+    naming returns section naming first and then one page per call.
     If ``pages`` is given, each entry is returned for successive page-naming calls.
     """
     if pages is None:
         pages = [{"page_name": "Auth Core", "description": "Core auth", "retrieval_query": "auth core"}]
 
-    call_count = [0]
+    section_calls = [0]
+    page_calls = [0]
 
     def mock_invoke(messages, **kwargs):
-        call_count[0] += 1
+        system_content = messages[0].content.lower()
         resp = MagicMock()
-        if call_count[0] == 1:
-            # Pass 1: section naming
+
+        if "one response" in system_content and "name every page" in system_content:
             resp.content = json.dumps({
                 "section_name": section_name,
                 "section_description": f"{section_name} module",
+                "pages": [
+                    {"page_id": idx, **page}
+                    for idx, page in enumerate(pages)
+                ],
             })
-        else:
-            # Pass 2: page naming (call_count-2 = page index)
-            page_idx = call_count[0] - 2
+        elif "page titles" in system_content:
+            page_idx = page_calls[0]
+            page_calls[0] += 1
             if page_idx < len(pages):
                 resp.content = json.dumps(pages[page_idx])
             else:
@@ -161,6 +167,12 @@ def _mock_llm_response(section_name="Authentication", pages=None):
                     "description": "Auto-generated",
                     "retrieval_query": "auto",
                 })
+        else:
+            section_calls[0] += 1
+            resp.content = json.dumps({
+                "section_name": section_name,
+                "section_description": f"{section_name} module",
+            })
         return resp
 
     mock = MagicMock()
@@ -348,7 +360,12 @@ class TestClusterNaming(unittest.TestCase):
 
             mock_llm = _mock_llm_response()
             planner = ClusterStructurePlanner(db, mock_llm)
-            planner._name_macro_cluster(0, {0: ["n0"]}, section_order=1)
+
+            with patch.dict(os.environ, {
+                "DEEPWIKI_NAMING_BATCHED": "0",
+                "DEEPWIKI_NAMING_ORDER": "sections_first",
+            }):
+                planner._name_macro_cluster(0, {0: ["n0"]}, section_order=1)
 
             # 1 micro-cluster → 1 section call + 1 page call = 2 total
             self.assertEqual(mock_llm.invoke.call_count, 2)
@@ -391,7 +408,12 @@ class TestClusterNaming(unittest.TestCase):
                 0: [f"auth_{i}" for i in range(3)],
                 1: [f"data_{i}" for i in range(3)],
             }
-            section = planner._name_macro_cluster(0, micro_map, section_order=1)
+
+            with patch.dict(os.environ, {
+                "DEEPWIKI_NAMING_BATCHED": "0",
+                "DEEPWIKI_NAMING_ORDER": "sections_first",
+            }):
+                section = planner._name_macro_cluster(0, micro_map, section_order=1)
 
             # 1 section call + 2 page calls = 3 total
             self.assertEqual(mock_llm.invoke.call_count, 3)
@@ -405,6 +427,51 @@ class TestClusterNaming(unittest.TestCase):
             page1_msg = mock_llm.invoke.call_args_list[2][0][0][1].content
             self.assertIn("DataHandler", page1_msg)
             self.assertNotIn("AuthClass", page1_msg)
+
+    def test_batched_naming_uses_one_call_per_macro(self):
+        """Batched naming returns section + page names in one LLM call."""
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = [
+                _make_node_dict(f"auth_{i}", symbol_name=f"AuthClass{i}", rel_path=f"src/auth/{i}.py")
+                for i in range(3)
+            ] + [
+                _make_node_dict(f"data_{i}", symbol_name=f"DataHandler{i}", rel_path=f"src/data/{i}.py")
+                for i in range(3)
+            ]
+            db = _make_db(tmp, nodes=nodes)
+            for i in range(3):
+                db.set_cluster(f"auth_{i}", macro=0, micro=0)
+                db.set_cluster(f"data_{i}", macro=0, micro=1)
+            db.conn.commit()
+
+            mock_llm = _mock_llm_response(
+                section_name="Access & Data Handling",
+                pages=[
+                    {"page_name": "Authentication", "description": "Auth", "retrieval_query": "auth"},
+                    {"page_name": "Data Handling", "description": "Data", "retrieval_query": "data"},
+                ],
+            )
+            planner = ClusterStructurePlanner(db, mock_llm)
+
+            with patch.dict(os.environ, {"DEEPWIKI_NAMING_BATCHED": "1"}):
+                section = planner._name_macro_cluster(
+                    0,
+                    {
+                        0: [f"auth_{i}" for i in range(3)],
+                        1: [f"data_{i}" for i in range(3)],
+                    },
+                    section_order=1,
+                )
+
+            self.assertEqual(mock_llm.invoke.call_count, 1)
+            self.assertEqual(section.section_name, "Access & Data Handling")
+            self.assertIn("batched naming", section.rationale)
+            self.assertEqual([page.page_name for page in section.pages], ["Authentication", "Data Handling"])
+
+            prompt = mock_llm.invoke.call_args_list[0][0][0][1].content
+            self.assertIn("AuthClass", prompt)
+            self.assertIn("DataHandler", prompt)
+            self.assertNotIn("TOP SYMBOLS", prompt)
 
     def test_multiple_micro_clusters(self):
         with tempfile.TemporaryDirectory() as tmp:
