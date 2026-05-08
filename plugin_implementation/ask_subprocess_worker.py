@@ -189,7 +189,6 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     from .vectorstore import VectorStoreManager
     from .retrievers import WikiRetrieverStack
     from .repository_analysis_store import RepositoryAnalysisStore
-    from .graph_manager import GraphManager
     from .ask_engine import create_ask_engine
 
     logger = logging.getLogger(__name__)
@@ -282,7 +281,12 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Resolve canonical repo identifier
         canonical_repo_identifier = repo_identifier
         try:
-            from .repo_resolution import cache_index_has_repo, resolve_canonical_repo_identifier, load_cache_index
+            from .repo_resolution import (
+                cache_index_has_repo,
+                load_cache_index,
+                resolve_canonical_repo_identifier,
+                resolve_unified_db_path,
+            )
 
             if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
                 override_candidate = repo_identifier_override.strip()
@@ -314,18 +318,18 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         _unified_retriever_enabled = True
         _unified_retriever_active = False
         retriever_stack = None
+        query_service = None
 
         if _unified_retriever_enabled:
             try:
-                import glob as _glob
                 from .unified_retriever import UnifiedRetriever
                 from .unified_db import UnifiedWikiDB
+                from .code_graph.storage_query_service import StorageQueryService
 
-                _udb_path = None
-                _all_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
-                if _all_dbs:
-                    _all_dbs.sort(key=os.path.getmtime, reverse=True)
-                    _udb_path = _all_dbs[0]
+                _udb_path = resolve_unified_db_path(
+                    canonical_repo_id=canonical_repo_identifier,
+                    cache_dir=cache_dir,
+                )
 
                 if _udb_path and os.path.isfile(_udb_path):
                     _udb = UnifiedWikiDB(_udb_path, readonly=True)
@@ -337,10 +341,17 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                         embedding_fn=_embed_fn,
                         embeddings=embeddings,
                     )
+                    query_service = StorageQueryService(_udb)
                     _unified_retriever_active = True
-                    _print(f"[UNIFIED_RETRIEVER] Agentic Ask using UnifiedRetriever from {_udb_path}")
+                    _print(
+                        "[UNIFIED_RETRIEVER] Agentic Ask using UnifiedRetriever "
+                        f"for {canonical_repo_identifier} from {_udb_path}"
+                    )
                 else:
-                    _print("[UNIFIED_RETRIEVER] No .wiki.db found — falling back to legacy retriever")
+                    _print(
+                        "[UNIFIED_RETRIEVER] No .wiki.db found for "
+                        f"{canonical_repo_identifier} — falling back to legacy retriever"
+                    )
             except Exception as _ur_exc:
                 _print(f"[UNIFIED_RETRIEVER] Upgrade failed, using legacy: {_ur_exc}")
 
@@ -364,24 +375,14 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _print("[UNIFIED_RETRIEVER] Skipping legacy FAISS vectorstore loading")
 
-        # Load relationship graph (always try — progressive tools benefit from it)
-        _print("Loading relationship graph...")
-        graph_manager = GraphManager(cache_dir=cache_dir)
-        relationship_graph = graph_manager.load_graph_by_repo_name(canonical_repo_identifier)
-        if relationship_graph:
-            _print(f"Relationship graph loaded: {relationship_graph.number_of_nodes()} nodes")
+        graph_manager = None
+        relationship_graph = None
+        if _unified_retriever_active:
+            _print("[UNIFIED_RETRIEVER] Using UnifiedWikiDB query service; skipping legacy relationship graph loading")
         else:
-            _print("No relationship graph found — proceeding without graph analysis")
+            _print("Unified DB not active — proceeding without graph analysis")
 
-        # Load FTS5 index (always try — progressive tools benefit from it)
-        try:
-            fts_result = graph_manager.load_fts_index_by_repo_name(canonical_repo_identifier)
-            if fts_result is not None:
-                _print("FTS5 index loaded")
-            else:
-                _print("FTS5 index not found — search_symbols will be limited")
-        except Exception as e:
-            _print(f"FTS5 index not available: {e}")
+        # Unified DB has its own FTS5 table; no legacy graph text index is loaded.
 
         # Load repository analysis
         _print("Loading repository analysis...")
@@ -425,7 +426,8 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
             repo_analysis=repo_analysis_dict,
             llm_client=llm,
             llm_settings=llm_settings,
-            enable_graph_analysis=relationship_graph is not None,
+            query_service=query_service,
+            enable_graph_analysis=query_service is not None or relationship_graph is not None,
         )
 
         # Run agentic Ask and collect events
@@ -587,7 +589,12 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Resolve canonical commit-scoped identifier where possible (or use override).
     canonical_repo_identifier = repo_identifier
     try:
-        from .repo_resolution import cache_index_has_repo, load_cache_index, resolve_canonical_repo_identifier
+        from .repo_resolution import (
+            cache_index_has_repo,
+            load_cache_index,
+            resolve_canonical_repo_identifier,
+            resolve_unified_db_path,
+        )
 
         if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
             # Validate override exists in cache before using it
@@ -610,8 +617,8 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
             idx = load_cache_index(cache_dir)
             faiss_key = idx.get(canonical_repo_identifier)
-            graphs_idx = idx.get('graphs', {}) if isinstance(idx.get('graphs', {}), dict) else {}
-            graph_key = graphs_idx.get(f"{canonical_repo_identifier}:combined")
+            unified_idx = idx.get('unified_db', {}) if isinstance(idx.get('unified_db', {}), dict) else {}
+            unified_key = unified_idx.get(canonical_repo_identifier)
 
             if isinstance(faiss_key, str):
                 _print(
@@ -621,13 +628,13 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 _print(f"[cache] faiss_key not found for repo_id={canonical_repo_identifier}")
 
-            if isinstance(graph_key, str):
+            if isinstance(unified_key, str):
                 _print(
-                    f"[cache] graph_key={graph_key} file={graph_key}.code_graph.gz "
-                    f"repo_id={canonical_repo_identifier}:combined"
+                    f"[cache] unified_db_key={unified_key} file={unified_key}.wiki.db "
+                    f"repo_id={canonical_repo_identifier}"
                 )
             else:
-                _print(f"[cache] graph_key not found for repo_id={canonical_repo_identifier}:combined")
+                _print(f"[cache] unified_db_key not found for repo_id={canonical_repo_identifier}")
         except Exception:
             pass
     except ValueError as e:
@@ -669,15 +676,8 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
         
         _print(f"Vector store loaded with {vectorstore.index.ntotal} vectors")
         
-        # Load relationship graph for enhanced retrieval
-        _print("Loading relationship graph...")
-        from .graph_manager import GraphManager
-        graph_manager = GraphManager(cache_dir=cache_dir)
-        relationship_graph = graph_manager.load_graph_by_repo_name(canonical_repo_identifier)
-        if relationship_graph:
-            _print(f"Relationship graph loaded: {relationship_graph.number_of_nodes()} nodes, {relationship_graph.number_of_edges()} edges")
-        else:
-            _print("No relationship graph found - proceeding without graph-based retrieval")
+        relationship_graph = None
+        _print("Proceeding without legacy relationship graph loading")
         
         # Load repository analysis (FULL, not truncated) for query optimization
         _print("Loading repository analysis...")
@@ -718,22 +718,13 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
         retriever_stack = None
         if _unified_retriever_enabled:
             try:
-                import glob as _glob
                 from .unified_retriever import UnifiedRetriever
                 from .unified_db import UnifiedWikiDB
 
-                # Locate .wiki.db
-                _udb_path = None
-                _commit = getattr(graph_manager, '_last_commit_hash', None) or ''
-                if _commit:
-                    _matches = _glob.glob(os.path.join(cache_dir, f"*_{_commit[:8]}.wiki.db"))
-                    if _matches:
-                        _udb_path = _matches[0]
-                if not _udb_path:
-                    _all_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
-                    if _all_dbs:
-                        _all_dbs.sort(key=os.path.getmtime, reverse=True)
-                        _udb_path = _all_dbs[0]
+                _udb_path = resolve_unified_db_path(
+                    canonical_repo_id=canonical_repo_identifier,
+                    cache_dir=cache_dir,
+                )
 
                 if _udb_path and os.path.isfile(_udb_path):
                     _udb = UnifiedWikiDB(_udb_path, readonly=True)
@@ -745,9 +736,15 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
                         embedding_fn=_embed_fn,
                         embeddings=embeddings,
                     )
-                    _print(f"[UNIFIED_RETRIEVER] Ask using UnifiedRetriever from {_udb_path}")
+                    _print(
+                        "[UNIFIED_RETRIEVER] Ask using UnifiedRetriever "
+                        f"for {canonical_repo_identifier} from {_udb_path}"
+                    )
                 else:
-                    _print("[UNIFIED_RETRIEVER] No .wiki.db found — falling back to legacy retriever")
+                    _print(
+                        "[UNIFIED_RETRIEVER] No .wiki.db found for "
+                        f"{canonical_repo_identifier} — falling back to legacy retriever"
+                    )
             except Exception as _ur_exc:
                 _print(f"[UNIFIED_RETRIEVER] Upgrade failed, using legacy: {_ur_exc}")
 

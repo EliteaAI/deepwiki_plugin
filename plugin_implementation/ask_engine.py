@@ -75,6 +75,7 @@ class AskEngine:
         llm_client: Optional[BaseChatModel] = None,
         backend: Optional[object] = None,
         llm_settings: Optional[Dict] = None,
+        query_service: Any = None,
         config: Optional[AskConfig] = None,
     ):
         """
@@ -97,6 +98,7 @@ class AskEngine:
         self.llm_client = llm_client
         self.backend = backend
         self.llm_settings = llm_settings or {}
+        self.query_service = query_service
         self.config = config or AskConfig()
 
         # Session state
@@ -159,6 +161,7 @@ class AskEngine:
                 repo_analysis=self.repo_analysis,
                 event_callback=None,  # Events come from LangGraph stream
                 graph_text_index=fts_index,
+                query_service=self.query_service,
             )
         finally:
             # Restore original env
@@ -416,6 +419,7 @@ def create_ask_engine(
     llm_client: Optional[BaseChatModel] = None,
     backend: Optional[object] = None,
     llm_settings: Optional[Dict] = None,
+    query_service: Any = None,
     **kwargs,
 ) -> AskEngine:
     """
@@ -444,5 +448,6 @@ def create_ask_engine(
         llm_client=llm_client,
         backend=backend,
         llm_settings=llm_settings,
+        query_service=query_service,
         config=config,
     )

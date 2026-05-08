@@ -23,7 +23,7 @@ from datetime import datetime
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 
-from ..constants import DOC_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS
+from ..constants import DOC_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS, CODE_SYMBOL_TYPES
 from ..code_graph.graph_query_service import GraphQueryService
 from .hybrid_fusion import (
     fuse_search_results,
@@ -38,6 +38,7 @@ UNIFIED_RETRIEVER_ENABLED = True
 # Container types that can own child methods/functions via 'defines' edges.
 # Used by orphan FTS fallback to discover string-based references.
 CONTAINER_SYMBOL_TYPES = frozenset({'class', 'interface', 'struct', 'enum', 'trait'})
+PROGRESSIVE_SYMBOL_TYPES = frozenset(CODE_SYMBOL_TYPES | {'method'})
 
 # Try to import EmbeddingsFilter for semantic reranking
 try:
@@ -457,6 +458,7 @@ def create_codebase_tools(
     similarity_threshold: float = 0.75,
     graph_text_index: Any = None,  # GraphTextIndex (FTS5)
     unified_db_path: Optional[str] = None,  # Path to .wiki.db (Phase 6)
+    query_service: Any = None,  # Pre-built GraphQueryService/StorageQueryService
 ) -> List:
     """
     Create custom tools for deep research.
@@ -486,7 +488,8 @@ def create_codebase_tools(
     emit = event_callback or (lambda x: None)
 
     # Build unified query service (SPEC-1: replaces scattered O(N) scans)
-    query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
+    if query_service is None:
+        query_service = GraphQueryService(code_graph, fts_index=graph_text_index) if code_graph else None
     
     # Resolve unified_db_path: auto-detect when flag is on but path not provided
     _udb_path = unified_db_path
@@ -499,6 +502,14 @@ def create_codebase_tools(
     _use_db_fallback = bool(_udb_path and code_graph is None)
     if _use_db_fallback:
         logger.info("[RESEARCH_TOOLS] Unified DB fallback enabled: %s", _udb_path)
+        if query_service is None:
+            db = getattr(retriever_stack, 'db', None)
+            if db is not None:
+                try:
+                    from ..code_graph.storage_query_service import StorageQueryService
+                    query_service = StorageQueryService(db)
+                except Exception as exc:
+                    logger.debug("[RESEARCH_TOOLS] Could not create storage query service: %s", exc)
     
     # Get embeddings from retriever_stack for reranking
     embeddings = None
@@ -508,6 +519,48 @@ def create_codebase_tools(
     # Doc search cap: the vector store mostly holds documentation chunks,
     # so we cap its contribution to avoid drowning out code results from FTS5.
     _MAX_DOC_RESULTS = int(os.environ.get("DEEPWIKI_MAX_DOC_RESULTS", "3"))
+
+    def _doc_from_symbol_result(result: Any, search_source: str) -> Optional[Document]:
+        """Materialize a query-service symbol hit into a tool result document."""
+        data: Dict[str, Any] = {}
+        if query_service is not None and hasattr(query_service, 'get_node'):
+            try:
+                data = query_service.get_node(result.node_id) or {}
+            except Exception:
+                data = {}
+        if not data and code_graph is not None:
+            try:
+                data = code_graph.nodes.get(result.node_id, {}) or {}
+            except Exception:
+                data = {}
+
+        content = (
+            data.get('source_text')
+            or data.get('content')
+            or data.get('docstring')
+            or result.docstring
+            or data.get('signature')
+            or ''
+        )
+        if not str(content).strip():
+            return None
+
+        rel_path = result.rel_path or result.file_path or data.get('rel_path', '') or data.get('file_path', '')
+        return Document(
+            page_content=str(content),
+            metadata={
+                'source': rel_path or 'unknown',
+                'rel_path': rel_path,
+                'file_path': result.file_path or data.get('file_path', ''),
+                'symbol_name': result.symbol_name or data.get('symbol_name', ''),
+                'symbol_type': result.symbol_type or data.get('symbol_type', 'unknown'),
+                'start_line': data.get('start_line', ''),
+                'end_line': data.get('end_line', ''),
+                'node_id': result.node_id,
+                'search_score': result.score,
+                'search_source': search_source,
+            },
+        )
 
     @tool(parse_docstring=True)
     def search_codebase(query: str, k: int = 10) -> str:
@@ -897,8 +950,8 @@ def create_codebase_tools(
             "timestamp": datetime.now().isoformat()
         })
 
-        if code_graph is None:
-            # Phase 6: return FTS5 results from unified DB (no neighbors available)
+        if query_service is None and code_graph is None:
+            # Phase 6 compatibility fallback when no query service was provided.
             if _use_db_fallback:
                 db_docs = _search_unified_db_fts(_udb_path, query, k=k)
                 if db_docs:
@@ -927,7 +980,17 @@ def create_codebase_tools(
         try:
             # Step 1: Find matching symbols via FTS5 or brute-force
             matched_docs: List[Document] = []
-            if graph_text_index is not None and graph_text_index.is_open:
+            if query_service is not None:
+                svc_results = query_service.search(
+                    query,
+                    k=k,
+                    exclude_types=DOC_SYMBOL_TYPES,
+                )
+                matched_docs = [
+                    doc for result in svc_results
+                    if (doc := _doc_from_symbol_result(result, 'graph_query')) is not None
+                ]
+            elif graph_text_index is not None and graph_text_index.is_open:
                 matched_docs = graph_text_index.search_smart(
                     query, k=k, intent='symbol',
                     exclude_types=DOC_SYMBOL_TYPES,
@@ -960,13 +1023,26 @@ def create_codebase_tools(
 
                 if include_neighbors:
                     # Use GraphQueryService for O(1) resolution (SPEC-1)
-                    node_id = None
+                    node_id = doc.metadata.get('node_id') or None
                     if query_service:
-                        node_id = query_service.resolve_symbol(sym_name, file_path=rel_path)
-                    if not node_id:
+                        node_id = node_id or query_service.resolve_symbol(sym_name, file_path=rel_path)
+                    if not node_id and code_graph is not None:
                         node_id = _find_graph_node(code_graph, sym_name, rel_path)
                     if node_id:
-                        neighbor_lines = _format_neighbors(code_graph, node_id)
+                        neighbor_lines = []
+                        if query_service is not None:
+                            rels = query_service.get_relationships(
+                                node_id,
+                                direction='both',
+                                max_depth=1,
+                                max_results=8,
+                            )
+                            for rel in rels:
+                                neighbor_lines.append(
+                                    f"  - `{rel.source_name}` -> `{rel.target_name}` [{rel.relationship_type}]"
+                                )
+                        elif code_graph is not None:
+                            neighbor_lines = _format_neighbors(code_graph, node_id)
                         if neighbor_lines:
                             section_lines.append("\n**Relationships:**")
                             section_lines.extend(neighbor_lines)
@@ -1041,7 +1117,17 @@ def create_codebase_tools(
 
         try:
             results = []
-            sym_types = frozenset({symbol_type.lower()}) if symbol_type else None
+            if symbol_type:
+                requested_types = frozenset({symbol_type.lower()})
+                sym_types = requested_types & PROGRESSIVE_SYMBOL_TYPES
+                if not sym_types:
+                    supported_types = ", ".join(sorted(PROGRESSIVE_SYMBOL_TYPES))
+                    return (
+                        f"Unsupported symbol_type '{symbol_type}'. "
+                        f"Supported values: {supported_types}"
+                    )
+            else:
+                sym_types = PROGRESSIVE_SYMBOL_TYPES
             path_prefix = file_prefix if file_prefix else None
 
             if query_service:
@@ -1054,13 +1140,17 @@ def create_codebase_tools(
                 for r in svc_results:
                     # Extract one-line doc (first sentence of docstring)
                     one_line = ''
-                    if r.node_id and r.node_id in code_graph:
-                        doc = (code_graph.nodes.get(r.node_id, {}) or {}).get('docstring', '') or ''
-                        if doc:
-                            first_line = doc.strip().split('\n')[0].strip()
-                            if len(first_line) > 80:
-                                first_line = first_line[:77] + '...'
-                            one_line = first_line
+                    node_data: Dict[str, Any] = {}
+                    if r.node_id and hasattr(query_service, 'get_node'):
+                        node_data = query_service.get_node(r.node_id) or {}
+                    if not node_data and r.node_id and code_graph is not None and r.node_id in code_graph:
+                        node_data = code_graph.nodes.get(r.node_id, {}) or {}
+                    doc = node_data.get('docstring', '') or ''
+                    if doc:
+                        first_line = doc.strip().split('\n')[0].strip()
+                        if len(first_line) > 80:
+                            first_line = first_line[:77] + '...'
+                        one_line = first_line
 
                     results.append({
                         'name': r.symbol_name,
@@ -1072,6 +1162,7 @@ def create_codebase_tools(
                     })
             elif graph_text_index and graph_text_index.is_open:
                 docs = graph_text_index.search_smart(query, k=k, intent='symbol',
+                                                      symbol_types=sym_types,
                                                       exclude_types=DOC_SYMBOL_TYPES)
                 for doc in docs:
                     m = doc.metadata

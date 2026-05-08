@@ -132,6 +132,74 @@ def cache_index_has_repo(index: Dict[str, Any], canonical_repo_id: str) -> bool:
     return has_combined_graph(index, canonical_repo_id)
 
 
+def resolve_unified_db_path(
+    *,
+    canonical_repo_id: str,
+    cache_dir: str | Path,
+) -> Optional[str]:
+    """Resolve the ``.wiki.db`` artifact for a canonical repo id.
+
+    Runtime ask/research must not pick the newest SQLite DB in the cache: a
+    cache directory can contain multiple repositories plus doc-only DBs. The
+    unified DB cache index is the source of truth, keyed by the same canonical
+    repo id used for repository analysis.
+    """
+    if not canonical_repo_id:
+        return None
+
+    cache_dir_path = Path(cache_dir).expanduser()
+    index = load_cache_index(cache_dir_path)
+    unified = index.get("unified_db")
+    candidates: list[str] = [canonical_repo_id]
+
+    repo, branch, _commit = split_repo_identifier(canonical_repo_id)
+    if repo and branch:
+        branch_key = repo_branch_key(repo, branch)
+        if branch_key not in candidates:
+            candidates.append(branch_key)
+        refs = index.get("refs")
+        if isinstance(refs, dict) and isinstance(refs.get(branch_key), str):
+            ref_value = str(refs[branch_key])
+            if ref_value not in candidates:
+                candidates.append(ref_value)
+
+    if isinstance(unified, dict):
+        for candidate in candidates:
+            cache_key = unified.get(candidate)
+            if not isinstance(cache_key, str) or not cache_key.strip():
+                continue
+            db_path = _cache_artifact_path(cache_dir_path, cache_key.strip(), ".wiki.db")
+            if db_path and db_path.exists() and db_path.is_file():
+                return str(db_path)
+
+    # Last-resort legacy compatibility: only auto-select when unambiguous.
+    # Multiple DBs must not fall back to mtime ordering because that crosses repos.
+    matches = sorted(cache_dir_path.glob("*.wiki.db"))
+    if len(matches) == 1 and matches[0].is_file():
+        return str(matches[0])
+
+    return None
+
+
+def _cache_artifact_path(cache_dir: Path, cache_key: str, suffix: str) -> Optional[Path]:
+    key = cache_key.strip()
+    if not key:
+        return None
+
+    key_path = Path(key)
+    if key_path.is_absolute():
+        return None
+
+    cache_root = cache_dir.expanduser().resolve(strict=False)
+    artifact_key = key if key.endswith(suffix) else f"{key}{suffix}"
+    artifact_path = (cache_root / artifact_key).resolve(strict=False)
+    try:
+        artifact_path.relative_to(cache_root)
+    except ValueError:
+        return None
+    return artifact_path
+
+
 def repository_clone_candidates(repositories_dir: str | Path, repo: str, branch: str) -> List[str]:
     repositories_dir_path = Path(repositories_dir)
     if not repositories_dir_path.exists():

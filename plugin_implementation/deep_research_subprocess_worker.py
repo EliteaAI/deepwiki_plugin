@@ -182,7 +182,6 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     from .vectorstore import VectorStoreManager
     from .retrievers import WikiRetrieverStack
     from .repository_analysis_store import RepositoryAnalysisStore
-    from .graph_manager import GraphManager
     from .deep_research import create_deep_research_engine
     
     logger = logging.getLogger(__name__)
@@ -281,8 +280,13 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         canonical_repo_identifier = repo_identifier
         filesystem_root_dir = None
         try:
-            from .repo_resolution import cache_index_has_repo, resolve_canonical_repo_identifier, resolve_clone_dir_for_canonical_id
-            from .repo_resolution import load_cache_index
+            from .repo_resolution import (
+                cache_index_has_repo,
+                load_cache_index,
+                resolve_canonical_repo_identifier,
+                resolve_clone_dir_for_canonical_id,
+                resolve_unified_db_path,
+            )
 
             if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
                 # Validate override exists in cache before using it
@@ -316,8 +320,8 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 idx = load_cache_index(cache_dir)
                 faiss_key = idx.get(canonical_repo_identifier)
-                graphs_idx = idx.get('graphs', {}) if isinstance(idx.get('graphs', {}), dict) else {}
-                graph_key = graphs_idx.get(f"{canonical_repo_identifier}:combined")
+                unified_idx = idx.get('unified_db', {}) if isinstance(idx.get('unified_db', {}), dict) else {}
+                unified_key = unified_idx.get(canonical_repo_identifier)
 
                 lines = [
                     f"canonical_repo_identifier={canonical_repo_identifier}",
@@ -328,10 +332,10 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     lines.append("faiss_key=(not found)")
 
-                if isinstance(graph_key, str):
-                    lines.append(f"graph_key={graph_key} file={graph_key}.code_graph.gz")
+                if isinstance(unified_key, str):
+                    lines.append(f"unified_db_key={unified_key} file={unified_key}.wiki.db")
                 else:
-                    lines.append("graph_key=(not found)")
+                    lines.append("unified_db_key=(not found)")
 
                 _emit_thinking_step("cache", "Cache Selection", "\n".join(lines))
             except Exception:
@@ -430,18 +434,18 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         _unified_retriever_enabled = True  # always-on — UnifiedWikiDB is the only retrieval store
         _unified_retriever_active = False
         retriever_stack = None
+        query_service = None
 
         if _unified_retriever_enabled:
             try:
-                import glob as _glob
                 from .unified_retriever import UnifiedRetriever
                 from .unified_db import UnifiedWikiDB
+                from .code_graph.storage_query_service import StorageQueryService
 
-                _udb_path = None
-                _all_dbs = _glob.glob(os.path.join(cache_dir, "*.wiki.db"))
-                if _all_dbs:
-                    _all_dbs.sort(key=os.path.getmtime, reverse=True)
-                    _udb_path = _all_dbs[0]
+                _udb_path = resolve_unified_db_path(
+                    canonical_repo_id=canonical_repo_identifier,
+                    cache_dir=cache_dir,
+                )
 
                 if _udb_path and os.path.isfile(_udb_path):
                     _udb = UnifiedWikiDB(_udb_path, readonly=True)
@@ -453,10 +457,17 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                         embedding_fn=_embed_fn,
                         embeddings=embeddings,
                     )
+                    query_service = StorageQueryService(_udb)
                     _unified_retriever_active = True
-                    _print(f"[UNIFIED_RETRIEVER] Deep Research using UnifiedRetriever from {_udb_path}")
+                    _print(
+                        "[UNIFIED_RETRIEVER] Deep Research using UnifiedRetriever "
+                        f"for {canonical_repo_identifier} from {_udb_path}"
+                    )
                 else:
-                    _print("[UNIFIED_RETRIEVER] No .wiki.db found — falling back to legacy retriever")
+                    _print(
+                        "[UNIFIED_RETRIEVER] No .wiki.db found for "
+                        f"{canonical_repo_identifier} — falling back to legacy retriever"
+                    )
             except Exception as _ur_exc:
                 _print(f"[UNIFIED_RETRIEVER] Upgrade failed, using legacy: {_ur_exc}")
 
@@ -480,14 +491,12 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             _print("[UNIFIED_RETRIEVER] Skipping legacy FAISS vectorstore loading")
         
-        # Load relationship graph (always try — tools benefit from it even in unified mode)
-        _print("Loading relationship graph...")
-        graph_manager = GraphManager(cache_dir=cache_dir)
-        relationship_graph = graph_manager.load_graph_by_repo_name(canonical_repo_identifier)
-        if relationship_graph:
-            _print(f"Relationship graph loaded: {relationship_graph.number_of_nodes()} nodes")
+        graph_manager = None
+        relationship_graph = None
+        if _unified_retriever_active:
+            _print("[UNIFIED_RETRIEVER] Using UnifiedWikiDB query service; skipping legacy relationship graph loading")
         else:
-            _print("No relationship graph found - proceeding without graph analysis")
+            _print("Unified DB not active - proceeding without graph analysis")
         
         # Load repository analysis
         _print("Loading repository analysis...")
@@ -574,9 +583,10 @@ async def run_deep_research_async(payload: Dict[str, Any]) -> Dict[str, Any]:
             llm_client=llm,
             backend=backend_factory,
             llm_settings=llm_settings,
+            query_service=query_service,
             max_iterations=max_iterations,
             research_type=research_type,
-            enable_graph_analysis=relationship_graph is not None,
+            enable_graph_analysis=query_service is not None or relationship_graph is not None,
             enable_subagents=True
         )
         
