@@ -93,6 +93,13 @@ class GraphQueryService:
         self._name_index: Dict[str, List[str]] = getattr(graph, '_name_index', defaultdict(list))
         self._suffix_index: Dict[str, List[str]] = getattr(graph, '_suffix_index', defaultdict(list))
 
+    def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """Return graph node attributes for parity with storage query services."""
+        if not node_id or self.graph is None:
+            return None
+        data = self.graph.nodes.get(node_id)
+        return dict(data) if data is not None else None
+
     # ------------------------------------------------------------------
     # Symbol Resolution — O(1) with FTS5 fallback
     # ------------------------------------------------------------------
@@ -290,6 +297,7 @@ class GraphQueryService:
                 connections=connections,
                 score=meta.get('search_score', 0.0),
                 match_source='fts5',
+                docstring=doc.page_content or meta.get('docstring', ''),
             ))
 
             if len(results) >= k:

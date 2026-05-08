@@ -78,6 +78,7 @@ class DeepResearchEngine:
         llm_client: Optional[BaseChatModel] = None,
         backend: Optional[object] = None,
         llm_settings: Optional[Dict] = None,
+        query_service: Any = None,
         config: Optional[ResearchConfig] = None
     ):
         """
@@ -98,6 +99,7 @@ class DeepResearchEngine:
         self.llm_client = llm_client
         self.backend = backend
         self.llm_settings = llm_settings or {}
+        self.query_service = query_service
         self.config = config or ResearchConfig()
         
         # Session tracking (simplified - no redundant state)
@@ -152,6 +154,7 @@ class DeepResearchEngine:
             repo_analysis=self.repo_analysis,
             event_callback=None,  # Not needed - using LangGraph stream
             graph_text_index=fts_index,
+            query_service=self.query_service,
         )
         
         # Create the DeepAgents agent (no subagents - they add complexity without benefit)
@@ -401,6 +404,7 @@ def create_deep_research_engine(
     llm_client: Optional[BaseChatModel] = None,
     backend: Optional[object] = None,
     llm_settings: Optional[Dict] = None,
+    query_service: Any = None,
     **kwargs
 ) -> DeepResearchEngine:
     """
@@ -429,5 +433,6 @@ def create_deep_research_engine(
         llm_client=llm_client,
         backend=backend,
         llm_settings=llm_settings,
+        query_service=query_service,
         config=config
     )
