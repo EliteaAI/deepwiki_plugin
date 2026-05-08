@@ -125,6 +125,60 @@ def test_resolve_unified_db_path_uses_cache_index_not_latest_mtime(tmp_path):
     assert resolved == str(requested)
 
 
+def test_resolve_unified_db_path_rejects_cache_keys_outside_cache_dir(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    outside = tmp_path / "outside.wiki.db"
+    outside.write_text("outside", encoding="utf-8")
+
+    save_cache_index_atomic(cache_dir, {
+        "unified_db": {
+            "owner/repo:main:11111111": "../outside",
+            "owner/repo:main:22222222": str(outside),
+        },
+    })
+
+    assert resolve_unified_db_path(
+        canonical_repo_id="owner/repo:main:11111111",
+        cache_dir=cache_dir,
+    ) is None
+    assert resolve_unified_db_path(
+        canonical_repo_id="owner/repo:main:22222222",
+        cache_dir=cache_dir,
+    ) is None
+
+
+def test_storage_query_service_preserves_zero_score_norm():
+    from plugin_implementation.code_graph.storage_query_service import StorageQueryService
+
+    result = StorageQueryService._row_to_result({
+        "node_id": "node",
+        "symbol_name": "Node",
+        "symbol_type": "class",
+        "rel_path": "src/node.py",
+        "score_norm": 0.0,
+        "fts_rank": -42.0,
+    })
+
+    assert result.score == 0.0
+
+
+def test_storage_query_service_search_batches_connection_counts(query_db, monkeypatch):
+    from plugin_implementation.code_graph.storage_query_service import StorageQueryService
+
+    def fail_edge_fetch(_node_id):
+        raise AssertionError("search should not materialize per-node edges for counts")
+
+    monkeypatch.setattr(query_db, "get_edges_from", fail_edge_fetch)
+    monkeypatch.setattr(query_db, "get_edges_to", fail_edge_fetch)
+
+    results = StorageQueryService(query_db).search("AuthService", k=1)
+
+    assert results
+    assert results[0].symbol_name == "AuthService"
+    assert results[0].connections == 2
+
+
 def test_query_graph_uses_unified_db_query_service(query_db):
     from plugin_implementation.code_graph.storage_query_service import StorageQueryService
 

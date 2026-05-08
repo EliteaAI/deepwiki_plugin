@@ -97,10 +97,13 @@ class StorageQueryService:
             result = self._row_to_result(row, match_source='storage_fts')
             if not self._matches_filters(result, symbol_types, exclude_types, layer, path_prefix):
                 continue
-            result.connections = self._connection_count(result.node_id)
             results.append(result)
             if len(results) >= k:
                 break
+
+        connection_counts = self._connection_counts(result.node_id for result in results)
+        for result in results:
+            result.connections = connection_counts.get(result.node_id, 0)
         return results
 
     def get_relationships(
@@ -231,8 +234,9 @@ class StorageQueryService:
             results = self._filter_has_relationship(results, jql.has_rel_values)
 
         if jql.connections_clause:
+            connection_counts = self._connection_counts(result.node_id for result in results)
             for result in results:
-                result.connections = self._connection_count(result.node_id)
+                result.connections = connection_counts.get(result.node_id, 0)
             results = [r for r in results if jql.connections_clause.matches_numeric(r.connections)]
 
         return results
@@ -277,8 +281,9 @@ class StorageQueryService:
         if not results:
             rows = self._nodes_by_id(reachable).values()
             materialized = [self._row_to_result(row) for row in rows]
+            connection_counts = self._connection_counts(result.node_id for result in materialized)
             for result in materialized:
-                result.connections = self._connection_count(result.node_id)
+                result.connections = connection_counts.get(result.node_id, 0)
             materialized.sort(key=lambda item: (-item.connections, item.symbol_name))
             return materialized
         return [result for result in results if result.node_id in reachable]
@@ -339,6 +344,39 @@ class StorageQueryService:
         if not node_id:
             return 0
         return len(self.storage.get_edges_from(node_id)) + len(self.storage.get_edges_to(node_id))
+
+    def _connection_counts(self, node_ids: Iterable[str]) -> dict[str, int]:
+        ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+        if not ids:
+            return {}
+
+        placeholders = ','.join('?' for _ in ids)
+        try:
+            rows = self.storage.conn.execute(
+                f"""
+                SELECT node_id, SUM(connection_count) AS connection_count
+                FROM (
+                    SELECT source_id AS node_id, COUNT(*) AS connection_count
+                    FROM repo_edges
+                    WHERE source_id IN ({placeholders})
+                    GROUP BY source_id
+                    UNION ALL
+                    SELECT target_id AS node_id, COUNT(*) AS connection_count
+                    FROM repo_edges
+                    WHERE target_id IN ({placeholders})
+                    GROUP BY target_id
+                )
+                GROUP BY node_id
+                """,
+                [*ids, *ids],
+            ).fetchall()
+            counts = {node_id: 0 for node_id in ids}
+            for row in rows:
+                values = dict(row)
+                counts[values.get('node_id') or ''] = int(values.get('connection_count') or 0)
+            return counts
+        except Exception:
+            return {node_id: self._connection_count(node_id) for node_id in ids}
 
     @staticmethod
     def _edge_type(edge: dict[str, Any]) -> str:
@@ -430,10 +468,22 @@ class StorageQueryService:
             file_path=rel_path,
             rel_path=rel_path,
             connections=0,
-            score=float(row.get('score_norm') or row.get('fts_rank') or 0.0),
+            score=StorageQueryService._score_from_row(row),
             match_source=match_source,
             docstring=row.get('docstring') or '',
         )
+
+    @staticmethod
+    def _score_from_row(row: dict[str, Any]) -> float:
+        score = row.get('score_norm')
+        if score is None:
+            score = row.get('fts_rank')
+        if score is None:
+            return 0.0
+        try:
+            return float(score)
+        except (TypeError, ValueError):
+            return 0.0
 
     def stats(self) -> dict[str, Any]:
         return {

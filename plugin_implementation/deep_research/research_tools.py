@@ -1121,7 +1121,11 @@ def create_codebase_tools(
                 requested_types = frozenset({symbol_type.lower()})
                 sym_types = requested_types & PROGRESSIVE_SYMBOL_TYPES
                 if not sym_types:
-                    return f"No architectural symbols found for unsupported symbol_type: {symbol_type}"
+                    supported_types = ", ".join(sorted(PROGRESSIVE_SYMBOL_TYPES))
+                    return (
+                        f"Unsupported symbol_type '{symbol_type}'. "
+                        f"Supported values: {supported_types}"
+                    )
             else:
                 sym_types = PROGRESSIVE_SYMBOL_TYPES
             path_prefix = file_prefix if file_prefix else None

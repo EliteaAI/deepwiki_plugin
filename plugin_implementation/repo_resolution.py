@@ -169,7 +169,7 @@ def resolve_unified_db_path(
             if not isinstance(cache_key, str) or not cache_key.strip():
                 continue
             db_path = _cache_artifact_path(cache_dir_path, cache_key.strip(), ".wiki.db")
-            if db_path.exists() and db_path.is_file():
+            if db_path and db_path.exists() and db_path.is_file():
                 return str(db_path)
 
     # Last-resort legacy compatibility: only auto-select when unambiguous.
@@ -181,13 +181,23 @@ def resolve_unified_db_path(
     return None
 
 
-def _cache_artifact_path(cache_dir: Path, cache_key: str, suffix: str) -> Path:
-    path = Path(cache_key).expanduser()
-    if path.is_absolute():
-        return path
-    if cache_key.endswith(suffix):
-        return cache_dir / cache_key
-    return cache_dir / f"{cache_key}{suffix}"
+def _cache_artifact_path(cache_dir: Path, cache_key: str, suffix: str) -> Optional[Path]:
+    key = cache_key.strip()
+    if not key:
+        return None
+
+    key_path = Path(key)
+    if key_path.is_absolute():
+        return None
+
+    cache_root = cache_dir.expanduser().resolve(strict=False)
+    artifact_key = key if key.endswith(suffix) else f"{key}{suffix}"
+    artifact_path = (cache_root / artifact_key).resolve(strict=False)
+    try:
+        artifact_path.relative_to(cache_root)
+    except ValueError:
+        return None
+    return artifact_path
 
 
 def repository_clone_candidates(repositories_dir: str | Path, repo: str, branch: str) -> List[str]:
