@@ -39,7 +39,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         )
         #
         return {
-            "name": "deepwiki",
+            "name": "wikis",
             "service_location_url": service_location_url,
             "configuration": {
                 "provided_ui": [
@@ -63,7 +63,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             },
             "provided_toolkits": [
                 {
-                    "name": "Deepwiki",
+                    "name": "Wikis",
                     "description": "Comprehensive wiki generation from GitHub repository analysis",
                     "toolkit_config": {
                         "type": "Wiki Builder Configuration",
@@ -244,37 +244,37 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                         "interface": {
                             "type": "iframe",
                             "create_url": None,
-                            "app_url": "/app/ui_host/deepwiki/ui/{project_id}/{toolkit_id}?theme={theme}"
+                            "app_url": "/app/ui_host/wikis/ui/{project_id}/{toolkit_id}?theme={theme}"
                         }
                     }
                 },
                 # ============================================================
-                # DEEPWIKI_QUERY TOOLKIT - Read-only access to existing wiki
+                # WIKIS_QUERY TOOLKIT - Read-only access to existing wiki
                 # ============================================================
-                # This toolkit references an existing deepwiki application and
+                # This toolkit references an existing wikis application and
                 # exposes only read-only query tools (ask, deep_research) for use by other agents.
-                # Unlike the main "Deepwiki" toolkit (which is an application),
+                # Unlike the main "Wikis" toolkit (which is an application),
                 # this provides direct tool access without needing to configure repository access.
                 {
-                    "name": "deepwiki_query",
-                    "description": "Read-only access to an existing DeepWiki knowledge base. Ask questions and perform deep research on a repository that has already been analyzed. Use this when you want to query an existing wiki without setting up your own.",
+                    "name": "wikis_query",
+                    "description": "Read-only access to an existing Wikis knowledge base. Ask questions and perform deep research on a repository that has already been analyzed. Use this when you want to query an existing wiki without setting up your own.",
                     "toolkit_config": {
-                        "type": "DeepWiki Query Tools",
-                        "description": "Connect to an existing DeepWiki to ask questions and perform research. Select a DeepWiki toolkit that has already been configured and has a wiki generated.",
+                        "type": "Wikis Query Tools",
+                        "description": "Connect to an existing Wikis to ask questions and perform research. Select a Wikis toolkit that has already been configured and has a wiki generated.",
                         "fields_order": [
-                            "deepwiki_toolkit",
+                            "wikis_toolkit",
                             "llm_model",
                             "embedding_model"
                         ],
                         "parameters": {
-                            "deepwiki_toolkit": {
+                            "wikis_toolkit": {
                                 "type": "Integer",
                                 "required": True,
-                                "description": "ID of an existing DeepWiki toolkit to connect to",
+                                "description": "ID of an existing Wikis toolkit to connect to",
                                 "json_schema_extra": {
-                                    "toolkit_types": ["deepwiki_Deepwiki"],
+                                    "toolkit_types": ["wikis_Wikis", "deepwiki_Deepwiki"],
                                     "application": True,
-                                    "label": "DeepWiki Toolkit"
+                                    "label": "Wikis Toolkit"
                                 }
                             },
                             "llm_model": {
@@ -305,7 +305,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                                     "description": "Question about the repository code or functionality"
                                 }
                             },
-                            "description": "Ask questions about the repository using an existing DeepWiki knowledge base. The referenced DeepWiki toolkit must have a wiki already generated.",
+                            "description": "Ask questions about the repository using an existing Wikis knowledge base. The referenced Wikis toolkit must have a wiki already generated.",
                             "tool_metadata": {
                                 "result_composition": "single_object",
                                 "result_objects": [
@@ -329,7 +329,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                                     "description": "Research question for deep analysis of the repository"
                                 }
                             },
-                            "description": "Perform deep research on a repository topic using an existing DeepWiki knowledge base. Uses multi-step analysis with planning, delegation, and comprehensive investigation. The referenced DeepWiki toolkit must have a wiki already generated.",
+                            "description": "Perform deep research on a repository topic using an existing Wikis knowledge base. Uses multi-step analysis with planning, delegation, and comprehensive investigation. The referenced Wikis toolkit must have a wiki already generated.",
                             "tool_metadata": {
                                 "result_composition": "single_object",
                                 "result_objects": [
@@ -346,7 +346,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                         }
                     ],
                     "toolkit_metadata": {
-                        "type_override": "deepwiki_query",
+                        "type_override": "wikis_query",
                         "application": False,
                         "required_context": ["project_id"]
                     }
@@ -360,7 +360,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                 # finds the relevant wiki and answers the question.
                 {
                     "name": "wiki_query",
-                    "description": "Context7-style access to multiple DeepWiki knowledge bases. Discover available wikis, resolve repository queries automatically, and ask questions across different repositories. Perfect for AI agents that need to query multiple codebases without prior knowledge of which repository to use.",
+                    "description": "Context7-style access to multiple Wikis knowledge bases. Discover available wikis, resolve repository queries automatically, and ask questions across different repositories. Perfect for AI agents that need to query multiple codebases without prior knowledge of which repository to use.",
                     "toolkit_config": {
                         "type": "Multi-Wiki Query Tools",
                         "description": "Connect to the wiki registry to discover and query multiple wikis. Configure LLM and embedding models for intelligent repository resolution and question answering.",

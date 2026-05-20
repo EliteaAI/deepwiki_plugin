@@ -59,7 +59,7 @@ class OptimizedWikiToolkitWrapper:
         
         # Output configuration
         self.wiki_output_path = "wiki_output"
-        self.bucket_name = "wiki_artifacts"
+        self.bucket_name = "wiki-artifacts"
         
         logger.info(f"Initialized WikiToolkitWrapper for repository: {self.github_repository}")
 

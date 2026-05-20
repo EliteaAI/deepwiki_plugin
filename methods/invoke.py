@@ -9,7 +9,7 @@ import requests
 from pylon.core.tools import log  # pylint: disable=E0611,E0401,W0611
 from pylon.core.tools import web  # pylint: disable=E0611,E0401,W0611
 
-default_bucket = 'wiki_artifacts'
+default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
     'github_configuration',
@@ -532,10 +532,12 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         # Get toolkit parameters
         toolkit_params = request_data.get("configuration", {}).get("parameters", {})
 
-        # Get the referenced deepwiki toolkit - can be an ID or a full toolkit object
-        deepwiki_toolkit_ref = toolkit_params.get("deepwiki_toolkit")
+        # Get the referenced wikis toolkit - can be an ID or a full toolkit object.
+        # Accept legacy "deepwiki_toolkit" key for backward compatibility with toolkit
+        # configurations created before the Deepwiki -> Wikis rename.
+        deepwiki_toolkit_ref = toolkit_params.get("wikis_toolkit") or toolkit_params.get("deepwiki_toolkit")
         if not deepwiki_toolkit_ref:
-            return None, "deepwiki_toolkit parameter is required - specify which DeepWiki toolkit to use"
+            return None, "wikis_toolkit parameter is required - specify which Wikis toolkit to use"
 
         # Extract toolkit ID and settings - handle both int and dict (full toolkit object)
         deepwiki_settings = {}
@@ -1316,9 +1318,10 @@ Do not include any explanation or other text."""
         import tasknode_task  # pylint: disable=E0401,C0415
         invocation_id = tasknode_task.id
 
-        # Validate toolkit - supports main deepwiki toolkit, deepwiki_query, and wiki_query
-        valid_main_toolkits = ["WikiBuilderToolkit", "deepwiki", "Deepwiki", "wiki", "DeepWikiToolkit", "DeepWiki", "Wiki"]
-        valid_query_toolkits = ["deepwiki_query", "DeepwikiQuery", "deepwiki-query"]
+        # Validate toolkit - supports main wikis/deepwiki toolkit, wikis_query/deepwiki_query, and wiki_query.
+        # Legacy identifiers preserved for backward compatibility with existing user data.
+        valid_main_toolkits = ["WikiBuilderToolkit", "deepwiki", "Deepwiki", "wiki", "DeepWikiToolkit", "DeepWiki", "Wiki", "wikis", "Wikis"]
+        valid_query_toolkits = ["wikis_query", "deepwiki_query", "DeepwikiQuery", "deepwiki-query"]
         valid_wiki_query_toolkits = ["wiki_query", "WikiQuery", "wiki-query"]
 
         all_valid_toolkits = valid_main_toolkits + valid_query_toolkits + valid_wiki_query_toolkits

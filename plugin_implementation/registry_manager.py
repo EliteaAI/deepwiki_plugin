@@ -94,7 +94,7 @@ class WikiRegistryManager:
     enabling discovery and resolution from natural language queries.
     """
     
-    def __init__(self, artifacts_client, bucket_name: str = "wiki_artifacts"):
+    def __init__(self, artifacts_client, bucket_name: str = "wiki-artifacts"):
         """
         Initialize registry manager.
         

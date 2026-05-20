@@ -86,7 +86,7 @@ class K8sJobManager:
         # K8s Job mode always uses platform artifact transport: the controller
         # uploads job input and downloads results via the platform API, and
         # workers read/write indexes to the same bucket.  The bucket name is
-        # hardcoded ("wiki_artifacts"); per-request llm_settings supply the
+        # hardcoded ("wiki-artifacts"); per-request llm_settings supply the
         # actual API credentials (base_url, token, project_id).
         from .artifacts_platform_client import ARTIFACT_ENV_VARS
         self._platform_transport = True

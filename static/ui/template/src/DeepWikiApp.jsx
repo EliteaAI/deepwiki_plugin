@@ -569,14 +569,18 @@ function clearGenerationState(projectId, toolkitId) {
 }
 
 // Get bucket name from toolkit with fallback
-// Hardcoded to 'wiki_artifacts' as the default bucket for all wiki artifacts
+// Hardcoded to 'wiki-artifacts' as the default bucket for all wiki artifacts
 function getBucketName(toolkit) {
-  if (!toolkit) return 'wiki_artifacts';
+  if (!toolkit) return 'wiki-artifacts';
   // Check settings first (user-configured values), then toolkit_config, then fallback to hardcoded default
-  return toolkit.settings?.toolkit_configuration_bucket || 
-         toolkit.settings?.bucket || 
-         toolkit.toolkit_config?.bucket || 
-         'wiki_artifacts';
+  const stored = toolkit.settings?.toolkit_configuration_bucket ||
+                 toolkit.settings?.bucket ||
+                 toolkit.toolkit_config?.bucket ||
+                 'wiki-artifacts';
+  // Normalize the legacy bucket name persisted in pre-rename toolkit settings
+  // (S3 naming conventions disallow underscores). Targeted equality match — do
+  // not transform any other custom bucket names users may have set.
+  return stored === 'wiki_artifacts' ? 'wiki-artifacts' : stored;
 }
 
 // Derive configured repository from toolkit or settings
@@ -704,10 +708,10 @@ function DeepWikiApp() {
       return import.meta.env.VITE_DEEPWIKI_URL;
     }
     // In production via ui_host, use the API proxy path
-    // UI is at /app/ui_host/deepwiki/ui/{project_id}/{toolkit_id}
-    // DeepWiki API is proxied at /app/ui_host/deepwiki/api/{project_id}
+    // UI is at /app/ui_host/wikis/ui/{project_id}/{toolkit_id}
+    // DeepWiki API is proxied at /app/ui_host/wikis/api/{project_id}
     if (projectId) {
-      return `${window.location.origin}/app/ui_host/deepwiki/api/${projectId}`;
+      return `${window.location.origin}/app/ui_host/wikis/api/${projectId}`;
     }
     // Fallback to origin (won't work but better than nothing)
     return window.location.origin;

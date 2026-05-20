@@ -12,7 +12,7 @@ Supports two deployment modes, automatically detected:
 
 2. K8s Jobs + platform artifacts (DEEPWIKI_JOBS_ENABLED=true):
    - generate_wiki runs as a K8s Job with **emptyDir**.
-   - Worker uploads index files to the "wiki_artifacts" bucket.
+   - Worker uploads index files to the "wiki-artifacts" bucket.
    - Versioned manifest (wiki_manifest_{version}.json) is uploaded separately
      by the invoke.py result pipeline as a normal artifact to the same bucket.
    - Controller lists versioned manifests (newest = latest) and downloads
@@ -186,7 +186,7 @@ class ArtifactManager:
             cache_dir: Local filesystem cache directory (e.g. /data/wiki_builder/cache).
             artifacts_client: PlatformArtifactClient (has download_artifact/upload_artifact).
                               Only needed in Jobs+API mode (when no shared PVC).
-            bucket: Platform bucket name (e.g. 'wiki_artifacts').
+            bucket: Platform bucket name (e.g. 'wiki-artifacts').
             max_cached_repos: Max repos to keep in local cache ("keep latest only").
         """
         self.cache_dir = Path(cache_dir)

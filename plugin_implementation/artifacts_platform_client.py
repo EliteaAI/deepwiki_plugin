@@ -22,7 +22,7 @@ Credential flow:
        DEEPWIKI_ARTIFACT_PROJECT_ID.
     4. Worker reads those env vars to build its own PlatformArtifactClient.
 
-Bucket key layout (inside the "wiki_artifacts" bucket):
+Bucket key layout (inside the "wiki-artifacts" bucket):
     _jobs/{job_id}/input.json                  Job input  (controller -> worker)
     _jobs/{job_id}/result.json                 Job result (worker -> controller)
     {wiki_id}/indexes/{file}                   Index files (worker uploads)
@@ -62,7 +62,7 @@ ARTIFACT_ENV_VARS = [
     ARTIFACT_X_SECRET_ENV,
 ]
 
-DEFAULT_BUCKET = "wiki_artifacts"
+DEFAULT_BUCKET = "wiki-artifacts"
 DEFAULT_API_PATH = "/api/v1"
 
 
