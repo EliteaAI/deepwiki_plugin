@@ -42,7 +42,7 @@ class Route:
         # Determine base_uri from request headers
         # When accessed via ui_host proxy, custom headers are injected:
         # X-Project-Id, X-User-Id, etc.
-        # The full client path is: /app/ui_host/deepwiki/ui/{project_id}/...
+        # The full client path is: /app/ui_host/wikis/ui/{project_id}/...
         # But the plugin only sees: /ui/...
         
         # Check if we're being accessed through ui_host by looking for injected headers
@@ -51,7 +51,7 @@ class Route:
         
         if header_project_id:
             # We're being accessed via ui_host proxy
-            # Reconstruct the base_uri: /app/ui_host/deepwiki/ui/{project_id}/{toolkit_id}
+            # Reconstruct the base_uri: /app/ui_host/wikis/ui/{project_id}/{toolkit_id}
             base_uri = f"/app/ui_host/wikis/ui/{effective_project_id}/{toolkit_id}"
         elif project_id:
             # Direct access with project_id in path

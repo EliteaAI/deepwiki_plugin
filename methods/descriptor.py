@@ -272,7 +272,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
                                 "required": True,
                                 "description": "ID of an existing Wikis toolkit to connect to",
                                 "json_schema_extra": {
-                                    "toolkit_types": ["wikis_Wikis"],
+                                    "toolkit_types": ["wikis_Wikis", "deepwiki_Deepwiki"],
                                     "application": True,
                                     "label": "Wikis Toolkit"
                                 }
