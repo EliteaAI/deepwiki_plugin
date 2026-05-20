@@ -52,7 +52,7 @@ class Route:
         if header_project_id:
             # We're being accessed via ui_host proxy
             # Reconstruct the base_uri: /app/ui_host/deepwiki/ui/{project_id}/{toolkit_id}
-            base_uri = f"/app/ui_host/deepwiki/ui/{effective_project_id}/{toolkit_id}"
+            base_uri = f"/app/ui_host/wikis/ui/{effective_project_id}/{toolkit_id}"
         elif project_id:
             # Direct access with project_id in path
             base_uri = f"/ui/{project_id}/{toolkit_id}"

@@ -14,7 +14,7 @@ from pylon.core.tools import log, web
 
 logger = logging.getLogger(__name__)
 
-default_bucket = 'wiki_artifacts'
+default_bucket = 'wiki-artifacts'
 
 
 class Route:

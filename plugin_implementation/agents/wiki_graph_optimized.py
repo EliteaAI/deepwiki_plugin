@@ -121,7 +121,7 @@ class OptimizedWikiGenerationAgent:
                  repository_url: str,
                  branch: str = "main",
                  elitea_client: Optional[Any] = None,
-                 bucket_name: str = "wiki_artifacts",
+                 bucket_name: str = "wiki-artifacts",
                  # Basic parameters (formerly WikiConfiguration)
                  wiki_style: WikiStyle = WikiStyle.COMPREHENSIVE,
                  target_audience: TargetAudience = TargetAudience.MIXED,

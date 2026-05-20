@@ -569,14 +569,14 @@ function clearGenerationState(projectId, toolkitId) {
 }
 
 // Get bucket name from toolkit with fallback
-// Hardcoded to 'wiki_artifacts' as the default bucket for all wiki artifacts
+// Hardcoded to 'wiki-artifacts' as the default bucket for all wiki artifacts
 function getBucketName(toolkit) {
-  if (!toolkit) return 'wiki_artifacts';
+  if (!toolkit) return 'wiki-artifacts';
   // Check settings first (user-configured values), then toolkit_config, then fallback to hardcoded default
   return toolkit.settings?.toolkit_configuration_bucket || 
          toolkit.settings?.bucket || 
          toolkit.toolkit_config?.bucket || 
-         'wiki_artifacts';
+         'wiki-artifacts';
 }
 
 // Derive configured repository from toolkit or settings
@@ -707,7 +707,7 @@ function DeepWikiApp() {
     // UI is at /app/ui_host/deepwiki/ui/{project_id}/{toolkit_id}
     // DeepWiki API is proxied at /app/ui_host/deepwiki/api/{project_id}
     if (projectId) {
-      return `${window.location.origin}/app/ui_host/deepwiki/api/${projectId}`;
+      return `${window.location.origin}/app/ui_host/wikis/api/${projectId}`;
     }
     // Fallback to origin (won't work but better than nothing)
     return window.location.origin;

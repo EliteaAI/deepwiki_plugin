@@ -12,7 +12,7 @@ downloads wiki artifacts from bucket. For deepwiki_plugin itself, artifacts
 are loaded from local disk cache and this module is NOT used.
 
 Bucket structure (Context7-style):
-    wiki_artifacts/
+    wiki-artifacts/
         ├── _registry/wikis.json           # Global registry of all wikis
         └── {wiki_id}/                     # Folder per wiki (flat inside)
             ├── wiki_manifest_{version}.json   # Versioned manifests
@@ -127,7 +127,7 @@ class WikiLoader:
     def __init__(
         self,
         artifacts_client,
-        bucket_name: str = "wiki_artifacts",
+        bucket_name: str = "wiki-artifacts",
         temp_dir: Optional[Path] = None,
         max_cached_wikis: int = 5,
     ):

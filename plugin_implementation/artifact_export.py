@@ -5,7 +5,7 @@ This module provides utilities for exporting and storing wiki artifacts
 via the EliteA client system.
 
 Bucket structure (Context7-style):
-    wiki_artifacts/
+    wiki-artifacts/
         ├── _registry/wikis.json           # Global registry of all wikis
         └── {wiki_id}/                     # Folder per wiki
             ├── wiki_manifest_{version}.json   # Versioned manifests

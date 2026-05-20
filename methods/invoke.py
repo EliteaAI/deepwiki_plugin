@@ -9,7 +9,7 @@ import requests
 from pylon.core.tools import log  # pylint: disable=E0611,E0401,W0611
 from pylon.core.tools import web  # pylint: disable=E0611,E0401,W0611
 
-default_bucket = 'wiki_artifacts'
+default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
     'github_configuration',
@@ -533,7 +533,7 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         toolkit_params = request_data.get("configuration", {}).get("parameters", {})
 
         # Get the referenced deepwiki toolkit - can be an ID or a full toolkit object
-        deepwiki_toolkit_ref = toolkit_params.get("deepwiki_toolkit")
+        deepwiki_toolkit_ref = toolkit_params.get("wikis_toolkit")
         if not deepwiki_toolkit_ref:
             return None, "deepwiki_toolkit parameter is required - specify which DeepWiki toolkit to use"
 
@@ -1317,8 +1317,8 @@ Do not include any explanation or other text."""
         invocation_id = tasknode_task.id
 
         # Validate toolkit - supports main deepwiki toolkit, deepwiki_query, and wiki_query
-        valid_main_toolkits = ["WikiBuilderToolkit", "deepwiki", "Deepwiki", "wiki", "DeepWikiToolkit", "DeepWiki", "Wiki"]
-        valid_query_toolkits = ["deepwiki_query", "DeepwikiQuery", "deepwiki-query"]
+        valid_main_toolkits = ["WikiBuilderToolkit", "deepwiki", "Deepwiki", "wiki", "DeepWikiToolkit", "DeepWiki", "Wiki", "Wikis"]
+        valid_query_toolkits = ["wikis_query", "DeepwikiQuery", "deepwiki-query"]
         valid_wiki_query_toolkits = ["wiki_query", "WikiQuery", "wiki-query"]
 
         all_valid_toolkits = valid_main_toolkits + valid_query_toolkits + valid_wiki_query_toolkits
