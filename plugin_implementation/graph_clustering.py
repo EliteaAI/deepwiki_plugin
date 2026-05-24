@@ -2031,27 +2031,43 @@ def _run_phase3_hierarchical_leiden(
         "test_nodes_excluded": len(excluded_test_nodes),
     }
 
-    # A.10: under the calibrated weight profile, derive the section-pass
-    # resolution from graph size instead of the hardcoded 1.0. The
-    # auto_resolution() formula yields γ ≈ 0.6 for ~100-node graphs,
-    # γ ≈ 0.5 for ~500-node graphs, γ → 0.3 for very large graphs —
-    # which fixes the over-clustering symptom on small repos (one
-    # community per file at γ=1.0) without disturbing the consolidator's
-    # downstream rebalancing on large repos.
+    # A.10 (+ A.10.1): under the calibrated weight profile, derive the
+    # section-pass resolution from graph size instead of the hardcoded
+    # 1.0. auto_resolution() yields γ ≈ 0.65 for ~60-node graphs,
+    # γ ≈ 0.5 for ~300-node graphs, γ → 0.3 for very large graphs —
+    # fixing the over-clustering symptom on small repos (one community
+    # per file at γ=1.0).
+    #
+    # A.10.1 — feed FILE COUNT, not symbol-node count. The section pass
+    # runs on the file-contracted projection (each rel_path becomes one
+    # node). The formula was tuned for graphs at the file/module scale,
+    # so feeding symbol count (often 10-100× larger than file count)
+    # always pushes γ to the 0.3 clamp floor and over-aggregates large
+    # repos. Distinct rel_path count is the correct input layer.
     #
     # Only fires when:
-    #   - caller used the default (didn't explicitly override
-    #     section_resolution)
+    #   - caller used the default (didn't override section_resolution)
     #   - feature_flags.weight_calibration_profile == "calibrated"
     # Legacy profile keeps the hardcoded 1.0 unchanged.
     if (section_resolution == LEIDEN_FILE_SECTION_RESOLUTION
             and getattr(feature_flags, "weight_calibration_profile", "legacy")
                 == "calibrated"):
-        adaptive_resolution = auto_resolution(G_cluster.number_of_nodes())
+        # File count = number of distinct rel_path values. Nodes without
+        # rel_path (rare, virtual aggregations) are excluded. The same
+        # contraction _contract_to_file_graph() will perform inside
+        # hierarchical_leiden_cluster, modulo isolated-file handling.
+        file_paths = {
+            G_cluster.nodes[n].get("rel_path", "") for n in G_cluster.nodes()
+        }
+        file_paths.discard("")
+        n_files = len(file_paths) if file_paths else G_cluster.number_of_nodes()
+        adaptive_resolution = auto_resolution(n_files)
         logger.info(
-            "A.10 auto_resolution (calibrated): γ_sec=%.4f for %d nodes "
-            "(was hardcoded %.2f)",
-            adaptive_resolution, G_cluster.number_of_nodes(), section_resolution,
+            "A.10 auto_resolution (calibrated): γ_sec=%.4f for %d files "
+            "(was hardcoded %.2f, feeding %d symbol nodes would have given %.4f)",
+            adaptive_resolution, n_files, section_resolution,
+            G_cluster.number_of_nodes(),
+            auto_resolution(G_cluster.number_of_nodes()),
         )
         section_resolution = adaptive_resolution
 
