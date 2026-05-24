@@ -85,33 +85,6 @@ WELL_KNOWN_INTERFACES: Dict[str, frozenset] = {
 }
 
 
-def _normalize_go_type(t: str) -> str:
-    """Normalize a Go type string for cross-package signature comparison (A.15.2).
-
-    Strips the outermost package prefix and preserves leading ``*`` /
-    ``&`` / ``[`` indicators. The same type seen from inside its own
-    package (``PlaceOrderRequest``) and from outside (``pb.PlaceOrderRequest``)
-    will normalize to the same canonical form, which is what the
-    structural-typing check needs for proto-generated code.
-
-    Best-effort only — does not handle generic type parameters,
-    nested package paths beyond one level, or function-typed
-    parameters like ``func(context.Context) error``. Wrong canonicalization
-    in those cases produces *false negatives* (we'd miss a true
-    implementation), which is the safer failure direction.
-    """
-    if not t:
-        return t
-    t = t.strip()
-    prefix = ""
-    while t and t[0] in "*&[":
-        prefix += t[0]
-        t = t[1:]
-    if "." in t and not t.startswith("("):
-        t = t.rsplit(".", 1)[-1]
-    return prefix + t
-
-
 def _parse_single_go_file(file_path: str) -> Tuple[str, ParseResult]:
     """Parse a single Go file — used by parallel workers (module-level for pickling)."""
     try:
@@ -1351,83 +1324,34 @@ class GoVisitorParser(BaseParser):
 
     def _detect_implicit_interfaces(self, results: Dict[str, ParseResult]) -> None:
         """
-        Detect implicit interface implementations via method-set subset
-        matching with **signature compatibility** (A.15.2).
+        Detect implicit interface implementations via method-set subset matching.
 
         Emits two kinds of IMPLEMENTATION edges per matched pair:
           1. Struct-level: ``struct → interface``
           2. Method-level: ``struct.method → interface.method`` for each
-             interface method the struct satisfies. The wiki planner
-             walks from interface methods to bodies via these.
+             interface method the struct also defines. The wiki planner
+             walks from interface methods to bodies via these — without
+             them, the orchestration code (e.g. ``cs.PlaceOrder``) is
+             unreachable from its declaring interface.
 
-        Three layered checks:
-          1. **Defensive true-interfaces filter** — only iterate names
-             that actually came from a ``symbol_type == INTERFACE``
-             declaration. ``_global_interface_methods`` is supposed to
-             only contain real interfaces, but empirically (microservices-
-             demo run, May 2026) struct names like ``CartItem`` ended up
-             as keys. Defensive cross-check against the per-pass scan of
-             ``result.symbols`` filters those out.
-          2. **Unexported method filter** — strip ``mustEmbedUnimplemented*``
-             and similar lowercase-leading methods from the interface set
-             before subset comparison. They're protoc-gen-go-grpc's
-             forward-compat markers, intentionally unimplementable from
-             outside the generating package.
-          3. **Signature compatibility** — for each candidate (struct,
-             interface) pair, every exported interface method must have
-             a matching method on the struct with **identical normalized
-             parameter types and return types**. This is real Go
-             structural typing — not just method-name overlap. Type
-             normalization strips outermost package prefix (``pb.X``
-             vs ``X`` — same type seen from different packages) which
-             handles the common gRPC-generated pattern where impl uses
-             qualified names and the interface lives in the genproto
-             package itself.
-
-        Stdlib interfaces (WELL_KNOWN_INTERFACES) keep method-name-only
-        matching with low confidence — we don't have stdlib signatures
-        and the small fixed set has bounded false-positive risk.
+        Filters unexported interface methods (e.g. protoc-gen-go-grpc's
+        ``mustEmbedUnimplemented*`` markers) from the subset check.
+        Those are intentionally unimplementable from outside the
+        generating package — they exist as a forward-compat compile-time
+        check, never as part of a struct's runtime API. Including them
+        in the subset check makes every gRPC-generated interface fail to
+        match its implementations, since `mustEmbed*` is provided by
+        embedding the generated ``Unimplemented*`` struct rather than
+        by direct definition.
         """
         # Build struct → method set from global method registry
         struct_methods: Dict[str, Set[str]] = {}
         for type_name, methods in self._global_method_registry.items():
             struct_methods[type_name] = set(methods.keys())
 
-        # Build true-interfaces set from a fresh scan — defensive against
-        # any path that may have populated _global_interface_methods with
-        # a non-interface name.
-        true_interfaces: Set[str] = set()
-        # Build (parent, method_name) → (param_types_tuple, return_type)
-        # lookup with normalized types, drawn from each method symbol's
-        # already-typed parameter_types and return_type fields (set by
-        # _handle_method_declaration and _extract_interface_members).
-        method_sigs: Dict[Tuple[str, str], Tuple[Tuple[str, ...], str]] = {}
-        for _file_path, result in results.items():
-            for sym in result.symbols:
-                if sym.symbol_type == SymbolType.INTERFACE:
-                    true_interfaces.add(sym.name)
-                if sym.symbol_type == SymbolType.METHOD and sym.parent_symbol:
-                    param_types = tuple(
-                        _normalize_go_type(t) for t in (sym.parameter_types or [])
-                    )
-                    ret = _normalize_go_type(sym.return_type or "")
-                    method_sigs[(sym.parent_symbol, sym.name)] = (param_types, ret)
-
         def _exported(methods: Set[str]) -> Set[str]:
             """Filter Go unexported (lowercase-leading) names — markers, not real API."""
             return {m for m in methods if m and not m[0].islower()}
-
-        def _signatures_match(iface_name_: str, struct_name_: str,
-                              iface_methods_: Set[str]) -> bool:
-            """Return True when every iface method has an identical-signature counterpart on struct."""
-            for m in iface_methods_:
-                iface_sig = method_sigs.get((iface_name_, m))
-                struct_sig = method_sigs.get((struct_name_, m))
-                if iface_sig is None or struct_sig is None:
-                    return False
-                if iface_sig != struct_sig:
-                    return False
-            return True
 
         def _emit_pair(
             struct_file: Optional[str],
@@ -1469,12 +1393,8 @@ class GoVisitorParser(BaseParser):
                     annotations=method_anns,
                 ))
 
-        # Check repo-local interfaces — full signature compatibility
+        # Check repo-local interfaces
         for iface_name, iface_methods_full in self._global_interface_methods.items():
-            if iface_name not in true_interfaces:
-                # Defensive: skip any name that didn't come from a real
-                # interface declaration (the CartItem case).
-                continue
             if not iface_methods_full:
                 continue
             iface_methods = _exported(iface_methods_full)
@@ -1483,23 +1403,18 @@ class GoVisitorParser(BaseParser):
             for struct_name, struct_meths in struct_methods.items():
                 if struct_name == iface_name:
                     continue
-                # Cheap pre-check: method names must subset
-                if not iface_methods.issubset(struct_meths):
-                    continue
-                # Real Go structural typing: param + return types must match
-                if not _signatures_match(iface_name, struct_name, iface_methods):
-                    continue
-                _emit_pair(
-                    struct_file=self._global_type_registry.get(struct_name),
-                    iface_file=self._global_type_registry.get(iface_name),
-                    struct_name=struct_name,
-                    iface_name=iface_name,
-                    shared_methods=iface_methods,
-                    confidence=0.95,  # signature-compat verified
-                    annotations={'implicit': True, 'signature_verified': True},
-                )
+                if iface_methods.issubset(struct_meths):
+                    _emit_pair(
+                        struct_file=self._global_type_registry.get(struct_name),
+                        iface_file=self._global_type_registry.get(iface_name),
+                        struct_name=struct_name,
+                        iface_name=iface_name,
+                        shared_methods=iface_methods,
+                        confidence=0.9,
+                        annotations={'implicit': True},
+                    )
 
-        # Stdlib well-known interfaces — name-only match (no stdlib signature DB)
+        # Check well-known stdlib interfaces
         for iface_full_name, iface_methods_full in WELL_KNOWN_INTERFACES.items():
             iface_methods = _exported(iface_methods_full)
             if not iface_methods:
@@ -1512,9 +1427,8 @@ class GoVisitorParser(BaseParser):
                         struct_name=struct_name,
                         iface_name=iface_full_name,
                         shared_methods=iface_methods,
-                        confidence=0.7,  # name-only stdlib match — lower confidence
-                        annotations={'implicit': True, 'stdlib': True,
-                                     'signature_verified': False},
+                        confidence=0.85,
+                        annotations={'implicit': True, 'stdlib': True},
                     )
 
     def _resolve_cross_file_calls(self, results: Dict[str, ParseResult]) -> None:
