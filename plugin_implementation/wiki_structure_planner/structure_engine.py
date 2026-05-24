@@ -762,6 +762,13 @@ class WikiStructurePlannerEngine:
 
     # -----------------------------------------------------------------
     # Graph-First Structure Planning (Phase B — feature-flagged)
+    #
+    # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+    # Called only by _generate_wiki_structure_graph_first in
+    # agents/wiki_graph_optimized.py:1990 — itself unreachable because the
+    # planner-choice resolver never returns "graph_first". The deepagents
+    # plan_structure path (line 274) is the active one. Coordinated removal
+    # pending after Phase A success criteria pass.
     # -----------------------------------------------------------------
 
     def plan_structure_graph_first(
@@ -898,6 +905,9 @@ class WikiStructurePlannerEngine:
                 files.append(rel)
         return files
 
+    # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+    # Called only by plan_structure_graph_first above; both die together in
+    # the coordinated cleanup batch.
     def _validate_graph_first(
         self,
         data: Dict[str, Any],

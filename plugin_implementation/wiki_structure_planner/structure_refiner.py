@@ -1,6 +1,21 @@
 """
-LLM Refinement for Structure Skeleton
+LLM Refinement for Structure Skeleton.
 
+DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14.
+
+Status: production-unreachable. The only production importer of this
+module is ``structure_engine.py:25`` (``from .structure_refiner import
+refine_with_llm``), which uses ``refine_with_llm`` exclusively inside
+``plan_structure_graph_first`` (line 843). That planner method is itself
+unreachable because the planner-choice resolver never returns
+``"graph_first"``. All other public functions in this file
+(``prioritize_symbols``, ``summarize_cluster``, ``assemble_wiki_structure``,
+etc.) have zero production importers — only tests reference them.
+
+Coordinated removal pending after Phase A success criteria pass — kept as
+revert/rework reference until then.
+
+Original purpose, retained for reference until removal:
 Phase 2 of the Graph-First approach.  The LLM receives only fixed-size
 cluster *summaries* (≈5 lines each, regardless of symbol count).  It
 outputs names, section grouping, and descriptions.  Symbols and folders

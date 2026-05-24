@@ -1,6 +1,26 @@
 """
-Deterministic Structure Skeleton Builder
+Deterministic Structure Skeleton Builder.
 
+DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14.
+
+Status: production-unreachable. This module's symbols (``build_skeleton``,
+``StructureSkeleton``, ``SymbolInfo``, ``DirCluster``, ``DocCluster``) are
+imported only by the graph_first planner chain
+(``structure_engine.plan_structure_graph_first``) and ``structure_refiner``,
+which is itself reached only via the same dead chain. The active planner
+modes ``cluster`` (hierarchical Leiden via ``ClusterStructurePlanner``) and
+``deepagents`` (``WikiStructurePlannerEngine.plan_structure``, line 274)
+do not call any symbol from this module.
+
+Coordinated removal pending after Phase A success criteria pass — kept as
+revert/rework reference until then.
+
+In wikis (the parallel codebase), this same file has been *reanimated* by
+maintainers and is actively imported by 25+ modules. That decision is
+investigated separately under Track 2 / Phase E.0; deepwiki_plugin's copy
+is independent and stays on the deletion path.
+
+Original purpose, retained for reference until removal:
 Builds a complete repository structure skeleton without any LLM calls.
 Uses graph topology (Louvain community detection) to cluster directories
 into page-sized groups, ensuring 100% directory and symbol coverage by
