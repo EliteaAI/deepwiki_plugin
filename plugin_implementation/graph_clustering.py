@@ -360,6 +360,12 @@ def auto_resolution(node_count: int) -> float:
 # 2. Macro-Clustering (Wiki Sections)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Production-unreachable via the hierarchical_leiden=True gate at line 2130.
+# Reachable only from the "Legacy pipeline" else-branch below (line 2133),
+# which the gate never enters because feature_flags.hierarchical_leiden is
+# hardcoded True. Default branch routes to _louvain_macro below.
+# Coordinated removal pending after Phase A success criteria pass.
 def macro_cluster(
     G: nx.MultiDiGraph,
     hubs: Set[str],
@@ -408,6 +414,10 @@ def macro_cluster(
     return _louvain_macro(G_work, resolution)
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Original Louvain macro implementation; production runs hierarchical Leiden
+# instead (see _run_phase3_hierarchical_leiden at line 1946). Coordinated
+# removal pending after Phase A success criteria pass.
 def _louvain_macro(
     G_work: nx.MultiDiGraph,
     resolution: float,
@@ -675,6 +685,13 @@ def _nx_directed_to_igraph(
 # 3. Micro-Clustering (Wiki Pages)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Production-unreachable via the hierarchical_leiden=True gate at line 2130.
+# Default branch routes to _louvain_micro below (with an igraph-based Infomap
+# fallback when igraph is available — also dead-via-feature-flag).
+# Future Infomap micro-clustering will land via a dedicated C-lib binding;
+# see GAP_ANALYSIS_AND_ROADMAP.md §8 deferred item 3.
+# Coordinated removal pending after Phase A success criteria pass.
 def micro_cluster(
     G: nx.MultiDiGraph,
     macro_nodes: Set[str],
@@ -710,6 +727,12 @@ def micro_cluster(
     return _louvain_micro(G, macro_nodes, resolution)
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Original Louvain micro implementation; production runs hierarchical Leiden
+# instead. The Infomap-via-igraph fallback inside this function is also
+# dead-via-feature-flag and is NOT the basis for the future Infomap
+# micro-clusterer — that will use a dedicated C-lib binding (§8 #3).
+# Coordinated removal pending after Phase A success criteria pass.
 def _louvain_micro(
     G: nx.MultiDiGraph,
     macro_nodes: Set[str],
@@ -2131,6 +2154,12 @@ def run_phase3(
         return _run_phase3_hierarchical_leiden(db, G, hubs, feature_flags=feature_flags)
 
     # ── Legacy pipeline (unchanged) ──────────────────────────────────
+    # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+    # Unreachable when feature_flags.hierarchical_leiden is True (which is the
+    # hardcoded production setting at feature_flags.py:64). The whole else-
+    # branch below — and every Louvain helper it calls (macro_cluster,
+    # _louvain_macro, micro_cluster, _louvain_micro) — is dead in production.
+    # Coordinated removal pending after Phase A success criteria pass.
     results: Dict[str, Any] = {}
 
     # Get hubs from DB if not provided
