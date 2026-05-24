@@ -1433,6 +1433,10 @@ def _dir_similarity(a: Counter, b: Counter) -> int:
 BRIDGE_WEIGHT = 0.1
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Zero production callers; only tests/test_component_bridging.py exercises it.
+# Active bridging is bridge_disconnected_components in graph_topology.py:1343.
+# Coordinated removal pending after Phase A success criteria pass.
 def _bridge_components(P: nx.MultiDiGraph) -> Dict[str, Any]:
     """Connect disconnected components in the projected graph.
 
