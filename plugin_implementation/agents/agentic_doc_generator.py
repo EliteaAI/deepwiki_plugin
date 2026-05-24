@@ -1,10 +1,30 @@
 """
-Agentic Documentation Generator with Context Swapping
+Agentic Documentation Generator with Context Swapping (V1 — DEPRECATED).
 
-This module implements a section-by-section documentation generation approach
-that keeps context size manageable by swapping code context between sections.
+DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14.
 
-Key features:
+Status: zero production usage.
+- ``AgenticDocGenerator`` is imported at ``agents/wiki_graph_optimized.py:48`` and
+  re-exported from ``agents/__init__.py:11``, but never instantiated outside
+  ``tests/test_agentic_generator.py``.
+- ``should_use_agentic_mode()`` defined here is also imported by
+  ``wiki_graph_optimized.py:48`` but never called in production. The module
+  ships only test-bound symbols at runtime.
+
+V2 (``agentic_doc_generator_v2.py``) is the path the production agentic
+generator was migrated to ~6 months ago. Production has been on the one-shot
+prompt path for the cluster planner since then; the V2 path itself is also
+unused in current production.
+
+This module + its dead imports + its test file (``test_agentic_generator.py``)
+get removed in the coordinated cleanup batch after Phase A success criteria
+pass. Do not import in new code.
+
+Original purpose, retained for reference until removal:
+section-by-section documentation generation with context swapping between
+sections.
+
+Key features (historical):
 - Constant context size (~15-20K tokens per iteration)
 - Two-tool workflow: commit_section + request_next_section
 - Table of Contents tracking for coherence
