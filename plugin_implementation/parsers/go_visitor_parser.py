@@ -1325,61 +1325,111 @@ class GoVisitorParser(BaseParser):
     def _detect_implicit_interfaces(self, results: Dict[str, ParseResult]) -> None:
         """
         Detect implicit interface implementations via method-set subset matching.
-        
-        For each interface, check if any struct/type has all of its methods.
-        Also checks against well-known stdlib interfaces.
+
+        Emits two kinds of IMPLEMENTATION edges per matched pair:
+          1. Struct-level: ``struct → interface``
+          2. Method-level: ``struct.method → interface.method`` for each
+             interface method the struct also defines. The wiki planner
+             walks from interface methods to bodies via these — without
+             them, the orchestration code (e.g. ``cs.PlaceOrder``) is
+             unreachable from its declaring interface.
+
+        Filters unexported interface methods (e.g. protoc-gen-go-grpc's
+        ``mustEmbedUnimplemented*`` markers) from the subset check.
+        Those are intentionally unimplementable from outside the
+        generating package — they exist as a forward-compat compile-time
+        check, never as part of a struct's runtime API. Including them
+        in the subset check makes every gRPC-generated interface fail to
+        match its implementations, since `mustEmbed*` is provided by
+        embedding the generated ``Unimplemented*`` struct rather than
+        by direct definition.
         """
         # Build struct → method set from global method registry
         struct_methods: Dict[str, Set[str]] = {}
         for type_name, methods in self._global_method_registry.items():
             struct_methods[type_name] = set(methods.keys())
 
+        def _exported(methods: Set[str]) -> Set[str]:
+            """Filter Go unexported (lowercase-leading) names — markers, not real API."""
+            return {m for m in methods if m and not m[0].islower()}
+
+        def _emit_pair(
+            struct_file: Optional[str],
+            iface_file: Optional[str],
+            struct_name: str,
+            iface_name: str,
+            shared_methods: Set[str],
+            *,
+            confidence: float,
+            annotations: Dict[str, Any],
+        ) -> None:
+            """Emit struct-level + method-level IMPLEMENTATION edges for one matched pair."""
+            if not (struct_file and struct_file in results):
+                return
+            empty_range = Range(
+                start=Position(line=1, column=0),
+                end=Position(line=1, column=0),
+            )
+            results[struct_file].relationships.append(Relationship(
+                source_symbol=struct_name,
+                target_symbol=iface_name,
+                relationship_type=RelationshipType.IMPLEMENTATION,
+                source_file=struct_file,
+                target_file=iface_file,
+                source_range=empty_range,
+                confidence=confidence,
+                annotations=annotations,
+            ))
+            method_anns = {**annotations, 'method_level': True}
+            for method_name in shared_methods:
+                results[struct_file].relationships.append(Relationship(
+                    source_symbol=f"{struct_name}.{method_name}",
+                    target_symbol=f"{iface_name}.{method_name}",
+                    relationship_type=RelationshipType.IMPLEMENTATION,
+                    source_file=struct_file,
+                    target_file=iface_file,
+                    source_range=empty_range,
+                    confidence=confidence,
+                    annotations=method_anns,
+                ))
+
         # Check repo-local interfaces
-        for iface_name, iface_methods in self._global_interface_methods.items():
+        for iface_name, iface_methods_full in self._global_interface_methods.items():
+            if not iface_methods_full:
+                continue
+            iface_methods = _exported(iface_methods_full)
             if not iface_methods:
                 continue
             for struct_name, struct_meths in struct_methods.items():
                 if struct_name == iface_name:
                     continue
                 if iface_methods.issubset(struct_meths):
-                    # Find which file has the struct to attach the relationship
-                    struct_file = self._global_type_registry.get(struct_name)
-                    iface_file = self._global_type_registry.get(iface_name)
-                    if struct_file and struct_file in results:
-                        results[struct_file].relationships.append(Relationship(
-                            source_symbol=struct_name,
-                            target_symbol=iface_name,
-                            relationship_type=RelationshipType.IMPLEMENTATION,
-                            source_file=struct_file,
-                            target_file=iface_file,
-                            source_range=Range(
-                                start=Position(line=1, column=0),
-                                end=Position(line=1, column=0),
-                            ),
-                            confidence=0.9,  # structural, not declared
-                            annotations={'implicit': True},
-                        ))
+                    _emit_pair(
+                        struct_file=self._global_type_registry.get(struct_name),
+                        iface_file=self._global_type_registry.get(iface_name),
+                        struct_name=struct_name,
+                        iface_name=iface_name,
+                        shared_methods=iface_methods,
+                        confidence=0.9,
+                        annotations={'implicit': True},
+                    )
 
         # Check well-known stdlib interfaces
-        for iface_full_name, iface_methods in WELL_KNOWN_INTERFACES.items():
-            iface_short = iface_full_name.split('.')[-1] if '.' in iface_full_name else iface_full_name
+        for iface_full_name, iface_methods_full in WELL_KNOWN_INTERFACES.items():
+            iface_methods = _exported(iface_methods_full)
+            if not iface_methods:
+                continue
             for struct_name, struct_meths in struct_methods.items():
                 if iface_methods.issubset(struct_meths):
-                    struct_file = self._global_type_registry.get(struct_name)
-                    if struct_file and struct_file in results:
-                        results[struct_file].relationships.append(Relationship(
-                            source_symbol=struct_name,
-                            target_symbol=iface_full_name,
-                            relationship_type=RelationshipType.IMPLEMENTATION,
-                            source_file=struct_file,
-                            target_file=None,
-                            source_range=Range(
-                                start=Position(line=1, column=0),
-                                end=Position(line=1, column=0),
-                            ),
-                            confidence=0.85,  # stdlib match
-                            annotations={'implicit': True, 'stdlib': True},
-                        ))
+                    _emit_pair(
+                        struct_file=self._global_type_registry.get(struct_name),
+                        iface_file=None,
+                        struct_name=struct_name,
+                        iface_name=iface_full_name,
+                        shared_methods=iface_methods,
+                        confidence=0.85,
+                        annotations={'implicit': True, 'stdlib': True},
+                    )
 
     def _resolve_cross_file_calls(self, results: Dict[str, ParseResult]) -> None:
         """Resolve cross-file CALLS relationships using global registries."""
