@@ -35,6 +35,16 @@ from ..feature_flags import FeatureFlags, get_feature_flags
 from ..graph_orphan_hybrid import rrf_fuse
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# These constants and _clamp set cross-language edge weights to [0.3, 0.8]
+# at emission time, but apply_edge_weights() in graph_topology.py
+# unconditionally overwrites every edge's ``weight`` with inverse-in-degree
+# (line 141 of that file) before Leiden runs. The clamp therefore never
+# reaches clustering — it's dead-on-arrival in the production pipeline.
+# Kept until coordinated cleanup batch so the call sites below
+# (_clamp(...) in L0/L1/L2/L3 emit paths) don't have to be touched in
+# the same change. Real removal happens alongside the L0–L3 cascade
+# replacement in Phase D (contract-node abstraction).
 _WEIGHT_FLOOR = 0.3
 _WEIGHT_CEIL = 0.8
 
