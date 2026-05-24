@@ -5317,8 +5317,6 @@ class OptimizedWikiGenerationAgent:
         )
         
         return generated_content
-        
-        return generated_content
 
     def _generate_with_continuation(self, page_spec: PageSpec, relevant_content: Dict[str, Any],
                                     repo_context: str, config: RunnableConfig) -> str:
