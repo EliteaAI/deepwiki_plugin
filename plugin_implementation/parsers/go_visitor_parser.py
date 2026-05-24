@@ -61,30 +61,6 @@ GO_BUILTIN_FUNCTIONS = frozenset({
     'complex', 'real', 'imag', 'clear', 'min', 'max',
 })
 
-# Well-known stdlib interfaces for implicit implementation detection.
-# Maps interface_name → frozenset of method signatures (just names for now).
-WELL_KNOWN_INTERFACES: Dict[str, frozenset] = {
-    'error': frozenset({'Error'}),
-    'fmt.Stringer': frozenset({'String'}),
-    'io.Reader': frozenset({'Read'}),
-    'io.Writer': frozenset({'Write'}),
-    'io.Closer': frozenset({'Close'}),
-    'io.ReadWriter': frozenset({'Read', 'Write'}),
-    'io.ReadCloser': frozenset({'Read', 'Close'}),
-    'io.WriteCloser': frozenset({'Write', 'Close'}),
-    'io.ReadWriteCloser': frozenset({'Read', 'Write', 'Close'}),
-    'sort.Interface': frozenset({'Len', 'Less', 'Swap'}),
-    'encoding.TextMarshaler': frozenset({'MarshalText'}),
-    'encoding.TextUnmarshaler': frozenset({'UnmarshalText'}),
-    'encoding.BinaryMarshaler': frozenset({'MarshalBinary'}),
-    'encoding.BinaryUnmarshaler': frozenset({'UnmarshalBinary'}),
-    'json.Marshaler': frozenset({'MarshalJSON'}),
-    'json.Unmarshaler': frozenset({'UnmarshalJSON'}),
-    'context.Context': frozenset({'Deadline', 'Done', 'Err', 'Value'}),
-    'http.Handler': frozenset({'ServeHTTP'}),
-}
-
-
 def _parse_single_go_file(file_path: str) -> Tuple[str, ParseResult]:
     """Parse a single Go file — used by parallel workers (module-level for pickling)."""
     try:
@@ -1414,22 +1390,18 @@ class GoVisitorParser(BaseParser):
                         annotations={'implicit': True},
                     )
 
-        # Check well-known stdlib interfaces
-        for iface_full_name, iface_methods_full in WELL_KNOWN_INTERFACES.items():
-            iface_methods = _exported(iface_methods_full)
-            if not iface_methods:
-                continue
-            for struct_name, struct_meths in struct_methods.items():
-                if iface_methods.issubset(struct_meths):
-                    _emit_pair(
-                        struct_file=self._global_type_registry.get(struct_name),
-                        iface_file=None,
-                        struct_name=struct_name,
-                        iface_name=iface_full_name,
-                        shared_methods=iface_methods,
-                        confidence=0.85,
-                        annotations={'implicit': True, 'stdlib': True},
-                    )
+        # Stdlib interface emission removed (A.15.3): stdlib types like
+        # ``fmt.Stringer`` and ``io.Writer`` have no corresponding nodes in
+        # the graph (stdlib isn't parsed). Targets like ``fmt.Stringer.String``
+        # therefore fall through to the persistence resolver's last-name
+        # fuzzy fallback (graph_builder.py:1944, Strategy 7), which on
+        # microservices-demo produced 35 wrong edges (every proto type's
+        # ``String`` method routed to ``quote.Quote.String``) plus 3
+        # self-loops (``responseRecorder.Write`` resolving to itself as
+        # the only struct with a ``Write`` method). Re-enable only after
+        # either (a) injecting placeholder nodes for stdlib interface
+        # methods, or (b) extending the resolver to skip stdlib-shaped
+        # targets instead of fuzzy-matching them.
 
     def _resolve_cross_file_calls(self, results: Dict[str, ParseResult]) -> None:
         """Resolve cross-file CALLS relationships using global registries."""
