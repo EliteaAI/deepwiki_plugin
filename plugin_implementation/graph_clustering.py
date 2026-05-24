@@ -2031,6 +2031,30 @@ def _run_phase3_hierarchical_leiden(
         "test_nodes_excluded": len(excluded_test_nodes),
     }
 
+    # A.10: under the calibrated weight profile, derive the section-pass
+    # resolution from graph size instead of the hardcoded 1.0. The
+    # auto_resolution() formula yields γ ≈ 0.6 for ~100-node graphs,
+    # γ ≈ 0.5 for ~500-node graphs, γ → 0.3 for very large graphs —
+    # which fixes the over-clustering symptom on small repos (one
+    # community per file at γ=1.0) without disturbing the consolidator's
+    # downstream rebalancing on large repos.
+    #
+    # Only fires when:
+    #   - caller used the default (didn't explicitly override
+    #     section_resolution)
+    #   - feature_flags.weight_calibration_profile == "calibrated"
+    # Legacy profile keeps the hardcoded 1.0 unchanged.
+    if (section_resolution == LEIDEN_FILE_SECTION_RESOLUTION
+            and getattr(feature_flags, "weight_calibration_profile", "legacy")
+                == "calibrated"):
+        adaptive_resolution = auto_resolution(G_cluster.number_of_nodes())
+        logger.info(
+            "A.10 auto_resolution (calibrated): γ_sec=%.4f for %d nodes "
+            "(was hardcoded %.2f)",
+            adaptive_resolution, G_cluster.number_of_nodes(), section_resolution,
+        )
+        section_resolution = adaptive_resolution
+
     # Step 1+2: Hierarchical Leiden on the (possibly filtered) graph
     leiden_result = hierarchical_leiden_cluster(
         G_cluster, hubs,
