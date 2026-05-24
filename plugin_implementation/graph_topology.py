@@ -336,13 +336,51 @@ def _expanding_prefixes(rel_path: str) -> List[str]:
     return prefixes
 
 
-def find_orphans(G: nx.MultiDiGraph) -> List[str]:
-    """Return node IDs with both in-degree == 0 and out-degree == 0.
+def find_orphans(G: nx.MultiDiGraph, *, strict: bool = False) -> List[str]:
+    """Return node IDs eligible for synthetic enrichment.
 
-    These are completely disconnected nodes — documentation files,
-    standalone scripts, event handlers, cross-language stubs, etc.
-    They need synthetic edges to participate in clustering.
+    Two profiles, controlled by ``feature_flags.weight_calibration_profile``:
+
+    * **legacy** (default) — nodes with both ``in_degree == 0`` and
+      ``out_degree == 0``. Truly disconnected: documentation files,
+      standalone scripts, cross-language stubs, etc.
+    * **calibrated** (A.11) — nodes with ``in_degree == 0`` regardless
+      of ``out_degree``. Catches top-level scripts (``main.go``, app
+      entry points) and isolated event handlers that *import*
+      dependencies but are never *imported by* anything else. Today
+      they're disqualified because their outbound import edges flip
+      ``out_degree`` above zero, even though they're structurally
+      isolated from any architectural unit and would benefit from
+      semantic enrichment.
+
+    Args:
+        G: the graph.
+        strict: if True, ignore the profile and always use the legacy
+            (degree==0) criterion. ``orphans_remaining`` stat consumers
+            pass this so the resolved-count metric stays comparable
+            across profile flips. Synthetic enrichment edges go *from*
+            the orphan *to* an anchor (orphan's ``out_degree`` rises;
+            ``in_degree`` stays the same), which means under the
+            calibrated profile the same node would still match the
+            ``in_degree==0`` criterion after resolution. Strict mode
+            avoids that artifact for stat purposes.
     """
+    if strict:
+        return [
+            n for n in G.nodes()
+            if G.in_degree(n) == 0 and G.out_degree(n) == 0
+        ]
+
+    profile = "legacy"
+    try:
+        from .feature_flags import get_feature_flags
+        profile = get_feature_flags().weight_calibration_profile
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    if profile == "calibrated":
+        return [n for n in G.nodes() if G.in_degree(n) == 0]
+
     return [
         n for n in G.nodes()
         if G.in_degree(n) == 0 and G.out_degree(n) == 0
@@ -612,7 +650,10 @@ def _resolve_orphans_v2(
     if remaining:
         stats["directory"] = _resolve_orphans_by_directory(db, G, remaining)
 
-    stats["orphans_remaining"] = len(find_orphans(G))
+    # Stats use strict=True so the resolved-count is comparable across
+    # legacy/calibrated profiles (see find_orphans docstring on the
+    # in_degree-stays-zero artifact under calibrated).
+    stats["orphans_remaining"] = len(find_orphans(G, strict=True))
     stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
 
     logger.info(
@@ -989,7 +1030,9 @@ def resolve_orphans(
         stats["directory"], t5 - t4,
     )
 
-    stats["orphans_remaining"] = len(find_orphans(G))
+    # Stats use strict=True for cross-profile comparability (see
+    # find_orphans docstring).
+    stats["orphans_remaining"] = len(find_orphans(G, strict=True))
     stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
 
     logger.info(
