@@ -1776,6 +1776,8 @@ def hierarchical_leiden_cluster(
     section_resolution: float = LEIDEN_FILE_SECTION_RESOLUTION,
     page_resolution: float = LEIDEN_PAGE_RESOLUTION,
     seed: int = 42,
+    macro_excluded_edge_classes: Optional[Set[str]] = None,
+    micro_excluded_edge_classes: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """Two-pass Leiden with file-level contraction for sections.
 
@@ -1796,6 +1798,16 @@ def hierarchical_leiden_cluster(
         section_resolution: Leiden γ for the file-contracted section pass.
         page_resolution: Leiden γ for the per-section page pass.
         seed: Random seed for reproducibility.
+        macro_excluded_edge_classes: When provided, drop edges of these
+            classes from the input graph before the section pass. Used to
+            keep doc/lexical/semantic noise from drawing files into
+            unrelated subsystems. Default ``None`` = no filter (legacy
+            behaviour). Set by ``_run_phase3_hierarchical_leiden`` when
+            ``feature_flags.weight_calibration_profile == "calibrated"``.
+        micro_excluded_edge_classes: Same idea for the per-section page
+            pass; typically a subset of the macro filter (e.g. macro drops
+            ``doc`` to keep doc fuzziness out of section boundaries; micro
+            keeps ``doc`` so a markdown_section can anchor a page).
 
     Returns:
         ``{"sections": {sec_id: {"pages": {pg_id: [node_ids]}}},
@@ -1829,7 +1841,17 @@ def hierarchical_leiden_cluster(
     G_sub = G_projected.subgraph(non_hub_nodes).copy()
 
     # ── Pass 1: Section-level on file-contracted graph ────────────────
-    file_graph, file_to_nodes = _contract_to_file_graph(G_sub)
+    # Optional participation gate (A.12-2): drop edge classes that should
+    # not pull files into the same section (typically doc / lexical /
+    # semantic / directory / bridge under the calibrated profile).
+    G_for_macro = G_sub
+    if macro_excluded_edge_classes:
+        kept_edges = [
+            (u, v, k) for u, v, k, d in G_sub.edges(data=True, keys=True)
+            if d.get("edge_class", "structural") not in macro_excluded_edge_classes
+        ]
+        G_for_macro = G_sub.edge_subgraph(kept_edges).copy()
+    file_graph, file_to_nodes = _contract_to_file_graph(G_for_macro)
 
     connected_files = [f for f in file_graph.nodes() if file_graph.degree(f) > 0]
     isolated_files = [f for f in file_graph.nodes() if file_graph.degree(f) == 0]
@@ -1901,6 +1923,16 @@ def hierarchical_leiden_cluster(
 
         # Extract subgraph for this section and run page Leiden
         sec_subgraph = G_sub.subgraph(node_set)
+        # Optional participation gate (A.12-2) for the page pass: drop
+        # edge classes that shouldn't form page boundaries (e.g. directory
+        # / bridge under calibrated). Doc anchors are typically retained
+        # at micro level even when excluded at macro.
+        if micro_excluded_edge_classes:
+            kept_edges = [
+                (u, v, k) for u, v, k, d in sec_subgraph.edges(data=True, keys=True)
+                if d.get("edge_class", "structural") not in micro_excluded_edge_classes
+            ]
+            sec_subgraph = sec_subgraph.edge_subgraph(kept_edges).copy()
         sec_undirected = _to_weighted_undirected(sec_subgraph)
 
         if sec_undirected.number_of_edges() == 0:
@@ -2031,11 +2063,24 @@ def _run_phase3_hierarchical_leiden(
         "test_nodes_excluded": len(excluded_test_nodes),
     }
 
-    # Step 1+2: Hierarchical Leiden on the (possibly filtered) graph
+    # Step 1+2: Hierarchical Leiden on the (possibly filtered) graph.
+    # Under the calibrated weight profile (A.12-2), apply the participation
+    # gate: macro pass sees only code-level edges (drops noise classes that
+    # would draw unrelated files into the same section); micro pass keeps
+    # ``doc`` so a markdown_section can still anchor a page within a
+    # section. Legacy profile passes None so behaviour is unchanged.
+    macro_excluded: Optional[Set[str]] = None
+    micro_excluded: Optional[Set[str]] = None
+    if getattr(feature_flags, "weight_calibration_profile", "legacy") == "calibrated":
+        macro_excluded = {"directory", "lexical", "semantic", "doc", "bridge"}
+        micro_excluded = {"directory", "lexical", "semantic", "bridge"}
+
     leiden_result = hierarchical_leiden_cluster(
         G_cluster, hubs,
         section_resolution=section_resolution,
         page_resolution=page_resolution,
+        macro_excluded_edge_classes=macro_excluded,
+        micro_excluded_edge_classes=micro_excluded,
     )
 
     # Step 2b: Consolidation safety net.
