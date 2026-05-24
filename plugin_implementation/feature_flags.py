@@ -38,6 +38,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val in ("1", "true", "yes")
 
 
+def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    """Read a string env var restricted to ``allowed`` values; fall back to ``default``."""
+    val = os.environ.get(name, "").strip().lower()
+    if val and val in allowed:
+        return val
+    return default
+
+
 @dataclass(frozen=True)
 class FeatureFlags:
     """Immutable snapshot of plugin feature flags.
@@ -103,10 +111,28 @@ class FeatureFlags:
     #: Detect generic REST classes and rewrite the FTS query to use the file stem.
     orphan_rest_disambig: bool = True
 
+    # ── Weight calibration (A.12 pilot) ────────────────────────────────
+    #: Selects how synthetic-edge weights are floored in ``apply_edge_weights``.
+    #:
+    #: - ``"legacy"`` (default): uniform ``SYNTHETIC_WEIGHT_FLOOR = 0.5`` for
+    #:   every synthetic edge class — current production behaviour.
+    #: - ``"calibrated"``: per-class floor table scaled by ``raw_similarity``
+    #:   when available. Higher floor for embedding-derived edges, lower for
+    #:   pure heuristics. Documented in
+    #:   ``_graph_audit/GAP_ANALYSIS_AND_ROADMAP.md`` §A.12.
+    #:
+    #: Env: ``DEEPWIKI_WEIGHT_CALIBRATION_PROFILE=legacy|calibrated``.
+    weight_calibration_profile: str = "legacy"
+
 
 def get_feature_flags() -> FeatureFlags:
     """Build a ``FeatureFlags`` instance, reading the few remaining env knobs."""
     return FeatureFlags(
         exclude_tests=_env_bool("DEEPWIKI_EXCLUDE_TESTS"),
         test_linker=_env_bool("DEEPWIKI_TEST_LINKER"),
+        weight_calibration_profile=_env_choice(
+            "DEEPWIKI_WEIGHT_CALIBRATION_PROFILE",
+            default="legacy",
+            allowed=("legacy", "calibrated"),
+        ),
     )

@@ -89,6 +89,28 @@ except ImportError:
 SYNTHETIC_WEIGHT_FLOOR = 0.5
 
 
+# Per-edge-class floor weights for the "calibrated" weight_calibration_profile
+# (A.12, see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md). Replaces the uniform
+# 0.5 floor with class-specific values so embedding-derived edges aren't
+# treated identically to pure path-prefix heuristics. When ``raw_similarity``
+# is populated on the edge (semantic / hybrid / lexical RRF), the floor is
+# lifted to ``max(class_floor, raw_similarity)`` — high-similarity edges
+# carry their similarity; weak ones fall back to the class baseline.
+#
+# Implicit confidence by edge_class — see GAP_ANALYSIS doc §A.12 on why a
+# per-class table is the same model as a per-edge ``confidence`` column for
+# our extractor population: each extractor emits one (rel_type, edge_class)
+# pair per confidence level, so confidence is encoded in the *choice* of
+# rel_type rather than per-edge.
+_CALIBRATED_FLOOR_BY_CLASS: Dict[str, float] = {
+    "directory": 0.30,   # name-heuristic (path prefix); lowest confidence
+    "bridge":    0.30,   # disconnected-component glue; Leiden bandage
+    "lexical":   0.40,   # FTS5 BM25 match on symbol/name
+    "doc":       0.40,   # markdown hyperlink + same-dir proximity
+    "semantic":  0.50,   # embedding-derived (hybrid / pure cosine)
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Inverse In-Degree Edge Weighting
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,6 +138,16 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
     if G.number_of_edges() == 0:
         return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
+    # Pick the calibration profile lazily to avoid an import cycle and to
+    # tolerate test contexts that construct a graph without a feature_flags
+    # provider.
+    profile = "legacy"
+    try:
+        from .feature_flags import get_feature_flags
+        profile = get_feature_flags().weight_calibration_profile
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+
     # Compute in-degree using ONLY structural edges (AST-derived).
     # Synthetic edges (orphan resolution, doc injection) are excluded
     # so they don't inflate anchor degrees and crush real edges.
@@ -128,15 +160,33 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
 
     weights = []
     synthetic_count = 0
+    per_class_count: Dict[str, int] = {}
     for u, v, key, data in G.edges(data=True, keys=True):
         in_deg = structural_in.get(v, 0)
         w = 1.0 / math.log(in_deg + 2)
 
-        # Synthetic recovery edges get a weight floor so Leiden
-        # actually groups orphan nodes with their anchors.
-        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
-            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+        # Synthetic recovery edges get a weight floor so Leiden actually
+        # groups orphan nodes with their anchors. Two profiles:
+        #   - "legacy"     — uniform SYNTHETIC_WEIGHT_FLOOR (0.5) for all classes
+        #   - "calibrated" — per-class floor from _CALIBRATED_FLOOR_BY_CLASS,
+        #                    lifted to raw_similarity when populated
+        edge_class = data.get("edge_class", "structural")
+        if edge_class in _SYNTHETIC_CLASSES:
+            if profile == "calibrated":
+                class_floor = _CALIBRATED_FLOOR_BY_CLASS.get(
+                    edge_class, SYNTHETIC_WEIGHT_FLOOR,
+                )
+                raw_sim = data.get("raw_similarity")
+                if raw_sim is not None:
+                    try:
+                        class_floor = max(class_floor, float(raw_sim))
+                    except (TypeError, ValueError):
+                        pass
+                w = max(w, class_floor)
+            else:
+                w = max(w, SYNTHETIC_WEIGHT_FLOOR)
             synthetic_count += 1
+            per_class_count[edge_class] = per_class_count.get(edge_class, 0) + 1
 
         data["weight"] = w
         weights.append(w)
@@ -144,17 +194,27 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
     stats = {
         "edges_weighted": len(weights),
         "synthetic_floored": synthetic_count,
+        "synthetic_per_class": per_class_count,
+        "calibration_profile": profile,
         "min": round(min(weights), 4),
         "max": round(max(weights), 4),
         "mean": round(sum(weights) / len(weights), 4),
     }
 
-    logger.info(
-        "Edge weighting complete: %d edges (%d synthetic floored at %.2f), "
-        "weight range [%.4f, %.4f], mean %.4f",
-        stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
-        stats["min"], stats["max"], stats["mean"],
-    )
+    if profile == "calibrated":
+        logger.info(
+            "Edge weighting complete (%s): %d edges, %d synthetic per-class %s, "
+            "weight range [%.4f, %.4f], mean %.4f",
+            profile, stats["edges_weighted"], synthetic_count, per_class_count,
+            stats["min"], stats["max"], stats["mean"],
+        )
+    else:
+        logger.info(
+            "Edge weighting complete (%s): %d edges (%d synthetic floored at %.2f), "
+            "weight range [%.4f, %.4f], mean %.4f",
+            profile, stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
+            stats["min"], stats["max"], stats["mean"],
+        )
     return stats
 
 
