@@ -52,15 +52,10 @@ rank-bm25==0.2.2
 tiktoken==0.12.0
 
 # --- Graph community detection ----------------------------------
-# graspologic provides Leiden via its native Rust backend
-# (graspologic-native), accepting NetworkX directly. Empirically 3-5×
-# faster than the leidenalg + igraph C++ bridge with equivalent
-# partition quality (verified against configurations + microservices
-# DBs at matching resolution_parameter / seed). igraph stays pinned
-# because InfoMap (``community_infomap``) is igraph-only and we keep
-# it as an alternate micro-cluster algorithm.
+# igraph provides InfoMap (community_infomap) and is the backend for
+# leidenalg.  Both are C-backed with stable, battle-tested wheels.
 python-igraph==1.0.0
-graspologic==3.4.4
+leidenalg==0.11.0
 
 # --- Unified DB (sqlite-vec) ------------------------------------
 # sqlite-vec provides vector KNN search as a loadable SQLite extension.
