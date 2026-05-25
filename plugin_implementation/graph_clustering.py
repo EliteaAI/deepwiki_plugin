@@ -1459,6 +1459,32 @@ def _dir_similarity(a: Counter, b: Counter) -> int:
     return sum(min(a[d], b[d]) for d in a if d in b)
 
 
+def _cross_edges_count(
+    G: nx.MultiDiGraph,
+    src: Set[str],
+    tgt: Set[str],
+) -> int:
+    """Count directed edges in ``G`` between two node sets, both directions.
+
+    For ``MultiDiGraph``, parallel edges are counted separately. Used by
+    consolidation passes to pick the most semantically related merge
+    target (highest edge density between candidate and sibling) instead
+    of the directory-only heuristic that was the only signal before.
+    """
+    if not src or not tgt:
+        return 0
+    src_set = src if isinstance(src, set) else set(src)
+    tgt_set = tgt if isinstance(tgt, set) else set(tgt)
+    count = 0
+    for _u, v in G.out_edges(src_set):
+        if v in tgt_set:
+            count += 1
+    for _u, v in G.out_edges(tgt_set):
+        if v in src_set:
+            count += 1
+    return count
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Component Bridging  (post-projection, pre-Leiden)
 # ───────────────────────────────────────────────────────────────────────────
@@ -1578,32 +1604,43 @@ def _consolidate_sections(
 
     original_count = len(sections)
 
-    # Pre-compute per-section directory histograms and sizes
+    # Pre-compute per-section directory histograms, node sets, sizes.
+    # The node set lets _cross_edges_count score by graph-edge density
+    # (semantic relatedness) instead of the directory-only heuristic
+    # the previous code used as its sole signal.
     sec_dirs: Dict[int, Counter] = {}
+    sec_nodes: Dict[int, Set[str]] = {}
     sec_sizes: Dict[int, int] = {}
     for sid, sec in sections.items():
         all_nids = [nid for pg in sec["pages"].values() for nid in pg]
         sec_dirs[sid] = _dir_histogram(all_nids, G)
+        sec_nodes[sid] = set(all_nids)
         sec_sizes[sid] = len(all_nids)
 
     while len(sections) > target:
         # Pick the smallest section
         smallest_id = min(sec_sizes, key=sec_sizes.get)
         dirs_a = sec_dirs[smallest_id]
+        nodes_a = sec_nodes[smallest_id]
 
-        # Find the best merge target (most shared directories; break ties
-        # by preferring the smaller target to keep sizes balanced).
+        # Score each candidate by (edges, dir_similarity, -size).
+        # Edges first (semantic relatedness — most cross-edges to the
+        # merging section win). Dir-similarity as tiebreak preserves
+        # the prior signal for the case where two siblings have equal
+        # cross-edge counts (typical for tiny components). Smaller
+        # sibling as third tiebreak — same as _consolidate_pages and
+        # the cluster_planner MERGE_WITH policy, keeps tie-breaking
+        # consistent across all merge layers.
         best_target = None
-        best_score = -1
+        best_key: Tuple[int, int, int] = (-1, -1, 1)
         for sid in sections:
             if sid == smallest_id:
                 continue
-            score = _dir_similarity(dirs_a, sec_dirs[sid])
-            if (score > best_score
-                    or (score == best_score
-                        and (best_target is None
-                             or sec_sizes[sid] < sec_sizes[best_target]))):
-                best_score = score
+            edges = _cross_edges_count(G, nodes_a, sec_nodes[sid])
+            dir_sim = _dir_similarity(dirs_a, sec_dirs[sid])
+            key = (edges, dir_sim, -sec_sizes[sid])
+            if key > best_key:
+                best_key = key
                 best_target = sid
 
         if best_target is None:
@@ -1627,6 +1664,7 @@ def _consolidate_sections(
         for d, c in dirs_a.items():
             sec_dirs[best_target][d] = sec_dirs[best_target].get(d, 0) + c
         del sec_dirs[smallest_id]
+        sec_nodes[best_target] |= sec_nodes.pop(smallest_id)
         sec_sizes[best_target] += sec_sizes.pop(smallest_id)
         del sections[smallest_id]
 
@@ -1668,15 +1706,20 @@ def _consolidate_pages(
 
     original_total = total_pages
 
-    # Build global page-size and page-dir indexes: (sid, pid) → size/dirs
+    # Build global page-size, page-dir, and page-node-set indexes:
+    # (sid, pid) → size / dirs / nodes. The node set lets the merge
+    # target pick by graph-edge density (semantic relatedness) instead
+    # of the directory-only heuristic that was the only signal before.
     pg_sizes: Dict[tuple, int] = {}
     pg_dirs: Dict[tuple, Counter] = {}
+    pg_nodes: Dict[tuple, Set[str]] = {}
 
     for sid, sec in sections.items():
         for pid, nids in sec["pages"].items():
             key = (sid, pid)
             pg_sizes[key] = len(nids)
             pg_dirs[key] = _dir_histogram(nids, G)
+            pg_nodes[key] = set(nids)
 
     while total_pages > target_total:
         # Find the globally smallest page that has a sibling in its section
@@ -1690,19 +1733,27 @@ def _consolidate_pages(
                 continue
 
             dirs_a = pg_dirs[(sid, pid)]
+            nodes_a = pg_nodes[(sid, pid)]
 
-            # Best same-section neighbour by directory similarity
+            # Best same-section neighbour scored by
+            # (edges, dir_similarity, -size). Edges first
+            # (semantic relatedness), dir as tiebreak, smaller-sibling
+            # third tiebreak — same policy as _consolidate_sections
+            # and cluster_planner MERGE_WITH.
             best_pg = None
-            best_score = -1
+            best_key: Tuple[int, int, int] = (-1, -1, 1)
             for other_pid in sec_pages:
                 if other_pid == pid:
                     continue
-                score = _dir_similarity(dirs_a, pg_dirs[(sid, other_pid)])
-                if (score > best_score
-                        or (score == best_score
-                            and (best_pg is None
-                                 or pg_sizes[(sid, other_pid)] < pg_sizes.get((sid, best_pg), 0)))):
-                    best_score = score
+                edges = _cross_edges_count(
+                    G, nodes_a, pg_nodes[(sid, other_pid)],
+                )
+                dir_sim = _dir_similarity(
+                    dirs_a, pg_dirs[(sid, other_pid)],
+                )
+                key = (edges, dir_sim, -pg_sizes[(sid, other_pid)])
+                if key > best_key:
+                    best_key = key
                     best_pg = other_pid
 
             if best_pg is None:
@@ -1715,7 +1766,9 @@ def _consolidate_pages(
 
             for d, c in dirs_a.items():
                 pg_dirs[(sid, best_pg)][d] = pg_dirs[(sid, best_pg)].get(d, 0) + c
+            pg_nodes[(sid, best_pg)] |= nodes_a
             del pg_dirs[(sid, pid)]
+            del pg_nodes[(sid, pid)]
             pg_sizes[(sid, best_pg)] += pg_sizes.pop((sid, pid))
 
             total_pages -= 1
