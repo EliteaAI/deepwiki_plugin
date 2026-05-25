@@ -2692,17 +2692,31 @@ class EnhancedUnifiedGraphBuilder:
     def _chunk_text_content(self, content: str, file_path: str, doc_type: str) -> List[Dict[str, Any]]:
         """
         Chunk text content into manageable pieces for documentation files.
-        Only split if content is larger than reasonable size (15-17k characters).
+
+        Markdown is ALWAYS split by H1–H4 headers via LangChain's
+        ``MarkdownHeaderTextSplitter``, regardless of total size — this
+        gives the orphan-resolver's explicit_ref pass finer-grained
+        ``source_text`` per chunk, so a "Configuration Schema" section
+        only links to the symbols it actually mentions instead of every
+        symbol mentioned anywhere in the README. ``_chunk_markdown_content``
+        falls back to a single chunk if the splitter finds no headers.
+
+        Non-markdown doc types (plaintext, yaml, json, config) have no
+        header structure and keep the size-threshold logic — single
+        chunk under 17 k characters, generic line-split above that.
         """
+        if doc_type == 'markdown':
+            return self._chunk_markdown_content(content, file_path)
+
         chunks = []
-        
+
         # Check if document is reasonably sized (13-17k characters)
         content_size = len(content)
         max_reasonable_size = 17000  # 17k characters
         min_split_size = 13000       # 13k characters - only split if larger than this
-        
+
         logger.debug(f"Document size: {content_size} characters, file: {file_path}")
-        
+
         # If document is reasonably sized, keep it as a single chunk
         if content_size <= max_reasonable_size:
             logger.info(f"Document {file_path} ({content_size} chars) fits in context - keeping as single chunk")
@@ -2759,11 +2773,15 @@ class EnhancedUnifiedGraphBuilder:
                 ("####", "Header 4"),
             ]
             
-            # Create markdown splitter
+            # Create markdown splitter — section-level chunks, not per-line.
+            # ``return_each_line=False`` groups all lines under a header into
+            # one chunk; ``True`` would produce a chunk per line, which gives
+            # the orphan-resolver too many micro-nodes that each only mention
+            # one or two symbols and dilute the doc-code explicit_ref signal.
             markdown_splitter = MarkdownHeaderTextSplitter(
                 headers_to_split_on=headers_to_split_on,
                 strip_headers=False,  # Keep headers in content
-                return_each_line=True
+                return_each_line=False,
             )
             
             # Split the markdown content
