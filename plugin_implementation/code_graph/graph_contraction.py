@@ -40,11 +40,38 @@ import networkx as nx
 
 logger = logging.getLogger(__name__)
 
-NOISE_TYPES: Set[str] = {"variable", "parameter", "field"}
-ARCH_TYPES: Set[str] = {
-    "class", "function", "method", "module", "constructor",
-    "interface", "struct",
-}
+#: Closed set of symbol types whose nodes carry no architectural information
+#: beyond what their containing arch already encodes. The contractor drops
+#: these and rewires their edges onto the containing arch (with the dropped
+#: node's identity preserved as a ``via=`` annotation).
+#:
+#: Derived from ``graph_builder._get_type_priority``:
+#: - priority 1 (``parameter``, ``variable``, ``local_variable``,
+#:   ``argument``) → noise (sub-method scope).
+#: - priority 2 (``field``, ``property``) → noise (data, not code).
+#: - priority 2 (``constructor``) → **arch**, NOT noise — it is a callable
+#:   with source code and a wiki-page-worthy unit.
+#: - priority ≥ 3 (``method``, ``function``, ``class``, ``interface``,
+#:   ``trait``, ``protocol``, ``struct``, ``enum``, ``record``,
+#:   ``data_class``, ``object``, ``module``, ``namespace``, ``constant``,
+#:   ``type_alias``, ``annotation``, ``decorator``, ``macro``) → arch.
+#: - All doc types (``text_chunk``, ``markdown_document``, ``yaml_document``,
+#:   ``infrastructure_document``, ...) → not noise; stay as terminals.
+#: - Unknown types → not in this set, treated as terminals (safe default —
+#:   contraction only ever DROPS nodes from this list, never others).
+#:
+#: Keep in sync with ``graph_builder._get_type_priority``: new noise types
+#: must be added here explicitly. We intentionally don't auto-derive from
+#: priority (priority is for disambiguation, a different concern; coupling
+#: would make a priority tweak silently change contraction behaviour).
+NOISE_TYPES: Set[str] = frozenset({
+    "parameter",        # priority 1 — function/method parameter
+    "variable",         # priority 1 — generic variable node
+    "local_variable",   # priority 1 — explicit local-scope variable
+    "argument",         # priority 1 — call-site argument node
+    "field",            # priority 2 — struct/class data member
+    "property",         # priority 2 — getter/setter-backed field
+})
 
 
 def _coerce_annotations(value: Any) -> dict:
@@ -121,10 +148,10 @@ def _walk_to_arch(
     if not data:
         return ""
     sym_type = data.get("symbol_type", "")
-    if sym_type in ARCH_TYPES:
-        return nid
     if sym_type not in NOISE_TYPES:
-        # Doc/constant/text_chunk/other — not noise, not arch; keep as-is.
+        # Arch (class/method/struct/trait/type_alias/...) or doc node or
+        # unknown — terminal in the walk. The current node IS the contraction
+        # target; caller will rewrite edges onto it.
         return nid
     parent_symbol = (data.get("parent_symbol") or "").strip()
     target = _resolve_arch_parent(nid, parent_symbol, by_pkg_full)
@@ -298,4 +325,4 @@ def contract_graph_inplace(graph: nx.MultiDiGraph) -> Dict[str, Any]:
     }
 
 
-__all__ = ["contract_graph_inplace", "NOISE_TYPES", "ARCH_TYPES"]
+__all__ = ["contract_graph_inplace", "NOISE_TYPES"]
