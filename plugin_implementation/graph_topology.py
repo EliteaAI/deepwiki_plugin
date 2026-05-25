@@ -786,6 +786,22 @@ def resolve_orphans(
         _sync_legacy_aliases(out)
         return out
 
+    # ─────────────────────────────────────────────────────────────────────
+    # A14 candidate (dead-via-feature-flag): everything below this point
+    # only runs when ``flags.orphan_cascade_v2`` is False — but it defaults
+    # to True in production (FeatureFlags.orphan_cascade_v2 = True) and the
+    # early-return at line 787 is the only exit taken in live runs. The
+    # `created_by` audit on configurations + microservices-demo confirms
+    # zero edges are emitted from ``fts5_lexical`` (bare, no _v2 suffix)
+    # and ``vec_semantic`` in either repo.
+    #
+    # Modes B (orphan_lexical_tiered) and C (legacy flat FTS + vec) below
+    # are kept only as a kill-switch fallback. Remove after one release
+    # cycle of the v2 cascade being default with no rollbacks observed.
+    # Until then, do not extend these branches — fixes belong in
+    # ``_resolve_orphans_v2``.
+    # ─────────────────────────────────────────────────────────────────────
+
     # ── Pass 1: lexical (tiered T1–T4 OR legacy flat FTS) ────
     if flags is not None and flags.orphan_lexical_tiered:
         try:
@@ -1187,6 +1203,15 @@ def _extract_hyperlink_edges(
     - `` `SymbolName` `` → directed edge doc → code symbol
 
     Returns list of (source_id, target_id) pairs.
+
+    A14 candidate (produces 0 edges in production): the heuristic requires
+    fully-resolvable relative paths inside markdown links, which neither
+    microservices-demo nor configurations READMEs use in practice
+    (verified by ``created_by='md_hyperlink'`` count = 0 in both DBs).
+    The ``explicit_ref_v2`` pass at orphan resolution Pass 1 already
+    extracts symbol mentions from doc text and produces real edges
+    (e.g. README.md → 13 edges on configurations), making this Tier 1
+    redundant. Remove once we're confident no internal repo benefits.
     """
     edges: List[Tuple[str, str]] = []
 
