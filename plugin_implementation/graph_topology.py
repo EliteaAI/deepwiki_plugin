@@ -1293,16 +1293,27 @@ def _extract_proximity_edges(
             # describe the whole project, so attach one edge per
             # top-level directory (capped) — gives the doc a path into
             # each top-level package without ballooning edge count.
+            #
+            # Hash-distributed anchor: each doc picks a *different*
+            # representative per top-level dir based on hash(nid). The
+            # naive ``code_nodes[0]`` shortcut would route every root
+            # doc (LICENSE, README, db_migrations.txt, requirements.txt,
+            # ...) to the same five anchors and pull all of them into
+            # one cluster — observed on the configurations repo's first
+            # post-Track-2a run (54.6%-dominance cluster ate every
+            # root doc plus the Configuration API + Event class).
             seen_top: Set[str] = set()
             _ROOT_DOC_TOP_LEVEL_CAP = 20
+            doc_hash = hash(nid)
             for code_dir, code_nodes in dir_to_code.items():
                 top = code_dir.split("/", 1)[0]
                 if not top or top in seen_top:
                     continue
-                # First node in each top-level dir as the anchor.
-                for cnid in code_nodes[:1]:
-                    if cnid != nid:
-                        edges.append((nid, cnid))
+                if not code_nodes:
+                    continue
+                cnid = code_nodes[doc_hash % len(code_nodes)]
+                if cnid != nid:
+                    edges.append((nid, cnid))
                 seen_top.add(top)
                 if len(seen_top) >= _ROOT_DOC_TOP_LEVEL_CAP:
                     break
