@@ -1286,6 +1286,26 @@ def _extract_proximity_edges(
 
         doc_dir = os.path.dirname(rp).replace("\\", "/")
         if not doc_dir:
+            # Repo-root doc (README.md, db_migrations.txt, ...). The
+            # directory-match heuristic above is "doc in dir X relates
+            # to code in dir X" — at the root that would mean "code at
+            # root", which is rare and unrepresentative. Repo-root docs
+            # describe the whole project, so attach one edge per
+            # top-level directory (capped) — gives the doc a path into
+            # each top-level package without ballooning edge count.
+            seen_top: Set[str] = set()
+            _ROOT_DOC_TOP_LEVEL_CAP = 20
+            for code_dir, code_nodes in dir_to_code.items():
+                top = code_dir.split("/", 1)[0]
+                if not top or top in seen_top:
+                    continue
+                # First node in each top-level dir as the anchor.
+                for cnid in code_nodes[:1]:
+                    if cnid != nid:
+                        edges.append((nid, cnid))
+                seen_top.add(top)
+                if len(seen_top) >= _ROOT_DOC_TOP_LEVEL_CAP:
+                    break
             continue
 
         # Strip doc prefix to get the "topic" directory
