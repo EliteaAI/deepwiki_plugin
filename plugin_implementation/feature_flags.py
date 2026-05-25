@@ -111,6 +111,24 @@ class FeatureFlags:
     #: Detect generic REST classes and rewrite the FTS query to use the file stem.
     orphan_rest_disambig: bool = True
 
+    # ── Noise contraction (Path A pilot) ───────────────────────────────
+    #: Drop ``variable`` / ``parameter`` / ``field`` nodes after AST parsing
+    #: and rewire their edges onto the containing arch node (class / method /
+    #: function / struct / interface / module / constructor) with a
+    #: ``via=<orig_name>@L<line>`` annotation. The graph stays one hop richer
+    #: per arch node and Leiden no longer co-clusters unrelated symbols
+    #: through shared parameter/variable names.
+    #:
+    #: Default ON. Disable with ``DEEPWIKI_CONTRACT_NOISE=0`` to fall back
+    #: to the pre-contraction shape (every variable/parameter/field is its
+    #: own node). The empirical baseline that motivated this:
+    #:
+    #: - configurations (Python): 71% nodes / 73% edges removed; top section
+    #:   dominance 54.6% → 20.8% on the contracted graph.
+    #: - microservices-demo (Go-heavy polyglot): 22% nodes / 53% edges
+    #:   removed; top dominance 56.5% → 14.9%.
+    contract_noise_nodes: bool = True
+
     # ── Weight calibration (A.12 pilot) ────────────────────────────────
     #: Selects how synthetic-edge weights are floored in ``apply_edge_weights``.
     #:
@@ -130,6 +148,7 @@ def get_feature_flags() -> FeatureFlags:
     return FeatureFlags(
         exclude_tests=_env_bool("DEEPWIKI_EXCLUDE_TESTS"),
         test_linker=_env_bool("DEEPWIKI_TEST_LINKER"),
+        contract_noise_nodes=_env_bool("DEEPWIKI_CONTRACT_NOISE", default=True),
         weight_calibration_profile=_env_choice(
             "DEEPWIKI_WEIGHT_CALIBRATION_PROFILE",
             default="legacy",
