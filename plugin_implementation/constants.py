@@ -230,7 +230,33 @@ SUPPORTING_CODE_SYMBOLS = frozenset({
 })
 
 # Documentation symbol kinds used for docs-only page detection.
+#
+# Must stay in sync with the symbol_type values that
+# ``code_graph/graph_builder.py:_parse_documentation_files`` actually
+# emits. The previous {module_doc, file_doc} set was a dead synonym —
+# no parser ever produced those types, so candidate_builder always
+# saw doc_count == 0 and never classified anything as CLASS_DOCS.
+# Empirical types observed in the live unified DB on configurations +
+# microservices: markdown_document, plaintext_document, yaml_document,
+# json_document, config_document, infrastructure_document,
+# script_document, html_document, schema_document, text_chunk.
+#
+# When adding a new doc parser, audit ``_chunk_text_content`` and
+# ``DOCUMENTATION_EXTENSIONS`` and add the new symbol_type here.
 DOC_CLUSTER_SYMBOLS = frozenset({
+    # Per-file blob doc nodes (one per source file unless chunked)
+    'markdown_document',
+    'plaintext_document',
+    'yaml_document',
+    'json_document',
+    'config_document',
+    'infrastructure_document',
+    'script_document',
+    'html_document',
+    'schema_document',
+    # Markdown-section chunks produced by MarkdownHeaderTextSplitter
+    'text_chunk',
+    # Legacy aliases — kept for compatibility if any parser still emits them
     'module_doc', 'file_doc',
 })
 

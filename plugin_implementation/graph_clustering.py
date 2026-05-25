@@ -153,6 +153,18 @@ def _detect_page_centroids(
     Returns:
         List of ``{"node_id": ..., "name": ..., "type": ..., "score": ...}``
         sorted by descending score.
+
+    A14 candidate (dead computation): output is stored in
+    ``sections[sec_id]["centroids"]`` during Phase 3 hierarchical Leiden
+    but a repo-wide grep confirms zero readers outside its own writes
+    (no consumer reads ``sections[*]["centroids"]`` or imports this
+    function). The production-relevant centroid path is
+    ``select_central_symbols`` (PageRank, this same module L87) which is
+    consumed by ``cluster_planner._select_central_node_ids`` to populate
+    ``PageSpec.target_symbols``. Keep until we either (a) wire the
+    degree+priority centroids into a UI-summary surface (the original
+    intent appears to have been per-page TL;DR cards) or (b) confirm
+    one release cycle without any new reader and delete.
     """
     if not page_node_ids:
         return []

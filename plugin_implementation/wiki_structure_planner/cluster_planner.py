@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,7 +41,14 @@ from ..state.wiki_state import PageSpec, SectionSpec, WikiStructureSpec
 from ..unified_db import UnifiedWikiDB
 from .candidate_builder import build_candidates
 from .coverage_ledger import CoverageLedger
-from .page_validator import validate_all, KEEP, MERGE_WITH, DEMOTE
+from .page_validator import (
+    validate_all,
+    KEEP, MERGE_WITH, DEMOTE, SPLIT_BY, PROMOTE_DOCS,
+)
+
+# Cap on how many sub-pages a SPLIT_BY action will produce. Prevents a
+# pathological 200-file utility cluster from exploding into 200 pages.
+_MAX_SPLIT_SUBPAGES = 5
 
 logger = logging.getLogger(__name__)
 
@@ -281,19 +289,23 @@ class ClusterStructurePlanner:
 
     # ── adaptive central-k ────────────────────────────────────────────
 
-    def _adaptive_central_k(self) -> int:
-        """Scale central symbol count with repo size.
+    def _adaptive_central_k(self, cluster_size: Optional[int] = None) -> int:
+        """Scale central-symbol count with cluster size (or repo size).
 
-        Smaller repos need fewer representative symbols per page;
-        larger repos need more to capture the breadth of each cluster.
+        Per-cluster ``k = max(3, min(15, ceil(sqrt(cluster_size))))``
+        when ``cluster_size`` is provided — a 30-node page gets ~6
+        centroids, a 100-node page gets 10, capped at 15. This is what
+        the LLM and content retrieval actually need: a representative
+        sample sized to the cluster, not a fixed budget derived from
+        the whole repo.
 
-        | Nodes      | k (central symbols) |
-        |------------|---------------------|
-        | < 200      | 5                   |
-        | 200–999    | 8                   |
-        | 1000–4999  | 12                  |
-        | 5000+      | 15                  |
+        Whole-graph fallback (``cluster_size=None``) preserves the
+        legacy step-function for callers that haven't yet been
+        threaded with a per-cluster size.
         """
+        if cluster_size is not None:
+            return max(3, min(15, math.ceil(math.sqrt(cluster_size))))
+
         if self._central_k is not None:
             return self._central_k
 
@@ -309,6 +321,29 @@ class ClusterStructurePlanner:
             k = 5
         self._central_k = k
         return k
+
+    def _count_cross_edges(
+        self, src_nids: List[str], tgt_nids: List[str],
+    ) -> int:
+        """Count graph edges between two sets of node IDs (either direction).
+
+        Used by MERGE_WITH to pick the most semantically related
+        sibling instead of the size leader. SQLite IN-list capped at
+        500 per side defensively (page sizes are ~10–100 in practice).
+        """
+        if not src_nids or not tgt_nids:
+            return 0
+        src = list(src_nids)[:500]
+        tgt = list(tgt_nids)[:500]
+        ph_src = ",".join("?" * len(src))
+        ph_tgt = ",".join("?" * len(tgt))
+        row = self.db.conn.execute(
+            f"SELECT COUNT(*) FROM repo_edges "
+            f"WHERE (source_id IN ({ph_src}) AND target_id IN ({ph_tgt})) "
+            f"   OR (source_id IN ({ph_tgt}) AND target_id IN ({ph_src}))",
+            tuple(src) + tuple(tgt) + tuple(tgt) + tuple(src),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -341,19 +376,70 @@ class ClusterStructurePlanner:
             validations = validate_all(candidates)
 
             # Pass 1 — Remove DEMOTE candidates
+            demote_count = 0
             for vr in validations:
                 if vr.shape_decision == DEMOTE:
                     mid = vr.candidate.macro_id
                     pid = vr.candidate.micro_id
                     if mid in cluster_map and pid in cluster_map[mid]:
                         del cluster_map[mid][pid]
-                        logger.debug(
-                            "ClusterStructurePlanner: demoted micro %d.%d",
-                            mid, pid,
-                        )
+                        demote_count += 1
 
-            # Pass 2 — Merge MERGE_WITH candidates into their largest
-            # surviving sibling (same macro-cluster).
+            # Pass 2 — Split SPLIT_BY candidates into per-file sub-pages.
+            # The validator flags SPLIT_BY for clusters that exceed
+            # max_page_size, hit the utility-contamination ceiling, or
+            # are classified as BRIDGE (high file_spread). All three
+            # benefit from a per-rel_path partition: each sub-page
+            # holds the symbols that originate from one source file,
+            # which is the most reliable "one capability" boundary
+            # available at this layer without re-running Leiden.
+            #
+            # Capped at _MAX_SPLIT_SUBPAGES; when a candidate has more
+            # files than the cap the smaller files merge into the
+            # largest sub-page so total page count stays bounded.
+            split_count = 0
+            for vr in validations:
+                if vr.shape_decision != SPLIT_BY:
+                    continue
+                mid = vr.candidate.macro_id
+                pid = vr.candidate.micro_id
+                if mid not in cluster_map or pid not in cluster_map[mid]:
+                    continue
+                node_ids = cluster_map[mid][pid]
+                sub_partitions: Dict[str, List[str]] = {}
+                for nid in node_ids:
+                    node = self.db.get_node(nid)
+                    rel = (node or {}).get("rel_path") or "_unknown"
+                    sub_partitions.setdefault(rel, []).append(nid)
+                if len(sub_partitions) <= 1:
+                    # Single-file candidate flagged for split (likely
+                    # utility-contamination on one big file). Nothing
+                    # better to split by here — keep as-is.
+                    continue
+                ordered = sorted(
+                    sub_partitions.items(), key=lambda kv: -len(kv[1]),
+                )
+                if len(ordered) > _MAX_SPLIT_SUBPAGES:
+                    keepers = ordered[:_MAX_SPLIT_SUBPAGES]
+                    for _path, extra in ordered[_MAX_SPLIT_SUBPAGES:]:
+                        keepers[0][1].extend(extra)
+                    ordered = keepers
+                # Replace the original page with the sub-pages.
+                del cluster_map[mid][pid]
+                next_pid = max(cluster_map[mid].keys(), default=-1) + 1
+                for _path, nids in ordered:
+                    cluster_map[mid][next_pid] = nids
+                    next_pid += 1
+                split_count += 1
+
+            # Pass 3 — Merge MERGE_WITH candidates into their best
+            # surviving sibling. Pick by graph-edge density between the
+            # candidate and each sibling (most edges = most semantically
+            # related), tie-break by smaller sibling — same policy as
+            # _consolidate_sections / _consolidate_pages in graph_clustering.
+            # The previous "biggest sibling wins" heuristic was both
+            # size-based (no semantic signal) and inconsistent with the
+            # consolidation passes that already run earlier.
             merge_count = 0
             for vr in validations:
                 if vr.shape_decision != MERGE_WITH:
@@ -362,25 +448,44 @@ class ClusterStructurePlanner:
                 pid = vr.candidate.micro_id
                 if mid not in cluster_map or pid not in cluster_map[mid]:
                     continue
-                # Find largest surviving sibling in this macro
+                src_nids = cluster_map[mid][pid]
                 best_sibling = None
+                best_edges = -1
                 best_size = 0
                 for other_pid, other_nids in cluster_map[mid].items():
                     if other_pid == pid:
                         continue
-                    if len(other_nids) > best_size:
-                        best_size = len(other_nids)
+                    edge_count = self._count_cross_edges(src_nids, other_nids)
+                    if (edge_count > best_edges
+                            or (edge_count == best_edges
+                                and (best_sibling is None
+                                     or len(other_nids) < best_size))):
+                        best_edges = edge_count
                         best_sibling = other_pid
+                        best_size = len(other_nids)
                 if best_sibling is not None:
                     cluster_map[mid][best_sibling].extend(
                         cluster_map[mid].pop(pid),
                     )
                     merge_count += 1
 
-            if merge_count:
+            # Pass 4 — PROMOTE_DOCS: explicit no-op acknowledgement.
+            # Now that DOC_CLUSTER_SYMBOLS is in sync with parser output,
+            # candidate_builder will classify pure-doc clusters as
+            # CLASS_DOCS and the validator will return PROMOTE_DOCS.
+            # The candidate is correctly KEPT (no DEMOTE / no MERGE);
+            # the CLASS_DOCS flag rides on the candidate metadata for
+            # downstream consumers (target_docs, retrieval). Logged so
+            # the count shows up in production telemetry.
+            promote_count = sum(
+                1 for vr in validations if vr.shape_decision == PROMOTE_DOCS
+            )
+
+            if demote_count or split_count or merge_count or promote_count:
                 logger.info(
-                    "ClusterStructurePlanner: merged %d MERGE_WITH candidates",
-                    merge_count,
+                    "ClusterStructurePlanner: validator actions applied — "
+                    "demote=%d, split=%d, merge=%d, promote_docs=%d",
+                    demote_count, split_count, merge_count, promote_count,
                 )
 
             # Clean up empty macros
@@ -802,7 +907,7 @@ class ClusterStructurePlanner:
             retrieval_query = page_naming.get("retrieval_query") or page_name
 
             central_ids = self._select_central_node_ids(
-                node_ids, k=self._adaptive_central_k(),
+                node_ids, k=self._adaptive_central_k(cluster_size=len(node_ids)),
             )
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
@@ -1198,7 +1303,7 @@ class ClusterStructurePlanner:
             node_ids = micro_map[micro_id]
             # Central symbol selection (Phase 7F)
             central_ids = self._select_central_node_ids(
-                node_ids, k=self._adaptive_central_k(),
+                node_ids, k=self._adaptive_central_k(cluster_size=len(node_ids)),
             )
             target_symbols = self._node_ids_to_symbol_names(central_ids)
             key_files = self._node_ids_to_paths(node_ids)
