@@ -29,6 +29,7 @@ Typical flow::
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -381,6 +382,14 @@ def _node_to_document(
     }
     if expanded_from:
         metadata["expanded_from"] = expanded_from
+    # via= context attached by ``_collect_expansion_neighbors`` from the
+    # edge's contraction annotations (e.g. "via src=email@L42; tgt=username@L11").
+    # Surfaces the dropped intermediate field/parameter that the rewired
+    # edge used to pass through, so the writer cites a line-anchored
+    # claim instead of "ClassA references ClassB" in the abstract.
+    via_context = node.get("_via_context")
+    if via_context:
+        metadata["expansion_via"] = via_context
     return Document(page_content=page_content, metadata=metadata)
 
 
@@ -880,6 +889,42 @@ def _fts_fallback(
 # Expansion neighbour collection
 # ---------------------------------------------------------------------------
 
+def _extract_via_from_annotations(raw: Any) -> str:
+    """Format an edge's ``annotations.via`` list into a writer-friendly string.
+
+    The contraction module attaches a list like
+    ``["src=email@L42", "tgt=username@L11"]`` to rewired edges so the
+    dropped intermediate field/parameter still anchors the relationship
+    in source. ``annotations`` arrives here as the JSON-serialised
+    string from ``repo_edges.annotations`` (or a dict when the caller
+    short-circuits the round-trip in tests). Anything else returns "".
+
+    Returned shape: ``"via src=email@L42; tgt=username@L11"`` — same
+    "via " prefix the legacy ``content_expander`` already emits, joined
+    semicolons in between so it slots into the existing
+    ``metadata['expansion_via']`` reader.
+    """
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return ""
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        return ""
+    via = data.get("via") if isinstance(data, dict) else None
+    if not via:
+        return ""
+    if isinstance(via, list):
+        parts = [str(p).strip() for p in via if str(p).strip()]
+    else:
+        parts = [str(via).strip()] if str(via).strip() else []
+    return "via " + "; ".join(parts) if parts else ""
+
+
 def _collect_expansion_neighbors(
     db,
     seed_ids: List[str],
@@ -906,15 +951,21 @@ def _collect_expansion_neighbors(
     # comparison or A/B verification.
     apply_edge_class_filter = get_feature_flags().writer_edge_class_filter
 
+    # Per-neighbour via= context, populated from edge annotations when
+    # contraction (or any edge producer) attached one. Stitched onto the
+    # node dict below so ``_node_to_document`` surfaces it without a
+    # signature change.
+    via_by_neighbor: Dict[str, str] = {}
+
     for seed_id in seed_ids:
         # Outgoing edges
         out_edges = conn.execute(
-            "SELECT target_id, rel_type, weight, edge_class FROM repo_edges WHERE source_id = ?",
+            "SELECT target_id, rel_type, weight, edge_class, annotations FROM repo_edges WHERE source_id = ?",
             (seed_id,),
         ).fetchall()
         # Incoming edges (structurally important: who inherits/implements me)
         in_edges = conn.execute(
-            "SELECT source_id, rel_type, weight, edge_class FROM repo_edges WHERE target_id = ?",
+            "SELECT source_id, rel_type, weight, edge_class, annotations FROM repo_edges WHERE target_id = ?",
             (seed_id,),
         ).fetchall()
 
@@ -929,6 +980,9 @@ def _collect_expansion_neighbors(
             if tid not in seen_ids and tid not in neighbor_ids:
                 neighbor_ids.add(tid)
                 edge_info.append((tid, row[1] or "unknown", row[2] or 1.0))
+                via_str = _extract_via_from_annotations(row[4])
+                if via_str:
+                    via_by_neighbor.setdefault(tid, via_str)
 
         for row in in_edges:
             edge_class = row[3] or "structural"
@@ -938,6 +992,9 @@ def _collect_expansion_neighbors(
             if sid not in seen_ids and sid not in neighbor_ids:
                 neighbor_ids.add(sid)
                 edge_info.append((sid, row[1] or "unknown", row[2] or 1.0))
+                via_str = _extract_via_from_annotations(row[4])
+                if via_str:
+                    via_by_neighbor.setdefault(sid, via_str)
 
         if not neighbor_ids:
             continue
@@ -972,6 +1029,14 @@ def _collect_expansion_neighbors(
                     continue
             elif macro_id is not None and node.get("macro_cluster") != macro_id:
                 continue
+            # Stitch via= context (when present) onto the node dict so
+            # ``_node_to_document`` can surface it as ``expansion_via``
+            # without a tuple-shape change. ``setdefault`` keeps the
+            # first-seen edge's via — multiple edges between the same
+            # two nodes is rare, and when it happens any one anchor is
+            # enough to make the writer claim line-precise.
+            if nid in via_by_neighbor:
+                node.setdefault("_via_context", via_by_neighbor[nid])
             candidates.append((nid, node, rel_type, weight))
 
     # Deduplicate (first occurrence wins) and sort by weight descending

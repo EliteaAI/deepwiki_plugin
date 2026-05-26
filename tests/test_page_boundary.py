@@ -63,15 +63,17 @@ def _mock_db_with_nodes(nodes, edges=None):
         if "FROM repo_edges" in sql and "source_id" in sql:
             src = params[0] if params else None
             edge_list = edges or []
-            # B7 added edge_class to the SELECT in _collect_expansion_neighbors;
-            # default to 'structural' so existing fixtures pass the writer
-            # gate without per-test changes.
+            # B7 + Enhancement 1 grew the SELECT to 5 cols (target_id,
+            # rel_type, weight, edge_class, annotations). Existing
+            # fixtures don't need to set them — sensible defaults pass
+            # the writer gate and produce no via context.
             result.fetchall.return_value = [
                 (
                     e["target_id"],
                     e.get("rel_type", "calls"),
                     e.get("weight", 1.0),
                     e.get("edge_class", "structural"),
+                    e.get("annotations", ""),
                 )
                 for e in edge_list if e["source_id"] == src
             ]
@@ -86,6 +88,7 @@ def _mock_db_with_nodes(nodes, edges=None):
                     e.get("rel_type", "calls"),
                     e.get("weight", 1.0),
                     e.get("edge_class", "structural"),
+                    e.get("annotations", ""),
                 )
                 for e in edge_list if e["target_id"] == tgt
             ]
