@@ -56,6 +56,8 @@ def _make_db():
             source_id TEXT,
             target_id TEXT,
             rel_type TEXT,
+            edge_class TEXT NOT NULL DEFAULT 'structural',
+            annotations TEXT DEFAULT '',
             weight REAL DEFAULT 1.0
         )
     """)

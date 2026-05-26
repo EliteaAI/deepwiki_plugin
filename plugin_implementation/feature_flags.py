@@ -129,6 +129,22 @@ class FeatureFlags:
     #:   removed; top dominance 56.5% → 14.9%.
     contract_noise_nodes: bool = True
 
+    # ── Writer evidence gating (B7) ────────────────────────────────────
+    #: Restrict ``_collect_expansion_neighbors`` to ``WRITER_ALLOWED_EDGE_CLASSES``.
+    #:
+    #: Without this filter, the writer's 1-hop expansion pool includes
+    #: edges added by topology enrichment (lexical / directory / doc
+    #: proximity / bridge) — synthetic glue that exists for clustering
+    #: connectivity but does not represent real architectural coupling.
+    #: Citing such an edge looks like grounded reasoning to the LLM but
+    #: produces a phantom claim ("X uses Y because the parser noticed
+    #: their names share three letters" — not a real relationship).
+    #:
+    #: Default ON. Disable with ``DEEPWIKI_WRITER_EDGE_CLASS_FILTER=0`` to
+    #: fall back to the pre-B7 inclusive expansion pool. See
+    #: ``_graph_audit/GAP_ANALYSIS_AND_ROADMAP.md`` §B7.
+    writer_edge_class_filter: bool = True
+
     # ── Weight calibration (A.12 pilot) ────────────────────────────────
     #: Selects how synthetic-edge weights are floored in ``apply_edge_weights``.
     #:
@@ -149,6 +165,9 @@ def get_feature_flags() -> FeatureFlags:
         exclude_tests=_env_bool("DEEPWIKI_EXCLUDE_TESTS"),
         test_linker=_env_bool("DEEPWIKI_TEST_LINKER"),
         contract_noise_nodes=_env_bool("DEEPWIKI_CONTRACT_NOISE", default=True),
+        writer_edge_class_filter=_env_bool(
+            "DEEPWIKI_WRITER_EDGE_CLASS_FILTER", default=True,
+        ),
         weight_calibration_profile=_env_choice(
             "DEEPWIKI_WEIGHT_CALIBRATION_PROFILE",
             default="legacy",
