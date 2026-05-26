@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from langchain_core.documents import Document
 
 from .code_graph.shared_expansion import expand_symbol_smart
-from .constants import WRITER_ALLOWED_EDGE_CLASSES
+from .constants import EXPANSION_SYMBOL_TYPES, WRITER_ALLOWED_EDGE_CLASSES
 from .feature_flags import get_feature_flags
 from .wiki_structure_planner.language_heuristics import (
     detect_dominant_language,
@@ -75,13 +75,7 @@ MAX_NEIGHBORS_PER_SYMBOL = 15
 # Global cap on total expansion nodes for one page
 MAX_EXPANSION_TOTAL = 200
 
-# Architectural symbol types accepted during expansion
-# (mirrors constants.EXPANSION_SYMBOL_TYPES)
-EXPANSION_SYMBOL_TYPES = frozenset({
-    'class', 'interface', 'struct', 'enum', 'trait',
-    'function', 'constant', 'type_alias', 'macro',
-    'module_doc', 'file_doc',
-})
+# EXPANSION_SYMBOL_TYPES imported from constants (includes 'contract')
 
 # Priority relationship types: edges traversed during expansion (sorted by
 # architectural importance — P0 first, P2 last).

@@ -390,13 +390,22 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
 
     # ── Proto / schema ──────────────────────────────────────────────
     if language in ("proto", "schema") or ("service " in text and "rpc " in text):
-        services = _PROTO_SERVICE.findall(text)
-        rpcs = _PROTO_RPC.findall(text)
-        for svc in services or [""]:
-            for rpc in rpcs:
+        for sm in _PROTO_SERVICE.finditer(text):
+            svc = sm.group(1)
+            block_start = sm.end()
+            depth = 1
+            i = block_start
+            while i < len(text) and depth > 0:
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                i += 1
+            svc_body = text[block_start:i]
+            for rpc in _PROTO_RPC.findall(svc_body):
                 out.append(APISurface(
                     kind="grpc",
-                    surface=f"grpc:{svc}/{rpc}" if svc else f"grpc:{rpc}",
+                    surface=f"grpc:{svc}/{rpc}",
                     weight_hint=0.8,
                     metadata={"service": svc, "method": rpc},
                 ))

@@ -20,6 +20,7 @@ import pytest
 
 from plugin_implementation.code_graph.api_surface_extractor import (
     APISurface,
+    _match_grpc,
     materialize_contract_nodes,
     _contract_node_id,
 )
@@ -364,3 +365,37 @@ class TestPersistenceRoundTrip:
         assert result["signature"] == "grpc_service"
         assert result["symbol_type"] == "contract"
         assert result["symbol_name"] == "grpc:UserService/GetUser"
+
+
+# ─── 7. Proto gRPC cross-product regression ───────────────────────────
+
+class TestProtoNoCrossProduct:
+
+    def test_multi_service_proto_no_cross_product(self):
+        """Multiple services in one proto file must NOT cross-multiply RPCs."""
+        proto_text = (
+            "service CartService {\n"
+            "  rpc AddItem (AddItemReq) returns (Empty) {}\n"
+            "  rpc GetCart (GetCartReq) returns (Cart) {}\n"
+            "}\n\n"
+            "service AdService {\n"
+            "  rpc GetAds (AdReq) returns (AdResp) {}\n"
+            "}\n"
+        )
+        surfaces = _match_grpc(proto_text, "schema")
+        surface_keys = {s["surface"] for s in surfaces}
+        assert surface_keys == {
+            "grpc:CartService/AddItem",
+            "grpc:CartService/GetCart",
+            "grpc:AdService/GetAds",
+        }
+
+    def test_single_service_proto_still_works(self):
+        proto_text = (
+            "service Greeter {\n"
+            "  rpc SayHello (HelloReq) returns (HelloResp) {}\n"
+            "}\n"
+        )
+        surfaces = _match_grpc(proto_text, "proto")
+        assert len(surfaces) == 1
+        assert surfaces[0]["surface"] == "grpc:Greeter/SayHello"
