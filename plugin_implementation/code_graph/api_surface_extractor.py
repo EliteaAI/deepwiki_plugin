@@ -321,12 +321,75 @@ def _match_rest_go(text: str) -> List[APISurface]:
 _PROTO_SERVICE = re.compile(r"\bservice\s+(\w+)\s*{", re.MULTILINE)
 _PROTO_RPC = re.compile(r"\brpc\s+(\w+)\s*\(", re.MULTILINE)
 
+# Go: ``type <Svc>Server interface { <Rpc>(...) }``
+_GO_GRPC_SERVER = re.compile(
+    r"\btype\s+(?P<svc>\w+)Server\s+interface\s*{", re.MULTILINE
+)
+_GO_GRPC_METHOD = re.compile(
+    r"^\s+(?P<rpc>[A-Z]\w*)\s*\(", re.MULTILINE
+)
+# Go: ``<Svc>_<Rpc>_FullMethodName = "/<pkg>.<Svc>/<Rpc>"``
+_GO_GRPC_FULLMETHOD = re.compile(
+    r'(?P<svc>\w+)_(?P<rpc>\w+)_FullMethodName\s*=\s*"[^"]*"'
+)
+
+# Java: ``extends <Svc>Grpc.<Svc>ImplBase``
+_JAVA_GRPC_IMPL = re.compile(
+    r"\bextends\s+(?:\w+\.)*(?P<svc>\w+)Grpc\.\w+ImplBase\b"
+)
+_JAVA_GRPC_METHOD = re.compile(
+    r"\bpublic\s+\w+\s+(?P<rpc>[a-z]\w*)\s*\(\s*\w+(?:Request|Req)\b"
+)
+# Java: also ``StreamObserver<...Response>`` param pattern
+_JAVA_GRPC_OBSERVER = re.compile(
+    r"\bpublic\s+void\s+(?P<rpc>[a-z]\w*)\s*\([^)]*StreamObserver\b"
+)
+
+# C#: ``class X : <Ns>.<Svc>.<Svc>Base`` or ``<Svc>Base``
+_CS_GRPC_IMPL = re.compile(
+    r"\bclass\s+\w+\s*:\s*(?:\w+\.)*(?P<svc>\w+)\.(?P=svc)Base\b"
+)
+# Return types can be generic: Task<Empty>, Task<Cart>, async Task<T>, etc.
+_CS_GRPC_METHOD = re.compile(
+    r"\bpublic\s+override\s+[\w<>,\s]+\s+(?P<rpc>[A-Z]\w*)\s*\("
+)
+
+# JS/TS: ``server.addService(<pkg>.<Svc>.service, { <rpc>: handler })``
+_JS_GRPC_ADDSERVICE = re.compile(
+    r"\.addService\s*\(\s*\w+\.(?P<svc>\w+)\.service\b"
+)
+_JS_GRPC_HANDLER_MAP = re.compile(
+    r"{\s*(?P<methods>[^}]+)}\s*\)"
+)
+_JS_GRPC_METHOD_KEY = re.compile(r"(?P<rpc>\w+)\s*:")
+
+# C++: ``class <Svc>::Service`` / ``Status <Rpc>(ServerContext*``
+_CPP_GRPC_SERVICE = re.compile(
+    r"\bclass\s+\w+\s*(?:final\s*)?:\s*public\s+(?P<svc>\w+)::Service\b"
+)
+_CPP_GRPC_METHOD = re.compile(
+    r"\b(?:grpc::)?Status\s+(?P<rpc>[A-Z]\w*)\s*\(\s*(?:grpc::)?ServerContext\b"
+)
+
+# Rust (tonic): ``#[tonic::async_trait]\s*impl <Svc> for``
+_RUST_GRPC_IMPL = re.compile(
+    r"\bimpl\s+(?P<svc>\w+)\s+for\s+\w+", re.MULTILINE
+)
+_RUST_GRPC_METHOD = re.compile(
+    r"\basync\s+fn\s+(?P<rpc>\w+)\s*\(", re.MULTILINE
+)
+
 
 def _match_grpc(text: str, language: str) -> List[APISurface]:
-    """Detect gRPC services across .proto definitions and Python/Java stubs."""
+    """Detect gRPC services across .proto definitions and language stubs.
+
+    Supported: proto/schema, Python, Go, Java, C#, JavaScript/TypeScript,
+    C++, Rust.
+    """
     out: List[APISurface] = []
 
-    if language == "proto" or "service " in text and "rpc " in text:
+    # ── Proto / schema ──────────────────────────────────────────────
+    if language in ("proto", "schema") or ("service " in text and "rpc " in text):
         services = _PROTO_SERVICE.findall(text)
         rpcs = _PROTO_RPC.findall(text)
         for svc in services or [""]:
@@ -338,10 +401,7 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
                     metadata={"service": svc, "method": rpc},
                 ))
 
-    # Python servicer convention: ``class <Svc>Servicer:`` with each
-    # ``def <RpcName>(self, request, context)`` mapping to one gRPC
-    # method. Pairs against ``.proto`` ``service <Svc> { rpc <RpcName>
-    # ... }`` declarations.
+    # ── Python: class <Svc>Servicer with def <Rpc>(self, ...) ──────
     if language == "python" and "Servicer" in text:
         for sm in re.finditer(r"\bclass\s+(?P<svc>\w+)Servicer\b", text):
             svc = sm.group("svc")
@@ -354,6 +414,113 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
                     surface=f"grpc:{svc}/{rpc}",
                     weight_hint=0.7,
                     metadata={"service": svc, "method": rpc},
+                ))
+
+    # ── Go: interface <Svc>Server or FullMethodName constants ──────
+    if language == "go":
+        for sm in _GO_GRPC_SERVER.finditer(text):
+            svc = sm.group("svc")
+            for dm in _GO_GRPC_METHOD.finditer(text[sm.end():]):
+                rpc = dm.group("rpc")
+                out.append(APISurface(
+                    kind="grpc",
+                    surface=f"grpc:{svc}/{rpc}",
+                    weight_hint=0.7,
+                    metadata={"service": svc, "method": rpc},
+                ))
+        for fm in _GO_GRPC_FULLMETHOD.finditer(text):
+            svc = fm.group("svc")
+            rpc = fm.group("rpc")
+            out.append(APISurface(
+                kind="grpc",
+                surface=f"grpc:{svc}/{rpc}",
+                weight_hint=0.7,
+                metadata={"service": svc, "method": rpc},
+            ))
+
+    # ── Java: extends <Svc>Grpc.<Svc>ImplBase ─────────────────────
+    if language == "java" and ("ImplBase" in text or "Grpc" in text):
+        for sm in _JAVA_GRPC_IMPL.finditer(text):
+            svc = sm.group("svc")
+            for dm in _JAVA_GRPC_METHOD.finditer(text):
+                rpc = dm.group("rpc")
+                rpc_cap = rpc[0].upper() + rpc[1:]
+                out.append(APISurface(
+                    kind="grpc",
+                    surface=f"grpc:{svc}/{rpc_cap}",
+                    weight_hint=0.7,
+                    metadata={"service": svc, "method": rpc_cap},
+                ))
+            for dm in _JAVA_GRPC_OBSERVER.finditer(text):
+                rpc = dm.group("rpc")
+                rpc_cap = rpc[0].upper() + rpc[1:]
+                if not any(s["metadata"].get("method") == rpc_cap for s in out):
+                    out.append(APISurface(
+                        kind="grpc",
+                        surface=f"grpc:{svc}/{rpc_cap}",
+                        weight_hint=0.7,
+                        metadata={"service": svc, "method": rpc_cap},
+                    ))
+
+    # ── C#: class X : <Svc>.<Svc>Base ─────────────────────────────
+    if language == "csharp" and "Base" in text:
+        for sm in _CS_GRPC_IMPL.finditer(text):
+            svc = sm.group("svc")
+            for dm in _CS_GRPC_METHOD.finditer(text):
+                rpc = dm.group("rpc")
+                out.append(APISurface(
+                    kind="grpc",
+                    surface=f"grpc:{svc}/{rpc}",
+                    weight_hint=0.7,
+                    metadata={"service": svc, "method": rpc},
+                ))
+
+    # ── JavaScript / TypeScript: server.addService(<Svc>.service, {..})
+    if language in ("javascript", "typescript") and "addService" in text:
+        for sm in _JS_GRPC_ADDSERVICE.finditer(text):
+            svc = sm.group("svc")
+            block_start = sm.end()
+            bm = _JS_GRPC_HANDLER_MAP.search(text[block_start:block_start + 500])
+            if bm:
+                for km in _JS_GRPC_METHOD_KEY.finditer(bm.group("methods")):
+                    rpc = km.group("rpc")
+                    rpc_cap = rpc[0].upper() + rpc[1:]
+                    out.append(APISurface(
+                        kind="grpc",
+                        surface=f"grpc:{svc}/{rpc_cap}",
+                        weight_hint=0.7,
+                        metadata={"service": svc, "method": rpc_cap},
+                    ))
+
+    # ── C++: class X : public <Svc>::Service ──────────────────────
+    if language in ("cpp", "c++") and "::Service" in text:
+        for sm in _CPP_GRPC_SERVICE.finditer(text):
+            svc = sm.group("svc")
+            for dm in _CPP_GRPC_METHOD.finditer(text):
+                rpc = dm.group("rpc")
+                out.append(APISurface(
+                    kind="grpc",
+                    surface=f"grpc:{svc}/{rpc}",
+                    weight_hint=0.7,
+                    metadata={"service": svc, "method": rpc},
+                ))
+
+    # ── Rust (tonic): impl <Svc> for <Name> ──────────────────────
+    if language == "rust" and "impl " in text and "async fn" in text:
+        for sm in _RUST_GRPC_IMPL.finditer(text):
+            svc = sm.group("svc")
+            if svc[0].islower() or svc in ("self", "Self", "impl"):
+                continue
+            for dm in _RUST_GRPC_METHOD.finditer(text[sm.end():]):
+                rpc = dm.group("rpc")
+                if rpc.startswith("_"):
+                    continue
+                rpc_pascal = "".join(w.capitalize() for w in rpc.split("_"))
+                out.append(APISurface(
+                    kind="grpc",
+                    surface=f"grpc:{svc}/{rpc_pascal}",
+                    weight_hint=0.6,
+                    metadata={"service": svc, "method": rpc_pascal},
                 ))
 
     return out
@@ -728,8 +895,10 @@ _BDD_GHERKIN = re.compile(
 )
 
 
-def _match_bdd(text: str) -> List[APISurface]:
+def _match_bdd(text: str, *, rel_path: str = "") -> List[APISurface]:
     out: List[APISurface] = []
+    # Step-definition decorators (@given/@when/@then) — these appear in
+    # actual test code and are always grounded.
     for m in _BDD_DECORATOR.finditer(text):
         out.append(APISurface(
             kind="bdd",
@@ -737,13 +906,18 @@ def _match_bdd(text: str) -> List[APISurface]:
             weight_hint=0.7,
             metadata={"kind": m.group("kind").lower()},
         ))
-    for m in _BDD_GHERKIN.finditer(text):
-        out.append(APISurface(
-            kind="bdd",
-            surface=f"bdd:{m.group('text').strip().lower()}",
-            weight_hint=0.6,
-            metadata={"kind": m.group("kind").lower()},
-        ))
+    # Raw Gherkin lines (Given/When/Then) — only valid inside .feature
+    # or .story files. Matching on arbitrary source (markdown, comments)
+    # produces false positives on conversational prose.
+    lp = rel_path.lower()
+    if lp.endswith((".feature", ".story")):
+        for m in _BDD_GHERKIN.finditer(text):
+            out.append(APISurface(
+                kind="bdd",
+                surface=f"bdd:{m.group('text').strip().lower()}",
+                weight_hint=0.6,
+                metadata={"kind": m.group("kind").lower()},
+            ))
     return out
 
 
@@ -966,11 +1140,13 @@ def extract_api_surfaces(
     if rest_fn:
         surfaces.extend(rest_fn(text))
 
+    rel_path = node_data.get("rel_path") or ""
+
     surfaces.extend(_match_grpc(text, language))
     surfaces.extend(_match_graphql(text))
     surfaces.extend(_match_ffi(text, symbol_name))
     surfaces.extend(_match_objects(text, language))
-    surfaces.extend(_match_bdd(text))
+    surfaces.extend(_match_bdd(text, rel_path=rel_path))
     surfaces.extend(_match_cli(text))
     # Pylon-style class-API producer (no decorators; route inferred
     # from rel_path; HTTP verb from method names of an APIBase /
@@ -1231,3 +1407,92 @@ def extract_api_surfaces_for_graph(
         data["api_surface"] = surfaces
         out[str(node_id)] = surfaces
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase B5: Materialize contract nodes from extracted API surfaces
+# ──────────────────────────────────────────────────────────────────────
+
+def _contract_node_id(kind: str, surface: str) -> str:
+    """Stable, deterministic node_id for a contract node.
+
+    Format: ``contract::<kind>::<surface>`` — deduplication across runs is
+    guaranteed because the same (kind, surface) pair always produces the
+    same node_id regardless of which code symbol exposes it.
+    """
+    return f"contract::{kind}::{surface}"
+
+
+def materialize_contract_nodes(
+    g: "Any",
+    surfaces_by_node: Dict[str, List[APISurface]],
+) -> int:
+    """Create first-class contract nodes from extracted API surfaces.
+
+    For each unique (kind, surface) in *surfaces_by_node*, adds a
+    ``symbol_type="contract"`` node to *g* (if not already present) and a
+    ``DEFINES`` edge from the owning symbol to the contract node.
+
+    The ``signature`` attribute on each contract node stores the
+    ``contract_kind`` discriminator (``"rest_route"``, ``"grpc_service"``,
+    etc.) for downstream queries.
+
+    Returns the count of contract nodes added (not counting duplicates
+    that already existed).
+    """
+    added = 0
+    for owner_id, surfaces in surfaces_by_node.items():
+        if not g.has_node(owner_id):
+            continue
+        owner_data = g.nodes[owner_id]
+        owner_rel_path = owner_data.get("rel_path", "")
+        owner_file_name = owner_data.get("file_name", "")
+        owner_language = owner_data.get("language", "")
+
+        for surf in surfaces:
+            kind = surf["kind"]
+            surface = surf["surface"]
+            nid = _contract_node_id(kind, surface)
+
+            if not g.has_node(nid):
+                g.add_node(
+                    nid,
+                    symbol_name=surface,
+                    symbol_type="contract",
+                    signature=kind,
+                    rel_path=owner_rel_path,
+                    file_name=owner_file_name,
+                    language=owner_language,
+                    start_line=0,
+                    end_line=0,
+                    source_text="",
+                    is_architectural=True,
+                    is_doc=False,
+                )
+                added += 1
+
+            via_entries = []
+            meta = surf.get("metadata") or {}
+            if meta.get("method"):
+                via_entries.append(f"dispatch={meta['method']}")
+            if meta.get("path"):
+                via_entries.append(f"route={meta['path']}")
+            if meta.get("url_params"):
+                via_entries.append(f"url_params={meta['url_params']}")
+            if meta.get("symbol"):
+                via_entries.append(f"symbol={meta['symbol']}")
+
+            annotations: Dict[str, Any] = {}
+            if via_entries:
+                annotations["via"] = via_entries
+
+            g.add_edge(
+                owner_id,
+                nid,
+                relationship_type="defines",
+                edge_class="structural",
+                weight=1.0,
+                annotations=annotations,
+            )
+
+    return added

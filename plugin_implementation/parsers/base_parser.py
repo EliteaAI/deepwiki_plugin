@@ -61,6 +61,8 @@ class RelationshipType(Enum):
     WRITES = "writes"                    # function/method writes/mutates a field / external state
     CAPTURES = "captures"                # lambda captures variable / this
     ALIAS_OF = "alias_of"               # type alias / typedef ultimate target mapping
+    # Phase B: contract-node algebra
+    CONSUMES = "consumes"                # implementation consumes a contract (handles the route/method)
 
 
 class SymbolType(Enum):
@@ -84,6 +86,7 @@ class SymbolType(Enum):
     ANNOTATION = "annotation"
     DECORATOR = "decorator"
     MACRO = "macro"
+    CONTRACT = "contract"
 
 
 class Scope(Enum):

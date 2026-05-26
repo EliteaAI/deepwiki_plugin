@@ -193,6 +193,7 @@ ARCHITECTURAL_SYMBOLS = frozenset({
     'constant',      # Module-level constants
     'type_alias',    # Type aliases (using/typedef)
     'macro',         # C/C++ preprocessor definitions
+    'contract',      # API surface contracts (rest_route, grpc_service, …)
 }) | DOC_SYMBOL_TYPES  # ← every doc type passes _is_architectural_symbol()
 
 # Subset used when expanding graph context for wiki page generation.
@@ -204,6 +205,7 @@ EXPANSION_SYMBOL_TYPES = frozenset({
     'constant',
     'type_alias',
     'macro',         # C/C++ macros are architecturally significant
+    'contract',      # API surface contracts (rest_route, grpc_service, …)
     'module_doc', 'file_doc',
 })
 
@@ -277,6 +279,7 @@ SYMBOL_TYPE_PRIORITY = {
     'module': 8, 'namespace': 8,
     'function': 7,
     'constant': 6, 'type_alias': 6, 'macro': 6,
+    'contract': 5,
     'method': 3, 'property': 2,
     # Doc symbols — must cover every DOC_CLUSTER_SYMBOLS member.
     'markdown_document': 1,
