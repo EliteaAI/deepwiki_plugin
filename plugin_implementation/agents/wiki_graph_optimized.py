@@ -1985,6 +1985,12 @@ class OptimizedWikiGenerationAgent:
 
     # -----------------------------------------------------------------
     # Graph-First Structure Planning
+    #
+    # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+    # Production-unreachable: _resolve_planner_choice (line 1392) returns only
+    # "deepagents" or "cluster"; "graph_first" is never returned, so this
+    # method is never called. Coordinated removal pending after Phase A
+    # success criteria pass.
     # -----------------------------------------------------------------
 
     def _generate_wiki_structure_graph_first(
@@ -5315,8 +5321,6 @@ class OptimizedWikiGenerationAgent:
             f"✅ Agentic V2 generation complete for '{page_spec.page_name}': "
             f"{len(generator.planned_sections)} planned sections, {len(generated_content)} chars"
         )
-        
-        return generated_content
         
         return generated_content
 

@@ -153,6 +153,18 @@ def _detect_page_centroids(
     Returns:
         List of ``{"node_id": ..., "name": ..., "type": ..., "score": ...}``
         sorted by descending score.
+
+    A14 candidate (dead computation): output is stored in
+    ``sections[sec_id]["centroids"]`` during Phase 3 hierarchical Leiden
+    but a repo-wide grep confirms zero readers outside its own writes
+    (no consumer reads ``sections[*]["centroids"]`` or imports this
+    function). The production-relevant centroid path is
+    ``select_central_symbols`` (PageRank, this same module L87) which is
+    consumed by ``cluster_planner._select_central_node_ids`` to populate
+    ``PageSpec.target_symbols``. Keep until we either (a) wire the
+    degree+priority centroids into a UI-summary surface (the original
+    intent appears to have been per-page TL;DR cards) or (b) confirm
+    one release cycle without any new reader and delete.
     """
     if not page_node_ids:
         return []
@@ -360,6 +372,12 @@ def auto_resolution(node_count: int) -> float:
 # 2. Macro-Clustering (Wiki Sections)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Production-unreachable via the hierarchical_leiden=True gate at line 2130.
+# Reachable only from the "Legacy pipeline" else-branch below (line 2133),
+# which the gate never enters because feature_flags.hierarchical_leiden is
+# hardcoded True. Default branch routes to _louvain_macro below.
+# Coordinated removal pending after Phase A success criteria pass.
 def macro_cluster(
     G: nx.MultiDiGraph,
     hubs: Set[str],
@@ -408,6 +426,10 @@ def macro_cluster(
     return _louvain_macro(G_work, resolution)
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Original Louvain macro implementation; production runs hierarchical Leiden
+# instead (see _run_phase3_hierarchical_leiden at line 1946). Coordinated
+# removal pending after Phase A success criteria pass.
 def _louvain_macro(
     G_work: nx.MultiDiGraph,
     resolution: float,
@@ -675,6 +697,13 @@ def _nx_directed_to_igraph(
 # 3. Micro-Clustering (Wiki Pages)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Production-unreachable via the hierarchical_leiden=True gate at line 2130.
+# Default branch routes to _louvain_micro below (with an igraph-based Infomap
+# fallback when igraph is available — also dead-via-feature-flag).
+# Future Infomap micro-clustering will land via a dedicated C-lib binding;
+# see GAP_ANALYSIS_AND_ROADMAP.md §8 deferred item 3.
+# Coordinated removal pending after Phase A success criteria pass.
 def micro_cluster(
     G: nx.MultiDiGraph,
     macro_nodes: Set[str],
@@ -710,6 +739,12 @@ def micro_cluster(
     return _louvain_micro(G, macro_nodes, resolution)
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Original Louvain micro implementation; production runs hierarchical Leiden
+# instead. The Infomap-via-igraph fallback inside this function is also
+# dead-via-feature-flag and is NOT the basis for the future Infomap
+# micro-clusterer — that will use a dedicated C-lib binding (§8 #3).
+# Coordinated removal pending after Phase A success criteria pass.
 def _louvain_micro(
     G: nx.MultiDiGraph,
     macro_nodes: Set[str],
@@ -1424,6 +1459,32 @@ def _dir_similarity(a: Counter, b: Counter) -> int:
     return sum(min(a[d], b[d]) for d in a if d in b)
 
 
+def _cross_edges_count(
+    G: nx.MultiDiGraph,
+    src: Set[str],
+    tgt: Set[str],
+) -> int:
+    """Count directed edges in ``G`` between two node sets, both directions.
+
+    For ``MultiDiGraph``, parallel edges are counted separately. Used by
+    consolidation passes to pick the most semantically related merge
+    target (highest edge density between candidate and sibling) instead
+    of the directory-only heuristic that was the only signal before.
+    """
+    if not src or not tgt:
+        return 0
+    src_set = src if isinstance(src, set) else set(src)
+    tgt_set = tgt if isinstance(tgt, set) else set(tgt)
+    count = 0
+    for _u, v in G.out_edges(src_set):
+        if v in tgt_set:
+            count += 1
+    for _u, v in G.out_edges(tgt_set):
+        if v in src_set:
+            count += 1
+    return count
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Component Bridging  (post-projection, pre-Leiden)
 # ───────────────────────────────────────────────────────────────────────────
@@ -1433,6 +1494,10 @@ def _dir_similarity(a: Counter, b: Counter) -> int:
 BRIDGE_WEIGHT = 0.1
 
 
+# DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+# Zero production callers; only tests/test_component_bridging.py exercises it.
+# Active bridging is bridge_disconnected_components in graph_topology.py:1343.
+# Coordinated removal pending after Phase A success criteria pass.
 def _bridge_components(P: nx.MultiDiGraph) -> Dict[str, Any]:
     """Connect disconnected components in the projected graph.
 
@@ -1539,32 +1604,43 @@ def _consolidate_sections(
 
     original_count = len(sections)
 
-    # Pre-compute per-section directory histograms and sizes
+    # Pre-compute per-section directory histograms, node sets, sizes.
+    # The node set lets _cross_edges_count score by graph-edge density
+    # (semantic relatedness) instead of the directory-only heuristic
+    # the previous code used as its sole signal.
     sec_dirs: Dict[int, Counter] = {}
+    sec_nodes: Dict[int, Set[str]] = {}
     sec_sizes: Dict[int, int] = {}
     for sid, sec in sections.items():
         all_nids = [nid for pg in sec["pages"].values() for nid in pg]
         sec_dirs[sid] = _dir_histogram(all_nids, G)
+        sec_nodes[sid] = set(all_nids)
         sec_sizes[sid] = len(all_nids)
 
     while len(sections) > target:
         # Pick the smallest section
         smallest_id = min(sec_sizes, key=sec_sizes.get)
         dirs_a = sec_dirs[smallest_id]
+        nodes_a = sec_nodes[smallest_id]
 
-        # Find the best merge target (most shared directories; break ties
-        # by preferring the smaller target to keep sizes balanced).
+        # Score each candidate by (edges, dir_similarity, -size).
+        # Edges first (semantic relatedness — most cross-edges to the
+        # merging section win). Dir-similarity as tiebreak preserves
+        # the prior signal for the case where two siblings have equal
+        # cross-edge counts (typical for tiny components). Smaller
+        # sibling as third tiebreak — same as _consolidate_pages and
+        # the cluster_planner MERGE_WITH policy, keeps tie-breaking
+        # consistent across all merge layers.
         best_target = None
-        best_score = -1
+        best_key: Tuple[int, int, int] = (-1, -1, 1)
         for sid in sections:
             if sid == smallest_id:
                 continue
-            score = _dir_similarity(dirs_a, sec_dirs[sid])
-            if (score > best_score
-                    or (score == best_score
-                        and (best_target is None
-                             or sec_sizes[sid] < sec_sizes[best_target]))):
-                best_score = score
+            edges = _cross_edges_count(G, nodes_a, sec_nodes[sid])
+            dir_sim = _dir_similarity(dirs_a, sec_dirs[sid])
+            key = (edges, dir_sim, -sec_sizes[sid])
+            if key > best_key:
+                best_key = key
                 best_target = sid
 
         if best_target is None:
@@ -1588,6 +1664,7 @@ def _consolidate_sections(
         for d, c in dirs_a.items():
             sec_dirs[best_target][d] = sec_dirs[best_target].get(d, 0) + c
         del sec_dirs[smallest_id]
+        sec_nodes[best_target] |= sec_nodes.pop(smallest_id)
         sec_sizes[best_target] += sec_sizes.pop(smallest_id)
         del sections[smallest_id]
 
@@ -1629,15 +1706,20 @@ def _consolidate_pages(
 
     original_total = total_pages
 
-    # Build global page-size and page-dir indexes: (sid, pid) → size/dirs
+    # Build global page-size, page-dir, and page-node-set indexes:
+    # (sid, pid) → size / dirs / nodes. The node set lets the merge
+    # target pick by graph-edge density (semantic relatedness) instead
+    # of the directory-only heuristic that was the only signal before.
     pg_sizes: Dict[tuple, int] = {}
     pg_dirs: Dict[tuple, Counter] = {}
+    pg_nodes: Dict[tuple, Set[str]] = {}
 
     for sid, sec in sections.items():
         for pid, nids in sec["pages"].items():
             key = (sid, pid)
             pg_sizes[key] = len(nids)
             pg_dirs[key] = _dir_histogram(nids, G)
+            pg_nodes[key] = set(nids)
 
     while total_pages > target_total:
         # Find the globally smallest page that has a sibling in its section
@@ -1651,19 +1733,27 @@ def _consolidate_pages(
                 continue
 
             dirs_a = pg_dirs[(sid, pid)]
+            nodes_a = pg_nodes[(sid, pid)]
 
-            # Best same-section neighbour by directory similarity
+            # Best same-section neighbour scored by
+            # (edges, dir_similarity, -size). Edges first
+            # (semantic relatedness), dir as tiebreak, smaller-sibling
+            # third tiebreak — same policy as _consolidate_sections
+            # and cluster_planner MERGE_WITH.
             best_pg = None
-            best_score = -1
+            best_key: Tuple[int, int, int] = (-1, -1, 1)
             for other_pid in sec_pages:
                 if other_pid == pid:
                     continue
-                score = _dir_similarity(dirs_a, pg_dirs[(sid, other_pid)])
-                if (score > best_score
-                        or (score == best_score
-                            and (best_pg is None
-                                 or pg_sizes[(sid, other_pid)] < pg_sizes.get((sid, best_pg), 0)))):
-                    best_score = score
+                edges = _cross_edges_count(
+                    G, nodes_a, pg_nodes[(sid, other_pid)],
+                )
+                dir_sim = _dir_similarity(
+                    dirs_a, pg_dirs[(sid, other_pid)],
+                )
+                key = (edges, dir_sim, -pg_sizes[(sid, other_pid)])
+                if key > best_key:
+                    best_key = key
                     best_pg = other_pid
 
             if best_pg is None:
@@ -1676,7 +1766,9 @@ def _consolidate_pages(
 
             for d, c in dirs_a.items():
                 pg_dirs[(sid, best_pg)][d] = pg_dirs[(sid, best_pg)].get(d, 0) + c
+            pg_nodes[(sid, best_pg)] |= nodes_a
             del pg_dirs[(sid, pid)]
+            del pg_nodes[(sid, pid)]
             pg_sizes[(sid, best_pg)] += pg_sizes.pop((sid, pid))
 
             total_pages -= 1
@@ -2004,6 +2096,46 @@ def _run_phase3_hierarchical_leiden(
         "test_nodes_excluded": len(excluded_test_nodes),
     }
 
+    # A.10 (+ A.10.1): under the calibrated weight profile, derive the
+    # section-pass resolution from graph size instead of the hardcoded
+    # 1.0. auto_resolution() yields γ ≈ 0.65 for ~60-node graphs,
+    # γ ≈ 0.5 for ~300-node graphs, γ → 0.3 for very large graphs —
+    # fixing the over-clustering symptom on small repos (one community
+    # per file at γ=1.0).
+    #
+    # A.10.1 — feed FILE COUNT, not symbol-node count. The section pass
+    # runs on the file-contracted projection (each rel_path becomes one
+    # node). The formula was tuned for graphs at the file/module scale,
+    # so feeding symbol count (often 10-100× larger than file count)
+    # always pushes γ to the 0.3 clamp floor and over-aggregates large
+    # repos. Distinct rel_path count is the correct input layer.
+    #
+    # Only fires when:
+    #   - caller used the default (didn't override section_resolution)
+    #   - feature_flags.weight_calibration_profile == "calibrated"
+    # Legacy profile keeps the hardcoded 1.0 unchanged.
+    if (section_resolution == LEIDEN_FILE_SECTION_RESOLUTION
+            and getattr(feature_flags, "weight_calibration_profile", "legacy")
+                == "calibrated"):
+        # File count = number of distinct rel_path values. Nodes without
+        # rel_path (rare, virtual aggregations) are excluded. The same
+        # contraction _contract_to_file_graph() will perform inside
+        # hierarchical_leiden_cluster, modulo isolated-file handling.
+        file_paths = {
+            G_cluster.nodes[n].get("rel_path", "") for n in G_cluster.nodes()
+        }
+        file_paths.discard("")
+        n_files = len(file_paths) if file_paths else G_cluster.number_of_nodes()
+        adaptive_resolution = auto_resolution(n_files)
+        logger.info(
+            "A.10 auto_resolution (calibrated): γ_sec=%.4f for %d files "
+            "(was hardcoded %.2f, feeding %d symbol nodes would have given %.4f)",
+            adaptive_resolution, n_files, section_resolution,
+            G_cluster.number_of_nodes(),
+            auto_resolution(G_cluster.number_of_nodes()),
+        )
+        section_resolution = adaptive_resolution
+
     # Step 1+2: Hierarchical Leiden on the (possibly filtered) graph
     leiden_result = hierarchical_leiden_cluster(
         G_cluster, hubs,
@@ -2127,6 +2259,12 @@ def run_phase3(
         return _run_phase3_hierarchical_leiden(db, G, hubs, feature_flags=feature_flags)
 
     # ── Legacy pipeline (unchanged) ──────────────────────────────────
+    # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
+    # Unreachable when feature_flags.hierarchical_leiden is True (which is the
+    # hardcoded production setting at feature_flags.py:64). The whole else-
+    # branch below — and every Louvain helper it calls (macro_cluster,
+    # _louvain_macro, micro_cluster, _louvain_micro) — is dead in production.
+    # Coordinated removal pending after Phase A success criteria pass.
     results: Dict[str, Any] = {}
 
     # Get hubs from DB if not provided

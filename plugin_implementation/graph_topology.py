@@ -37,6 +37,7 @@ Usage::
     persist_weights_to_db(db, G)    # syncs all weights back to SQLite
 """
 
+import hashlib
 import logging
 import math
 import os
@@ -89,6 +90,28 @@ except ImportError:
 SYNTHETIC_WEIGHT_FLOOR = 0.5
 
 
+# Per-edge-class floor weights for the "calibrated" weight_calibration_profile
+# (A.12, see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md). Replaces the uniform
+# 0.5 floor with class-specific values so embedding-derived edges aren't
+# treated identically to pure path-prefix heuristics. When ``raw_similarity``
+# is populated on the edge (semantic / hybrid / lexical RRF), the floor is
+# lifted to ``max(class_floor, raw_similarity)`` — high-similarity edges
+# carry their similarity; weak ones fall back to the class baseline.
+#
+# Implicit confidence by edge_class — see GAP_ANALYSIS doc §A.12 on why a
+# per-class table is the same model as a per-edge ``confidence`` column for
+# our extractor population: each extractor emits one (rel_type, edge_class)
+# pair per confidence level, so confidence is encoded in the *choice* of
+# rel_type rather than per-edge.
+_CALIBRATED_FLOOR_BY_CLASS: Dict[str, float] = {
+    "directory": 0.30,   # name-heuristic (path prefix); lowest confidence
+    "bridge":    0.30,   # disconnected-component glue; Leiden bandage
+    "lexical":   0.40,   # FTS5 BM25 match on symbol/name
+    "doc":       0.40,   # markdown hyperlink + same-dir proximity
+    "semantic":  0.50,   # embedding-derived (hybrid / pure cosine)
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Inverse In-Degree Edge Weighting
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,6 +139,16 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
     if G.number_of_edges() == 0:
         return {"edges_weighted": 0, "min": 0, "max": 0, "mean": 0}
 
+    # Pick the calibration profile lazily to avoid an import cycle and to
+    # tolerate test contexts that construct a graph without a feature_flags
+    # provider.
+    profile = "legacy"
+    try:
+        from .feature_flags import get_feature_flags
+        profile = get_feature_flags().weight_calibration_profile
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+
     # Compute in-degree using ONLY structural edges (AST-derived).
     # Synthetic edges (orphan resolution, doc injection) are excluded
     # so they don't inflate anchor degrees and crush real edges.
@@ -128,15 +161,33 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
 
     weights = []
     synthetic_count = 0
+    per_class_count: Dict[str, int] = {}
     for u, v, key, data in G.edges(data=True, keys=True):
         in_deg = structural_in.get(v, 0)
         w = 1.0 / math.log(in_deg + 2)
 
-        # Synthetic recovery edges get a weight floor so Leiden
-        # actually groups orphan nodes with their anchors.
-        if data.get("edge_class", "structural") in _SYNTHETIC_CLASSES:
-            w = max(w, SYNTHETIC_WEIGHT_FLOOR)
+        # Synthetic recovery edges get a weight floor so Leiden actually
+        # groups orphan nodes with their anchors. Two profiles:
+        #   - "legacy"     — uniform SYNTHETIC_WEIGHT_FLOOR (0.5) for all classes
+        #   - "calibrated" — per-class floor from _CALIBRATED_FLOOR_BY_CLASS,
+        #                    lifted to raw_similarity when populated
+        edge_class = data.get("edge_class", "structural")
+        if edge_class in _SYNTHETIC_CLASSES:
+            if profile == "calibrated":
+                class_floor = _CALIBRATED_FLOOR_BY_CLASS.get(
+                    edge_class, SYNTHETIC_WEIGHT_FLOOR,
+                )
+                raw_sim = data.get("raw_similarity")
+                if raw_sim is not None:
+                    try:
+                        class_floor = max(class_floor, float(raw_sim))
+                    except (TypeError, ValueError):
+                        pass
+                w = max(w, class_floor)
+            else:
+                w = max(w, SYNTHETIC_WEIGHT_FLOOR)
             synthetic_count += 1
+            per_class_count[edge_class] = per_class_count.get(edge_class, 0) + 1
 
         data["weight"] = w
         weights.append(w)
@@ -144,17 +195,27 @@ def apply_edge_weights(G: nx.MultiDiGraph) -> Dict[str, Any]:
     stats = {
         "edges_weighted": len(weights),
         "synthetic_floored": synthetic_count,
+        "synthetic_per_class": per_class_count,
+        "calibration_profile": profile,
         "min": round(min(weights), 4),
         "max": round(max(weights), 4),
         "mean": round(sum(weights) / len(weights), 4),
     }
 
-    logger.info(
-        "Edge weighting complete: %d edges (%d synthetic floored at %.2f), "
-        "weight range [%.4f, %.4f], mean %.4f",
-        stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
-        stats["min"], stats["max"], stats["mean"],
-    )
+    if profile == "calibrated":
+        logger.info(
+            "Edge weighting complete (%s): %d edges, %d synthetic per-class %s, "
+            "weight range [%.4f, %.4f], mean %.4f",
+            profile, stats["edges_weighted"], synthetic_count, per_class_count,
+            stats["min"], stats["max"], stats["mean"],
+        )
+    else:
+        logger.info(
+            "Edge weighting complete (%s): %d edges (%d synthetic floored at %.2f), "
+            "weight range [%.4f, %.4f], mean %.4f",
+            profile, stats["edges_weighted"], synthetic_count, SYNTHETIC_WEIGHT_FLOOR,
+            stats["min"], stats["max"], stats["mean"],
+        )
     return stats
 
 
@@ -276,13 +337,51 @@ def _expanding_prefixes(rel_path: str) -> List[str]:
     return prefixes
 
 
-def find_orphans(G: nx.MultiDiGraph) -> List[str]:
-    """Return node IDs with both in-degree == 0 and out-degree == 0.
+def find_orphans(G: nx.MultiDiGraph, *, strict: bool = False) -> List[str]:
+    """Return node IDs eligible for synthetic enrichment.
 
-    These are completely disconnected nodes — documentation files,
-    standalone scripts, event handlers, cross-language stubs, etc.
-    They need synthetic edges to participate in clustering.
+    Two profiles, controlled by ``feature_flags.weight_calibration_profile``:
+
+    * **legacy** (default) — nodes with both ``in_degree == 0`` and
+      ``out_degree == 0``. Truly disconnected: documentation files,
+      standalone scripts, cross-language stubs, etc.
+    * **calibrated** (A.11) — nodes with ``in_degree == 0`` regardless
+      of ``out_degree``. Catches top-level scripts (``main.go``, app
+      entry points) and isolated event handlers that *import*
+      dependencies but are never *imported by* anything else. Today
+      they're disqualified because their outbound import edges flip
+      ``out_degree`` above zero, even though they're structurally
+      isolated from any architectural unit and would benefit from
+      semantic enrichment.
+
+    Args:
+        G: the graph.
+        strict: if True, ignore the profile and always use the legacy
+            (degree==0) criterion. ``orphans_remaining`` stat consumers
+            pass this so the resolved-count metric stays comparable
+            across profile flips. Synthetic enrichment edges go *from*
+            the orphan *to* an anchor (orphan's ``out_degree`` rises;
+            ``in_degree`` stays the same), which means under the
+            calibrated profile the same node would still match the
+            ``in_degree==0`` criterion after resolution. Strict mode
+            avoids that artifact for stat purposes.
     """
+    if strict:
+        return [
+            n for n in G.nodes()
+            if G.in_degree(n) == 0 and G.out_degree(n) == 0
+        ]
+
+    profile = "legacy"
+    try:
+        from .feature_flags import get_feature_flags
+        profile = get_feature_flags().weight_calibration_profile
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    if profile == "calibrated":
+        return [n for n in G.nodes() if G.in_degree(n) == 0]
+
     return [
         n for n in G.nodes()
         if G.in_degree(n) == 0 and G.out_degree(n) == 0
@@ -552,7 +651,10 @@ def _resolve_orphans_v2(
     if remaining:
         stats["directory"] = _resolve_orphans_by_directory(db, G, remaining)
 
-    stats["orphans_remaining"] = len(find_orphans(G))
+    # Stats use strict=True so the resolved-count is comparable across
+    # legacy/calibrated profiles (see find_orphans docstring on the
+    # in_degree-stays-zero artifact under calibrated).
+    stats["orphans_remaining"] = len(find_orphans(G, strict=True))
     stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
 
     logger.info(
@@ -684,6 +786,22 @@ def resolve_orphans(
         )
         _sync_legacy_aliases(out)
         return out
+
+    # ─────────────────────────────────────────────────────────────────────
+    # A14 candidate (dead-via-feature-flag): everything below this point
+    # only runs when ``flags.orphan_cascade_v2`` is False — but it defaults
+    # to True in production (FeatureFlags.orphan_cascade_v2 = True) and the
+    # early-return at line 787 is the only exit taken in live runs. The
+    # `created_by` audit on configurations + microservices-demo confirms
+    # zero edges are emitted from ``fts5_lexical`` (bare, no _v2 suffix)
+    # and ``vec_semantic`` in either repo.
+    #
+    # Modes B (orphan_lexical_tiered) and C (legacy flat FTS + vec) below
+    # are kept only as a kill-switch fallback. Remove after one release
+    # cycle of the v2 cascade being default with no rollbacks observed.
+    # Until then, do not extend these branches — fixes belong in
+    # ``_resolve_orphans_v2``.
+    # ─────────────────────────────────────────────────────────────────────
 
     # ── Pass 1: lexical (tiered T1–T4 OR legacy flat FTS) ────
     if flags is not None and flags.orphan_lexical_tiered:
@@ -929,7 +1047,9 @@ def resolve_orphans(
         stats["directory"], t5 - t4,
     )
 
-    stats["orphans_remaining"] = len(find_orphans(G))
+    # Stats use strict=True for cross-profile comparability (see
+    # find_orphans docstring).
+    stats["orphans_remaining"] = len(find_orphans(G, strict=True))
     stats["resolved"] = stats["orphans_found"] - stats["orphans_remaining"]
 
     logger.info(
@@ -1084,6 +1204,15 @@ def _extract_hyperlink_edges(
     - `` `SymbolName` `` → directed edge doc → code symbol
 
     Returns list of (source_id, target_id) pairs.
+
+    A14 candidate (produces 0 edges in production): the heuristic requires
+    fully-resolvable relative paths inside markdown links, which neither
+    microservices-demo nor configurations READMEs use in practice
+    (verified by ``created_by='md_hyperlink'`` count = 0 in both DBs).
+    The ``explicit_ref_v2`` pass at orphan resolution Pass 1 already
+    extracts symbol mentions from doc text and produces real edges
+    (e.g. README.md → 13 edges on configurations), making this Tier 1
+    redundant. Remove once we're confident no internal repo benefits.
     """
     edges: List[Tuple[str, str]] = []
 
@@ -1158,6 +1287,44 @@ def _extract_proximity_edges(
 
         doc_dir = os.path.dirname(rp).replace("\\", "/")
         if not doc_dir:
+            # Repo-root doc (README.md, db_migrations.txt, ...). The
+            # directory-match heuristic above is "doc in dir X relates
+            # to code in dir X" — at the root that would mean "code at
+            # root", which is rare and unrepresentative. Repo-root docs
+            # describe the whole project, so attach one edge per
+            # top-level directory (capped) — gives the doc a path into
+            # each top-level package without ballooning edge count.
+            #
+            # Hash-distributed anchor: each doc picks a *different*
+            # representative per top-level dir based on hash(nid). The
+            # naive ``code_nodes[0]`` shortcut would route every root
+            # doc (LICENSE, README, db_migrations.txt, requirements.txt,
+            # ...) to the same five anchors and pull all of them into
+            # one cluster — observed on the configurations repo's first
+            # post-Track-2a run (54.6%-dominance cluster ate every
+            # root doc plus the Configuration API + Event class).
+            seen_top: Set[str] = set()
+            _ROOT_DOC_TOP_LEVEL_CAP = 20
+            # Stable hash — Python's built-in hash() is randomised per
+            # process (PYTHONHASHSEED) and would pick a different anchor
+            # symbol every run, churning doc edges and clustering output.
+            # md5 is used purely as a deterministic 128-bit digest, not
+            # for any security property.
+            doc_hash = int.from_bytes(
+                hashlib.md5(nid.encode("utf-8")).digest()[:8], "big",
+            )
+            for code_dir, code_nodes in dir_to_code.items():
+                top = code_dir.split("/", 1)[0]
+                if not top or top in seen_top:
+                    continue
+                if not code_nodes:
+                    continue
+                cnid = code_nodes[doc_hash % len(code_nodes)]
+                if cnid != nid:
+                    edges.append((nid, cnid))
+                seen_top.add(top)
+                if len(seen_top) >= _ROOT_DOC_TOP_LEVEL_CAP:
+                    break
             continue
 
         # Strip doc prefix to get the "topic" directory

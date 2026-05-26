@@ -230,11 +230,47 @@ SUPPORTING_CODE_SYMBOLS = frozenset({
 })
 
 # Documentation symbol kinds used for docs-only page detection.
+#
+# Must stay in sync with the symbol_type values that
+# ``code_graph/graph_builder.py:_parse_documentation_files`` actually
+# emits. The previous {module_doc, file_doc} set was a dead synonym —
+# no parser ever produced those types, so candidate_builder always
+# saw doc_count == 0 and never classified anything as CLASS_DOCS.
+# Empirical types observed in the live unified DB on configurations +
+# microservices: markdown_document, plaintext_document, yaml_document,
+# json_document, config_document, infrastructure_document,
+# script_document, html_document, schema_document, text_chunk.
+#
+# When adding a new doc parser, audit ``_chunk_text_content`` and
+# ``DOCUMENTATION_EXTENSIONS`` and add the new symbol_type here.
 DOC_CLUSTER_SYMBOLS = frozenset({
+    # Per-file blob doc nodes (one per source file unless chunked)
+    'markdown_document',
+    'plaintext_document',
+    'yaml_document',
+    'json_document',
+    'config_document',
+    'infrastructure_document',
+    'script_document',
+    'html_document',
+    'schema_document',
+    # Markdown header-split sections — the dominant type after Phase A's
+    # always-split-by-header chunker (graph_builder._chunk_markdown_content
+    # emits section_type='markdown_section', which becomes symbol_type on
+    # the BasicSymbol node). Without this entry candidate_builder counts
+    # README sections as code and never classifies pure-doc clusters.
+    'markdown_section',
+    # Generic chunks produced by _chunk_generic_text fallback
+    'text_chunk',
+    # Legacy aliases — kept for compatibility if any parser still emits them
     'module_doc', 'file_doc',
 })
 
 # Numeric priority for seed ordering — aligned with graph_builder._get_type_priority().
+# All DOC_CLUSTER_SYMBOLS share priority 1 (lowest, tie-broken by name) so they
+# never out-rank code seeds in mixed clusters but remain valid fallbacks for
+# pure-doc clusters. Test contract:
+# tests/test_feature_flags.py::test_priority_covers_doc_symbols.
 SYMBOL_TYPE_PRIORITY = {
     'class': 10, 'interface': 10, 'trait': 10, 'protocol': 10,
     'enum': 9, 'struct': 9, 'record': 9,
@@ -242,6 +278,18 @@ SYMBOL_TYPE_PRIORITY = {
     'function': 7,
     'constant': 6, 'type_alias': 6, 'macro': 6,
     'method': 3, 'property': 2,
+    # Doc symbols — must cover every DOC_CLUSTER_SYMBOLS member.
+    'markdown_document': 1,
+    'markdown_section': 1,
+    'plaintext_document': 1,
+    'yaml_document': 1,
+    'json_document': 1,
+    'config_document': 1,
+    'infrastructure_document': 1,
+    'script_document': 1,
+    'html_document': 1,
+    'schema_document': 1,
+    'text_chunk': 1,
     'module_doc': 1, 'file_doc': 1,
 }
 

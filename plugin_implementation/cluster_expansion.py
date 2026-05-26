@@ -757,8 +757,18 @@ def expand_for_page(
                 budget_remaining -= cost
 
     # ── Step 4: Include cluster doc nodes (if budget allows) ─────
+    #     Two sources, deduped:
+    #       (a) docs co-clustered with the page (same macro/micro)
+    #       (b) docs graph-adjacent to any seed symbol — README → util
+    #           edges from explicit_ref_v2 / proximity routes README to
+    #           a page whose seeds are util methods, even when README
+    #           lives in a different cluster (Track 2b symmetric
+    #           traversal at the consumer).
     if include_docs and macro_id is not None and budget_remaining > 0:
-        doc_nodes = _get_cluster_docs(db, macro_id, micro_id, seen_ids)
+        seed_node_ids = set(matched_nodes.keys())
+        doc_nodes = _get_cluster_docs(
+            db, macro_id, micro_id, seen_ids, seed_node_ids,
+        )
         for node in doc_nodes:
             if budget_remaining <= 0 or len(result_docs) >= MAX_EXPANSION_TOTAL:
                 break
@@ -973,12 +983,29 @@ def _get_cluster_docs(
     macro_id: int,
     micro_id: Optional[int],
     seen_ids: Set[str],
+    seed_ids: Optional[Set[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch documentation nodes from the same cluster not yet in ``seen_ids``.
+    """Fetch documentation nodes for a page.
+
+    Two sources, deduped by ``node_id``:
+      1. Same-cluster docs (existing behaviour) — fetched by
+         ``macro_cluster`` (and ``micro_cluster`` if provided). Catches
+         docs the planner already grouped with this page.
+      2. Edge-adjacent docs — when ``seed_ids`` is provided, also
+         include docs that have an edge in either direction to any of
+         the page's seed symbols. Closes the producer-consumer gap
+         where explicit_ref / proximity edges put a doc in the graph
+         but the doc happens to land in a different cluster than the
+         code it describes (e.g. README in cluster 3 mentions
+         ``utils.section`` which lives in cluster 0; without source
+         (2) the page about cluster 0 would never see README's
+         content even though the graph says they're connected).
 
     Returns nodes sorted by path (deterministic ordering).
     """
     conn = db.conn
+
+    # Source (1): same-cluster docs.
     if micro_id is not None:
         rows = conn.execute(
             "SELECT * FROM repo_nodes "
@@ -994,11 +1021,41 @@ def _get_cluster_docs(
             (macro_id,),
         ).fetchall()
 
-    result = []
+    # Source (2): edge-adjacent docs (Track 2b symmetric traversal).
+    # Skipped when seed_ids is empty/None — keeps the legacy code path
+    # unchanged when the caller didn't opt in.
+    if seed_ids:
+        # SQLite has a soft IN-list parameter limit (~999 by default).
+        # Page seeds are ~10-30 in practice; cap defensively to be safe
+        # in pathological cases.
+        seeds_capped = list(seed_ids)[:500]
+        placeholders = ",".join("?" * len(seeds_capped))
+        adjacent_rows = conn.execute(
+            f"SELECT n.* FROM repo_nodes n "
+            f"WHERE n.is_doc = 1 AND n.node_id IN ("
+            f"  SELECT DISTINCT source_id FROM repo_edges "
+            f"  WHERE target_id IN ({placeholders}) "
+            f"  UNION "
+            f"  SELECT DISTINCT target_id FROM repo_edges "
+            f"  WHERE source_id IN ({placeholders}) "
+            f") "
+            f"ORDER BY n.rel_path",
+            tuple(seeds_capped) * 2,
+        ).fetchall()
+    else:
+        adjacent_rows = []
+
+    # Dedup by node_id, preserving rel_path ordering.
+    result: List[Dict[str, Any]] = []
+    seen_node_ids: Set[str] = set()
     exclude = get_feature_flags().exclude_tests
-    for r in rows:
+    for r in list(rows) + list(adjacent_rows):
         node = dict(r)
-        if node.get("node_id", "") not in seen_ids:
-            if not _is_excluded_test_node(node, exclude):
-                result.append(node)
+        nid = node.get("node_id", "")
+        if not nid or nid in seen_ids or nid in seen_node_ids:
+            continue
+        if _is_excluded_test_node(node, exclude):
+            continue
+        result.append(node)
+        seen_node_ids.add(nid)
     return result

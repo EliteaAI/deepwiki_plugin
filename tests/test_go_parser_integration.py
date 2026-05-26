@@ -1155,9 +1155,12 @@ class TestGoGraphBuilder:
             if d.get("relationship_type") == "defines":
                 defines_edges.append((u, v, d))
 
-        # Should have fields (Name, Email) + methods (Validate, String, SetName) = 5 defines
-        assert len(defines_edges) >= 5, (
-            f"Expected >= 5 defines edges (2 fields + 3 methods), got {len(defines_edges)}: "
+        # Phase A graph contraction drops field nodes (Name, Email) as noise,
+        # leaving the three methods as the surviving DEFINES targets — which
+        # is what this test really checks (cross-file receiver methods).
+        assert len(defines_edges) >= 3, (
+            f"Expected >= 3 method defines edges (Validate, String, SetName), "
+            f"got {len(defines_edges)}: "
             f"{[(u.split('::')[-1], v.split('::')[-1]) for u, v, _ in defines_edges]}"
         )
 

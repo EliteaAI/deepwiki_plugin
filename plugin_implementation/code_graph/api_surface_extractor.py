@@ -788,6 +788,130 @@ def _match_cli(text: str) -> List[APISurface]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Pylon class-API producer (ported from wikis 2026-05-25)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Pylon framework convention: each module under ``api/v\d+/<name>.py``
+# defines a class ``API(APIBase)`` (or ``MethodView`` for vanilla Flask,
+# ``Resource`` for Flask-RESTful) whose method names (``get``, ``post``,
+# ``put``, ``patch``, ``delete``) are HTTP verbs. The path is derived
+# from the file path; per-method extra path segments live in a class
+# attribute ``url_params = ['', '<int:project_id>', ...]``. There are
+# no decorators to scan, which is why the standard REST matchers
+# above produce zero surfaces for Pylon plugin handlers.
+#
+# Port intent: graph-level API surface emission + plugin-mounted
+# variants. Does NOT change page generation — the LLM-side instruction
+# for rendering deployed URLs is a separate concern (see
+# _graph_audit/PYLON_ENDPOINT_DERIVATION_NOTE.md).
+
+_PYLON_API_BASE = re.compile(
+    r"\bclass\s+\w+\s*\(\s*[^)]*?(?:APIBase|MethodView|Resource)\b"
+)
+# Capture everything inside the first ``url_params = [...]`` literal.
+# Multi-line OK; we then split by comma.
+_PYLON_URL_PARAMS = re.compile(
+    r"\burl_params\s*=\s*\[(?P<body>.*?)\]",
+    re.DOTALL,
+)
+_PYLON_METHOD_DEF = re.compile(
+    r"^\s*def\s+(?P<m>get|post|put|patch|delete|head|options)\s*\(",
+    re.MULTILINE | re.IGNORECASE,
+)
+# rel_path → route base. Matches both ``api/v1/foo.py`` and
+# ``api/foo.py``; everything before the version-or-api segment is
+# treated as the pylon plugin mount point and dropped.
+_PYLON_ROUTE_FROM_PATH = re.compile(
+    r"(/api(?:/v\d+\w*)?/[A-Za-z0-9_/\-]+?)\.py$"
+)
+
+
+def _pylon_route_from_rel_path(rel_path: str) -> str:
+    if not rel_path:
+        return ""
+    norm = "/" + rel_path.lstrip("/")
+    m = _PYLON_ROUTE_FROM_PATH.search(norm)
+    if not m:
+        return ""
+    return m.group(1)
+
+
+def _match_pylon_api(node_data: dict, plugin_name: str = "") -> List[APISurface]:
+    """Producer-side matcher for Pylon's class-API framework.
+
+    Fires only on top-level class nodes whose source declares
+    inheritance from ``APIBase`` (Pylon), ``MethodView`` (Flask), or
+    ``Resource`` (Flask-RESTful) — all share the same
+    "method-name = HTTP verb" convention.
+
+    When ``plugin_name`` is supplied, also emits twins with the plugin
+    mount segment inserted after ``/api/vN/`` (Pylon convention: a
+    plugin named ``configurations`` mounts ``api/v2/foo.py`` at
+    ``/api/v2/configurations/foo``). Without this, the source's
+    on-disk route ``/api/v2/foo`` would never pair against an SDK
+    consumer URL ``/api/v2/configurations/foo`` because the framework
+    inserts the mount segment at deploy time, not in source.
+    """
+    if (node_data.get("symbol_type") or "").lower() != "class":
+        return []
+    text = node_data.get("source_text") or ""
+    if not text or not _PYLON_API_BASE.search(text):
+        return []
+    base = _pylon_route_from_rel_path(node_data.get("rel_path") or "")
+    if not base:
+        return []
+    # Collect url_params suffixes; default to a single empty suffix so
+    # we still emit the bare base route.
+    suffixes: List[str] = [""]
+    pm = _PYLON_URL_PARAMS.search(text)
+    if pm:
+        body = pm.group("body")
+        custom: List[str] = []
+        for raw in body.split(","):
+            tok = raw.strip().strip("'\"")
+            if not tok:
+                custom.append("")
+                continue
+            # Pylon path params look like ``<int:project_id>`` —
+            # collapse to ``{var}`` so they pair with consumer-side
+            # f-string templates.
+            collapsed = re.sub(r"<[^>]+>", "{var}", tok)
+            collapsed = "/" + collapsed.lstrip("/")
+            custom.append(collapsed)
+        if custom:
+            suffixes = custom
+    methods = {m.group("m").upper() for m in _PYLON_METHOD_DEF.finditer(text)}
+    if not methods:
+        return []
+    # Compute the plugin-mounted variant of the base path. Pylon
+    # plugins are conventionally mounted at ``/api/vN/<plugin_name>/``
+    # so a file at ``api/v2/foo.py`` is served at
+    # ``/api/v2/<plugin_name>/foo``. Without this twin, the bare
+    # source-path route ``/api/v2/foo`` would never match an SDK
+    # consumer URL ``/api/v2/<plugin_name>/foo``.
+    base_variants: List[str] = [base]
+    if plugin_name:
+        mount_re = re.compile(r"^(/api(?:/v\d+\w*)?)/(.+)$")
+        mm = mount_re.match(base)
+        if mm and not mm.group(2).startswith(plugin_name + "/") and mm.group(2) != plugin_name:
+            mounted = f"{mm.group(1)}/{plugin_name}/{mm.group(2)}"
+            base_variants.append(mounted)
+    out: List[APISurface] = []
+    seen: set = set()
+    for method in methods:
+        for base_v in base_variants:
+            for suffix in suffixes:
+                full = base_v + suffix if suffix else base_v
+                for surf in _emit_rest_surfaces(method, full, weight_hint=0.65):
+                    key = (surf["kind"], surf["surface"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(surf)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Dispatcher
 # ──────────────────────────────────────────────────────────────────────
 
@@ -804,6 +928,8 @@ _REST_BY_LANGUAGE: Dict[str, Callable[[str], List[APISurface]]] = {
 def extract_api_surfaces(
     node_data: dict,
     parser_metadata: Optional[dict] = None,
+    *,
+    plugin_name: str = "",
 ) -> List[APISurface]:
     """Return all API surfaces visible in *node_data*.
 
@@ -811,6 +937,11 @@ def extract_api_surfaces(
     attributes (``language``, ``symbol_name``). ``parser_metadata`` is
     accepted but currently unused — reserved for matchers that need
     decorator AST detail beyond what survives in ``source_text``.
+
+    ``plugin_name`` is the Pylon-style plugin mount segment (read from
+    ``metadata.json`` by ``extract_api_surfaces_for_graph``). When
+    supplied, ``_match_pylon_api`` emits both the on-disk source path
+    and the deployed ``/api/vN/<plugin_name>/...`` twin.
     """
     existing = node_data.get("api_surface") or []
     if existing:
@@ -841,6 +972,11 @@ def extract_api_surfaces(
     surfaces.extend(_match_objects(text, language))
     surfaces.extend(_match_bdd(text))
     surfaces.extend(_match_cli(text))
+    # Pylon-style class-API producer (no decorators; route inferred
+    # from rel_path; HTTP verb from method names of an APIBase /
+    # MethodView / Resource subclass). Skips silently for any class
+    # that doesn't match the inheritance pattern.
+    surfaces.extend(_match_pylon_api(node_data, plugin_name=plugin_name))
 
     # De-duplicate while preserving order; tag the first occurrence wins.
     seen = set()
@@ -967,6 +1103,46 @@ def extract_api_surfaces_for_graph(
         file_ctypes_libs[rel_path] = names
         return names
 
+    def _plugin_name_from_metadata_text(text: str) -> str:
+        """Parse a Pylon plugin's ``metadata.json`` and return its
+        ``name`` field (the URL mount segment).
+
+        Tolerates the ``[File: metadata.json]`` header line some
+        parsers prepend. Restricts the name to a conservative
+        identifier-like shape so we never inject arbitrary user
+        strings into a route surface.
+        """
+        if not text:
+            return ""
+        try:
+            import json as _json
+            payload = text
+            if payload.startswith("[File:"):
+                nl = payload.find("\n")
+                if nl != -1:
+                    payload = payload[nl + 1:]
+            meta = _json.loads(payload)
+            name = (meta.get("name") or "").strip()
+            if name and re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", name):
+                return name
+        except Exception:
+            return ""
+        return ""
+
+    # Detect the Pylon plugin name once per repo from ``metadata.json``.
+    # When found, ``_match_pylon_api`` uses it to emit deployed-URL
+    # twins (``/api/v2/<plugin_name>/foo``) alongside the bare
+    # source-path routes. Single repo here so a flat name is enough —
+    # no per-wiki scoping like wikis upstream.
+    plugin_name: str = ""
+    for _nid, _d in g.nodes(data=True):
+        if (_d.get("rel_path") or "") != "metadata.json":
+            continue
+        _name = _plugin_name_from_metadata_text(_d.get("source_text") or "")
+        if _name:
+            plugin_name = _name
+            break
+
     out: Dict[str, List[APISurface]] = {}
     for node_id, data in g.nodes(data=True):
         # For Python nodes, splice the file-level router-prefix line into
@@ -1005,7 +1181,9 @@ def extract_api_surfaces_for_graph(
                 data["source_text"] = scratch_text
         try:
             surfaces = extract_api_surfaces(
-                data, parser_metadata=parser_metadata_by_node.get(str(node_id))
+                data,
+                parser_metadata=parser_metadata_by_node.get(str(node_id)),
+                plugin_name=plugin_name,
             )
             # Python ctypes wrapper detection (file-level lib var ↔
             # ``<libvar>.<func>(`` call sites in the symbol body).
