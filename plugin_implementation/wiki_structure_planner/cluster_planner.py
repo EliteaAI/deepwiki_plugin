@@ -327,9 +327,14 @@ class ClusterStructurePlanner:
     ) -> int:
         """Count graph edges between two sets of node IDs (either direction).
 
-        Used by MERGE_WITH to pick the most semantically related
-        sibling instead of the size leader. SQLite IN-list capped at
-        500 per side defensively (page sizes are ~10–100 in practice).
+        Used by MERGE_WITH when no precomputed per-macro table is
+        available (e.g. tests / one-off callers). The hot MERGE_WITH
+        loop in ``plan_structure`` uses ``_build_macro_edge_index``
+        instead — a single batched query per macro — to avoid
+        O(pages²) SQL.
+
+        SQLite IN-list capped at 500 per side defensively
+        (page sizes are ~10–100 in practice).
         """
         if not src_nids or not tgt_nids:
             return 0
@@ -344,6 +349,113 @@ class ClusterStructurePlanner:
             tuple(src) + tuple(tgt) + tuple(tgt) + tuple(src),
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def _apply_split_by_pass(
+        self,
+        cluster_map: Dict[int, Dict[int, List[str]]],
+        validations: List[Any],
+    ) -> int:
+        """Partition each SPLIT_BY-flagged page by ``rel_path`` in place.
+
+        The validator flags SPLIT_BY for clusters that exceed
+        ``max_page_size``, hit the utility-contamination ceiling, or are
+        classified as BRIDGE (high file_spread). All three benefit from
+        a per-rel_path partition: each sub-page holds the symbols that
+        originate from one source file, which is the most reliable
+        "one capability" boundary available at this layer without
+        re-running Leiden.
+
+        Capped at ``_MAX_SPLIT_SUBPAGES``; when a candidate has more
+        files than the cap, the smaller files merge into the largest
+        sub-page so total page count stays bounded. A single-file
+        SPLIT_BY (utility-contamination on one big file) is left
+        untouched — there is nothing better to split it by here.
+
+        Returns the number of pages that were actually split.
+        Extracted from the inline ``plan_structure`` body so the rule
+        can be unit-tested without driving the full planner pipeline.
+        """
+        split_count = 0
+        for vr in validations:
+            if vr.shape_decision != SPLIT_BY:
+                continue
+            mid = vr.candidate.macro_id
+            pid = vr.candidate.micro_id
+            if mid not in cluster_map or pid not in cluster_map[mid]:
+                continue
+            node_ids = cluster_map[mid][pid]
+            sub_partitions: Dict[str, List[str]] = {}
+            for nid in node_ids:
+                node = self.db.get_node(nid)
+                rel = (node or {}).get("rel_path") or "_unknown"
+                sub_partitions.setdefault(rel, []).append(nid)
+            if len(sub_partitions) <= 1:
+                continue
+            ordered = sorted(
+                sub_partitions.items(), key=lambda kv: -len(kv[1]),
+            )
+            if len(ordered) > _MAX_SPLIT_SUBPAGES:
+                keepers = ordered[:_MAX_SPLIT_SUBPAGES]
+                for _path, extra in ordered[_MAX_SPLIT_SUBPAGES:]:
+                    keepers[0][1].extend(extra)
+                ordered = keepers
+            del cluster_map[mid][pid]
+            next_pid = max(cluster_map[mid].keys(), default=-1) + 1
+            for _path, nids in ordered:
+                cluster_map[mid][next_pid] = nids
+                next_pid += 1
+            split_count += 1
+        return split_count
+
+    def _build_macro_edge_index(
+        self, macro_pages: Dict[int, List[str]],
+    ) -> Dict[Tuple[int, int], int]:
+        """One SQL query per macro → ``(pid_a, pid_b) → undirected count``.
+
+        Replaces the per-pair ``_count_cross_edges`` calls inside the
+        MERGE_WITH loop. For a macro with ``P`` pages and ``M``
+        MERGE_WITH candidates the old path issued ``M·(P-1)`` SQL
+        ``COUNT(*)`` queries; this issues exactly one (chunked over
+        SQLite's default 999-placeholder limit) and counts in Python.
+
+        Pairs are stored with the smaller pid first so callers don't
+        need to probe both orderings.
+        """
+        # Build the inverse lookup once and collect the full nid set.
+        nid_to_pid: Dict[str, int] = {}
+        for pid, nids in macro_pages.items():
+            for nid in nids:
+                nid_to_pid[nid] = pid
+
+        index: Dict[Tuple[int, int], int] = {}
+        if not nid_to_pid:
+            return index
+
+        all_nids = list(nid_to_pid.keys())
+        # SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999. Chunk the
+        # ``source_id IN (...)`` half and post-filter ``target_id`` in
+        # Python — this lets one macro scale to thousands of nids
+        # without hitting the placeholder limit.
+        chunk_size = 900
+        nid_set = set(all_nids)
+        for i in range(0, len(all_nids), chunk_size):
+            chunk = all_nids[i:i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            cur = self.db.conn.execute(
+                f"SELECT source_id, target_id FROM repo_edges "
+                f"WHERE source_id IN ({placeholders})",
+                tuple(chunk),
+            )
+            for src_id, tgt_id in cur.fetchall():
+                if tgt_id not in nid_set:
+                    continue
+                pa = nid_to_pid.get(src_id)
+                pb = nid_to_pid.get(tgt_id)
+                if pa is None or pb is None or pa == pb:
+                    continue
+                key = (pa, pb) if pa < pb else (pb, pa)
+                index[key] = index.get(key, 0) + 1
+        return index
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -386,51 +498,7 @@ class ClusterStructurePlanner:
                         demote_count += 1
 
             # Pass 2 — Split SPLIT_BY candidates into per-file sub-pages.
-            # The validator flags SPLIT_BY for clusters that exceed
-            # max_page_size, hit the utility-contamination ceiling, or
-            # are classified as BRIDGE (high file_spread). All three
-            # benefit from a per-rel_path partition: each sub-page
-            # holds the symbols that originate from one source file,
-            # which is the most reliable "one capability" boundary
-            # available at this layer without re-running Leiden.
-            #
-            # Capped at _MAX_SPLIT_SUBPAGES; when a candidate has more
-            # files than the cap the smaller files merge into the
-            # largest sub-page so total page count stays bounded.
-            split_count = 0
-            for vr in validations:
-                if vr.shape_decision != SPLIT_BY:
-                    continue
-                mid = vr.candidate.macro_id
-                pid = vr.candidate.micro_id
-                if mid not in cluster_map or pid not in cluster_map[mid]:
-                    continue
-                node_ids = cluster_map[mid][pid]
-                sub_partitions: Dict[str, List[str]] = {}
-                for nid in node_ids:
-                    node = self.db.get_node(nid)
-                    rel = (node or {}).get("rel_path") or "_unknown"
-                    sub_partitions.setdefault(rel, []).append(nid)
-                if len(sub_partitions) <= 1:
-                    # Single-file candidate flagged for split (likely
-                    # utility-contamination on one big file). Nothing
-                    # better to split by here — keep as-is.
-                    continue
-                ordered = sorted(
-                    sub_partitions.items(), key=lambda kv: -len(kv[1]),
-                )
-                if len(ordered) > _MAX_SPLIT_SUBPAGES:
-                    keepers = ordered[:_MAX_SPLIT_SUBPAGES]
-                    for _path, extra in ordered[_MAX_SPLIT_SUBPAGES:]:
-                        keepers[0][1].extend(extra)
-                    ordered = keepers
-                # Replace the original page with the sub-pages.
-                del cluster_map[mid][pid]
-                next_pid = max(cluster_map[mid].keys(), default=-1) + 1
-                for _path, nids in ordered:
-                    cluster_map[mid][next_pid] = nids
-                    next_pid += 1
-                split_count += 1
+            split_count = self._apply_split_by_pass(cluster_map, validations)
 
             # Pass 3 — Merge MERGE_WITH candidates into their best
             # surviving sibling. Pick by graph-edge density between the
@@ -441,6 +509,18 @@ class ClusterStructurePlanner:
             # size-based (no semantic signal) and inconsistent with the
             # consolidation passes that already run earlier.
             merge_count = 0
+            # Precompute one (pid_a, pid_b) → edge_count map per macro
+            # that has MERGE_WITH candidates — replaces the inner
+            # _count_cross_edges loop and its per-pair SQL COUNT(*).
+            merge_macros = {
+                vr.candidate.macro_id for vr in validations
+                if vr.shape_decision == MERGE_WITH
+                and vr.candidate.macro_id in cluster_map
+            }
+            macro_edge_index: Dict[int, Dict[Tuple[int, int], int]] = {
+                mid: self._build_macro_edge_index(cluster_map[mid])
+                for mid in merge_macros
+            }
             for vr in validations:
                 if vr.shape_decision != MERGE_WITH:
                     continue
@@ -448,14 +528,15 @@ class ClusterStructurePlanner:
                 pid = vr.candidate.micro_id
                 if mid not in cluster_map or pid not in cluster_map[mid]:
                     continue
-                src_nids = cluster_map[mid][pid]
+                edge_index = macro_edge_index.get(mid, {})
                 best_sibling = None
                 best_edges = -1
                 best_size = 0
                 for other_pid, other_nids in cluster_map[mid].items():
                     if other_pid == pid:
                         continue
-                    edge_count = self._count_cross_edges(src_nids, other_nids)
+                    key = (pid, other_pid) if pid < other_pid else (other_pid, pid)
+                    edge_count = edge_index.get(key, 0)
                     if (edge_count > best_edges
                             or (edge_count == best_edges
                                 and (best_sibling is None

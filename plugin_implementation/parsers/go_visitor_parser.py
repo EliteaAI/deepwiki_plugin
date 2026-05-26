@@ -1326,8 +1326,14 @@ class GoVisitorParser(BaseParser):
             struct_methods[type_name] = set(methods.keys())
 
         def _exported(methods: Set[str]) -> Set[str]:
-            """Filter Go unexported (lowercase-leading) names — markers, not real API."""
-            return {m for m in methods if m and not m[0].islower()}
+            """Filter to Go-exported names (first rune uppercase).
+
+            ``str.isupper()`` matches Go's ``unicode.IsUpper`` for ASCII
+            letters; the previous ``not m[0].islower()`` accepted '_' and
+            digit-leading names, accidentally treating private markers
+            like ``_unexported`` as exported.
+            """
+            return {m for m in methods if m and m[0].isupper()}
 
         def _emit_pair(
             struct_file: Optional[str],

@@ -503,9 +503,16 @@ class TestDocTypeCorrectness(unittest.TestCase):
         self.assertEqual(result.symbols[0].symbol_type, 'xml_document')
 
     def test_markdown_gets_markdown_document_type(self):
+        # Phase A always splits markdown by H1–H4 headers; a single-section
+        # file becomes one ``markdown_section`` node, a header-less file
+        # falls through to a ``markdown_document`` blob. Both are valid
+        # markdown-doc types for downstream classification.
         result = self._write_and_parse('README.md', '# Hello\n')
         self.assertEqual(result.language, 'markdown')
-        self.assertEqual(result.symbols[0].symbol_type, 'markdown_document')
+        self.assertIn(
+            result.symbols[0].symbol_type,
+            {'markdown_document', 'markdown_section'},
+        )
 
     def test_toml_gets_toml_document_type(self):
         result = self._write_and_parse('pyproject.toml', '[project]\nname = "x"\n')

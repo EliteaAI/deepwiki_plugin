@@ -254,13 +254,23 @@ DOC_CLUSTER_SYMBOLS = frozenset({
     'script_document',
     'html_document',
     'schema_document',
-    # Markdown-section chunks produced by MarkdownHeaderTextSplitter
+    # Markdown header-split sections — the dominant type after Phase A's
+    # always-split-by-header chunker (graph_builder._chunk_markdown_content
+    # emits section_type='markdown_section', which becomes symbol_type on
+    # the BasicSymbol node). Without this entry candidate_builder counts
+    # README sections as code and never classifies pure-doc clusters.
+    'markdown_section',
+    # Generic chunks produced by _chunk_generic_text fallback
     'text_chunk',
     # Legacy aliases — kept for compatibility if any parser still emits them
     'module_doc', 'file_doc',
 })
 
 # Numeric priority for seed ordering — aligned with graph_builder._get_type_priority().
+# All DOC_CLUSTER_SYMBOLS share priority 1 (lowest, tie-broken by name) so they
+# never out-rank code seeds in mixed clusters but remain valid fallbacks for
+# pure-doc clusters. Test contract:
+# tests/test_feature_flags.py::test_priority_covers_doc_symbols.
 SYMBOL_TYPE_PRIORITY = {
     'class': 10, 'interface': 10, 'trait': 10, 'protocol': 10,
     'enum': 9, 'struct': 9, 'record': 9,
@@ -268,6 +278,18 @@ SYMBOL_TYPE_PRIORITY = {
     'function': 7,
     'constant': 6, 'type_alias': 6, 'macro': 6,
     'method': 3, 'property': 2,
+    # Doc symbols — must cover every DOC_CLUSTER_SYMBOLS member.
+    'markdown_document': 1,
+    'markdown_section': 1,
+    'plaintext_document': 1,
+    'yaml_document': 1,
+    'json_document': 1,
+    'config_document': 1,
+    'infrastructure_document': 1,
+    'script_document': 1,
+    'html_document': 1,
+    'schema_document': 1,
+    'text_chunk': 1,
     'module_doc': 1, 'file_doc': 1,
 }
 

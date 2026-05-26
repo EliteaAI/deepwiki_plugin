@@ -2708,16 +2708,16 @@ class EnhancedUnifiedGraphBuilder:
         if doc_type == 'markdown':
             return self._chunk_markdown_content(content, file_path)
 
-        chunks = []
-
-        # Check if document is reasonably sized (13-17k characters)
+        # Non-markdown docs: single chunk under 17 k chars, otherwise
+        # fall back to generic line-split. (The earlier markdown-only
+        # threshold branch was unreachable after the always-split early
+        # return above and was removed.)
         content_size = len(content)
-        max_reasonable_size = 17000  # 17k characters
-        min_split_size = 13000       # 13k characters - only split if larger than this
+        max_reasonable_size = 17000
+        min_split_size = 13000
 
         logger.debug(f"Document size: {content_size} characters, file: {file_path}")
 
-        # If document is reasonably sized, keep it as a single chunk
         if content_size <= max_reasonable_size:
             logger.info(f"Document {file_path} ({content_size} chars) fits in context - keeping as single chunk")
             return [{
@@ -2728,33 +2728,24 @@ class EnhancedUnifiedGraphBuilder:
                 'headers': {},
                 'section_type': f'{doc_type}_document',
                 'section_id': 0,
-                'section_order': 0
+                'section_order': 0,
             }]
-        
-        # Only split if document is larger than minimum split threshold
+
         if content_size > min_split_size:
             logger.info(f"Document {file_path} ({content_size} chars) is large - attempting to split")
-            
-            # For markdown files, try to split by headers
-            if doc_type == 'markdown':
-                chunks = self._chunk_markdown_content(content, file_path)
-            else:
-                # For other text files, use simple line-based chunking
-                chunks = self._chunk_generic_text(content, file_path)
-        else:
-            logger.info(f"Document {file_path} ({content_size} chars) below split threshold - keeping as single chunk")
-            chunks = [{
-                'content': content,
-                'summary': Path(file_path).stem,
-                'start_line': 1,
-                'end_line': len(content.split('\n')),
-                'headers': {},
-                'section_type': f'{doc_type}_document',
-                'section_id': 0,
-                'section_order': 0
-            }]
-        
-        return chunks
+            return self._chunk_generic_text(content, file_path)
+
+        logger.info(f"Document {file_path} ({content_size} chars) below split threshold - keeping as single chunk")
+        return [{
+            'content': content,
+            'summary': Path(file_path).stem,
+            'start_line': 1,
+            'end_line': len(content.split('\n')),
+            'headers': {},
+            'section_type': f'{doc_type}_document',
+            'section_id': 0,
+            'section_order': 0,
+        }]
     
     def _chunk_markdown_content(self, content: str, file_path: str) -> List[Dict[str, Any]]:
         """

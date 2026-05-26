@@ -37,6 +37,7 @@ Usage::
     persist_weights_to_db(db, G)    # syncs all weights back to SQLite
 """
 
+import hashlib
 import logging
 import math
 import os
@@ -1304,7 +1305,14 @@ def _extract_proximity_edges(
             # root doc plus the Configuration API + Event class).
             seen_top: Set[str] = set()
             _ROOT_DOC_TOP_LEVEL_CAP = 20
-            doc_hash = hash(nid)
+            # Stable hash — Python's built-in hash() is randomised per
+            # process (PYTHONHASHSEED) and would pick a different anchor
+            # symbol every run, churning doc edges and clustering output.
+            # md5 is used purely as a deterministic 128-bit digest, not
+            # for any security property.
+            doc_hash = int.from_bytes(
+                hashlib.md5(nid.encode("utf-8")).digest()[:8], "big",
+            )
             for code_dir, code_nodes in dir_to_code.items():
                 top = code_dir.split("/", 1)[0]
                 if not top or top in seen_top:
