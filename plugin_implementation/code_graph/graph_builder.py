@@ -1672,7 +1672,30 @@ class EnhancedUnifiedGraphBuilder:
                 rel_annotations = {}
                 if hasattr(relationship, 'annotations') and relationship.annotations:
                     rel_annotations = relationship.annotations.copy()
-                
+
+                # Universal via= callsite injection.
+                #
+                # Every parser already records the precise event location
+                # in ``Relationship.source_range`` (the AST node of the
+                # CALL / CREATES / REFERENCES / IMPORTS event, not the
+                # whole containing method). That data was being dropped
+                # at this seam — preserved here as a ``via`` entry in
+                # the edge's annotations using the same vocabulary the
+                # contraction module emits (``via=src=name@L<line>``,
+                # ``via=tgt=name@L<line>``).
+                #
+                # Format: ``"<rel_type>@L<line>"`` — the rel_type prefix
+                # tells a reader/MCP consumer "what kind of usage" without
+                # needing to also fetch ``rel_type`` from the same row.
+                # ``setdefault`` preserves any pre-existing ``via`` list
+                # (e.g. one that contraction will append to later).
+                source_range = getattr(relationship, 'source_range', None)
+                if source_range is not None and getattr(source_range, 'start', None) is not None:
+                    callsite_line = source_range.start.line
+                    via_list = rel_annotations.setdefault('via', [])
+                    if isinstance(via_list, list):
+                        via_list.append(f"{rel_type}@L{callsite_line}")
+
                 # Collect edge for bulk addition
                 edge_data = {
                     'relationship_type': rel_type,
