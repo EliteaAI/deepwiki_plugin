@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from langchain_core.documents import Document
 
 from .code_graph.shared_expansion import expand_symbol_smart
+from .constants import WRITER_ALLOWED_EDGE_CLASSES
 from .feature_flags import get_feature_flags
 from .wiki_structure_planner.language_heuristics import (
     detect_dominant_language,
@@ -898,15 +899,22 @@ def _collect_expansion_neighbors(
     candidates: List[Tuple[str, Dict[str, Any], str, float]] = []
     conn = db.conn
 
+    # B7 — gate the writer's expansion pool to architecturally-real edge
+    # classes. Synthetic glue (lexical / directory / doc-proximity /
+    # bridge) reaches non-related nodes and would let the LLM cite a
+    # phantom relationship. Default-on; disable via the feature flag for
+    # comparison or A/B verification.
+    apply_edge_class_filter = get_feature_flags().writer_edge_class_filter
+
     for seed_id in seed_ids:
         # Outgoing edges
         out_edges = conn.execute(
-            "SELECT target_id, rel_type, weight FROM repo_edges WHERE source_id = ?",
+            "SELECT target_id, rel_type, weight, edge_class FROM repo_edges WHERE source_id = ?",
             (seed_id,),
         ).fetchall()
         # Incoming edges (structurally important: who inherits/implements me)
         in_edges = conn.execute(
-            "SELECT source_id, rel_type, weight FROM repo_edges WHERE target_id = ?",
+            "SELECT source_id, rel_type, weight, edge_class FROM repo_edges WHERE target_id = ?",
             (seed_id,),
         ).fetchall()
 
@@ -914,12 +922,18 @@ def _collect_expansion_neighbors(
         edge_info: List[Tuple[str, str, float]] = []  # (nid, rel_type, weight)
 
         for row in out_edges:
+            edge_class = row[3] or "structural"
+            if apply_edge_class_filter and edge_class not in WRITER_ALLOWED_EDGE_CLASSES:
+                continue
             tid = row[0]
             if tid not in seen_ids and tid not in neighbor_ids:
                 neighbor_ids.add(tid)
                 edge_info.append((tid, row[1] or "unknown", row[2] or 1.0))
 
         for row in in_edges:
+            edge_class = row[3] or "structural"
+            if apply_edge_class_filter and edge_class not in WRITER_ALLOWED_EDGE_CLASSES:
+                continue
             sid = row[0]
             if sid not in seen_ids and sid not in neighbor_ids:
                 neighbor_ids.add(sid)

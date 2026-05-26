@@ -309,6 +309,61 @@ CODE_SYMBOL_TYPES = frozenset({
 })
 
 # =============================================================================
+# Edge-Class Vocabularies (Phase B7 — writer evidence gating)
+# =============================================================================
+# All ``edge_class`` values that appear on ``repo_edges.edge_class``. The
+# default is ``"structural"`` (AST-derived). Synthetic classes are added
+# by topology enrichment (orphan resolution, doc proximity, bridge edges)
+# and exist primarily so Leiden can group otherwise-disconnected nodes
+# into reasonable communities — they do not represent real architectural
+# coupling and must NOT be cited by the writer.
+#
+# Producer audit (deepwiki_plugin, ``grep edge_class= --include='*.py'``):
+#
+# - ``structural``     — default, set by unified_db.py:221 and assumed
+#                        whenever a parser/linker omits ``edge_class``.
+# - ``cross_language`` — cross_language_linker.py:92, 141.
+# - ``test_link``      — test_linker.py:108, 143.
+# - ``directory``      — graph_topology.py:458 (directory-proximity glue).
+# - ``lexical``        — graph_topology.py:518, 631, 839, 896 (FTS / name match).
+# - ``semantic``       — graph_topology.py:576, 1000 (embedding cosine).
+# - ``doc``            — graph_topology.py:518, 1409, 1422 (markdown link / proximity).
+# - ``bridge``         — graph_topology.py:1596+; graph_clustering.py:1560+.
+#
+# Names referenced in the GAP_ANALYSIS_AND_ROADMAP but NOT yet emitted
+# in this repo: ``cross_repo`` (planned for Phase D's contract-node
+# algebra), ``member_uses`` (mentioned in cross_language_linker L3
+# docstring but never set as edge_class). Add them to the allow-set
+# below when their producers land — until then they would be silent
+# placeholders.
+
+#: Synthetic edges added by topology enrichment. Bypassed when computing
+#: structural in-degree (``apply_edge_weights``) and when assembling
+#: writer evidence (``_collect_expansion_neighbors``).
+SYNTHETIC_EDGE_CLASSES = frozenset({
+    "directory",
+    "lexical",
+    "semantic",
+    "doc",
+    "bridge",
+})
+
+#: Edge classes the writer is allowed to walk when expanding a page's
+#: content. Default-allow set per ``GAP_ANALYSIS_AND_ROADMAP.md`` §B7:
+#: only architecturally-real edges contribute to the prompt context, so
+#: the LLM cannot ground a citation on a lexical/directory/bridge edge.
+#:
+#: Sweep this set explicitly when adding a new producer ``edge_class``.
+#: ``_collect_expansion_neighbors`` blocks unknown classes by default,
+#: so a typo in the producer makes its edges invisible to the writer
+#: (loud silence, not silent inclusion).
+WRITER_ALLOWED_EDGE_CLASSES = frozenset({
+    "structural",      # AST-derived; the canonical default
+    "cross_language",  # cross-language API surface match
+    "test_link",       # test_node ↔ production_node
+})
+
+# =============================================================================
 # Display Categories for query_graph
 # =============================================================================
 # Mapping from symbol types to display buckets in the structure planner.
