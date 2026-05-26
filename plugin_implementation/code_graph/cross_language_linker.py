@@ -151,6 +151,10 @@ def _link_l1_via_contract_nodes(
         predecessors = [
             src for src in g.predecessors(contract_id)
             if g.nodes.get(src, {}).get("symbol_type") != "contract"
+            and any(
+                d.get("relationship_type") == "defines"
+                for d in g[src][contract_id].values()
+            )
         ]
         if len(predecessors) < 2:
             continue

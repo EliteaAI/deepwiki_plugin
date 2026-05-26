@@ -12,11 +12,7 @@ Pins:
 
 from __future__ import annotations
 
-import math
-from unittest.mock import patch
-
 import networkx as nx
-import pytest
 
 from plugin_implementation.code_graph.api_surface_extractor import (
     APISurface,
@@ -26,7 +22,6 @@ from plugin_implementation.code_graph.api_surface_extractor import (
 )
 from plugin_implementation.code_graph.cross_language_linker import (
     link_l1_api_surface,
-    _link_l1_via_contract_nodes,
 )
 from plugin_implementation.constants import (
     ARCHITECTURAL_SYMBOLS,

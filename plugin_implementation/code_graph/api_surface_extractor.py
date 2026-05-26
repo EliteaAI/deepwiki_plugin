@@ -429,7 +429,16 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
     if language == "go":
         for sm in _GO_GRPC_SERVER.finditer(text):
             svc = sm.group("svc")
-            for dm in _GO_GRPC_METHOD.finditer(text[sm.end():]):
+            block_start = sm.end()
+            depth, i = 1, block_start
+            while i < len(text) and depth > 0:
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                i += 1
+            iface_body = text[block_start:i]
+            for dm in _GO_GRPC_METHOD.finditer(iface_body):
                 rpc = dm.group("rpc")
                 out.append(APISurface(
                     kind="grpc",
@@ -451,7 +460,18 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
     if language == "java" and ("ImplBase" in text or "Grpc" in text):
         for sm in _JAVA_GRPC_IMPL.finditer(text):
             svc = sm.group("svc")
-            for dm in _JAVA_GRPC_METHOD.finditer(text):
+            block_start = text.find("{", sm.end())
+            if block_start == -1:
+                continue
+            depth, i = 1, block_start + 1
+            while i < len(text) and depth > 0:
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                i += 1
+            class_body = text[block_start:i]
+            for dm in _JAVA_GRPC_METHOD.finditer(class_body):
                 rpc = dm.group("rpc")
                 rpc_cap = rpc[0].upper() + rpc[1:]
                 out.append(APISurface(
@@ -460,7 +480,7 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
                     weight_hint=0.7,
                     metadata={"service": svc, "method": rpc_cap},
                 ))
-            for dm in _JAVA_GRPC_OBSERVER.finditer(text):
+            for dm in _JAVA_GRPC_OBSERVER.finditer(class_body):
                 rpc = dm.group("rpc")
                 rpc_cap = rpc[0].upper() + rpc[1:]
                 if not any(s["metadata"].get("method") == rpc_cap for s in out):
@@ -475,7 +495,18 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
     if language == "csharp" and "Base" in text:
         for sm in _CS_GRPC_IMPL.finditer(text):
             svc = sm.group("svc")
-            for dm in _CS_GRPC_METHOD.finditer(text):
+            block_start = text.find("{", sm.end())
+            if block_start == -1:
+                continue
+            depth, i = 1, block_start + 1
+            while i < len(text) and depth > 0:
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                i += 1
+            class_body = text[block_start:i]
+            for dm in _CS_GRPC_METHOD.finditer(class_body):
                 rpc = dm.group("rpc")
                 out.append(APISurface(
                     kind="grpc",
