@@ -107,14 +107,88 @@ def link_l0_exact(
 
 def link_l1_api_surface(
     g: nx.MultiDiGraph,
-    surfaces_by_node: Dict[str, List[APISurface]],
+    surfaces_by_node: Optional[Dict[str, List[APISurface]]] = None,
 ) -> List[Tuple[str, str, dict]]:
     """Pair nodes whose API surfaces match across languages.
+
+    Phase B5 rewrite: reads contract nodes (``symbol_type="contract"``)
+    from the graph instead of comparing JSON blobs. Each contract node
+    has inbound ``defines`` edges from implementation nodes; when two
+    implementors are in different languages, emit a ``cross_language_L1``
+    edge between them via the shared contract.
+
+    Falls back to the legacy ``surfaces_by_node`` dict path when no
+    contract nodes exist in the graph (pre-B5 compatibility).
 
     Specificity = ``1 / log(1 + N_matches_for_this_surface)`` so that
     ubiquitous surfaces (``GET /``) yield weak edges and rare ones
     (``POST /api/admin/billing/refund``) yield strong edges.
     """
+    contract_nodes = [
+        (nid, data)
+        for nid, data in g.nodes(data=True)
+        if data.get("symbol_type") == "contract"
+    ]
+
+    if contract_nodes:
+        return _link_l1_via_contract_nodes(g, contract_nodes)
+
+    if not surfaces_by_node:
+        return []
+    return _link_l1_legacy(g, surfaces_by_node)
+
+
+def _link_l1_via_contract_nodes(
+    g: nx.MultiDiGraph,
+    contract_nodes: List[Tuple[str, dict]],
+) -> List[Tuple[str, str, dict]]:
+    """L1 linking through materialized contract nodes."""
+    out: List[Tuple[str, str, dict]] = []
+
+    for contract_id, cdata in contract_nodes:
+        kind = cdata.get("signature", "")
+        surface = cdata.get("symbol_name", "")
+        predecessors = [
+            src for src in g.predecessors(contract_id)
+            if g.nodes.get(src, {}).get("symbol_type") != "contract"
+            and any(
+                d.get("relationship_type") == "defines"
+                for d in g[src][contract_id].values()
+            )
+        ]
+        if len(predecessors) < 2:
+            continue
+        specificity = 1.0 / math.log(1.0 + len(predecessors))
+
+        for i in range(len(predecessors)):
+            for j in range(i + 1, len(predecessors)):
+                src, tgt = predecessors[i], predecessors[j]
+                if _node_language(g, src) == _node_language(g, tgt):
+                    continue
+                weight = _clamp(0.7 * _locality_factor(g, src, tgt) * specificity)
+                attrs = {
+                    "relationship_type": "cross_language_L1",
+                    "edge_class": "cross_language",
+                    "weight": weight,
+                    "annotations": {
+                        "via": [f"contract={contract_id}"],
+                    },
+                    "provenance": {
+                        "source": "cross_language_linker",
+                        "level": "L1",
+                        "matcher": f"api_surface:{kind}",
+                        "surface": surface,
+                    },
+                }
+                out.append((src, tgt, attrs))
+    return out
+
+
+def _link_l1_legacy(
+    g: nx.MultiDiGraph,
+    surfaces_by_node: Dict[str, List[APISurface]],
+) -> List[Tuple[str, str, dict]]:
+    """Legacy L1 path: pair nodes by comparing in-memory surface dicts."""
     by_surface: Dict[Tuple[str, str], List[Tuple[str, APISurface]]] = defaultdict(list)
     for node_id, surfaces in surfaces_by_node.items():
         if not g.has_node(node_id):
@@ -127,7 +201,6 @@ def link_l1_api_surface(
         if len(nodes) < 2:
             continue
         specificity = 1.0 / math.log(1.0 + len(nodes))
-        # Cross every pair of *distinct-language* nodes once.
         for i in range(len(nodes)):
             for j in range(i + 1, len(nodes)):
                 src, src_s = nodes[i]

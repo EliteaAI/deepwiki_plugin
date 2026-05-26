@@ -599,6 +599,20 @@ class FilesystemRepositoryIndexer:
                                 len(surfaces_by_node),
                             )
 
+                        if surfaces_by_node and _flags.api_surface_extraction:
+                            from .code_graph.api_surface_extractor import (
+                                materialize_contract_nodes,
+                            )
+
+                            n_contracts = materialize_contract_nodes(
+                                self.relationship_graph,
+                                surfaces_by_node,
+                            )
+                            logger.info(
+                                "Phase 1c: materialized %d contract nodes",
+                                n_contracts,
+                            )
+
                         if _flags.cross_language_linking:
                             from .code_graph.cross_language_linker import (
                                 run_cross_language_linker,
