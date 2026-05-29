@@ -23,6 +23,7 @@ from unittest.mock import patch
 import pytest
 
 from plugin_implementation.cluster_expansion import (
+    _accumulate_via,
     _collect_expansion_neighbors,
     _extract_via_from_annotations,
     _node_to_document,
@@ -202,3 +203,64 @@ class TestViaPropagation:
         }
         doc = _node_to_document(node, is_initial=False, expanded_from="calls")
         assert "expansion_via" not in doc.metadata
+
+
+# ─── 3. Keep-all via accumulation (V2) ─────────────────────────────
+
+class TestAccumulateVia:
+    """``_accumulate_via`` must merge anchors across multiple edges to the
+    same neighbour, preserving order and dropping duplicates — the V2 fix
+    for the prior first-callsite-wins truncation."""
+
+    def test_merges_anchors_from_multiple_edges(self):
+        acc: dict = {}
+        _accumulate_via(acc, "n1", {"via": ["src=a@L1"]})
+        _accumulate_via(acc, "n1", {"via": ["tgt=b@L2"]})
+        assert acc["n1"] == ["src=a@L1", "tgt=b@L2"]
+
+    def test_dedups_repeated_anchors(self):
+        acc: dict = {}
+        _accumulate_via(acc, "n1", {"via": ["src=a@L1", "tgt=b@L2"]})
+        _accumulate_via(acc, "n1", {"via": ["src=a@L1"]})
+        assert acc["n1"] == ["src=a@L1", "tgt=b@L2"]
+
+    def test_empty_annotations_no_entry(self):
+        acc: dict = {}
+        _accumulate_via(acc, "n1", "")
+        _accumulate_via(acc, "n1", {})
+        assert "n1" not in acc
+
+    def test_collect_keeps_all_via_anchors(self):
+        """Two structural edges between the same seed and neighbour each
+        carrying distinct anchors — the surfaced ``_via_context`` must
+        contain both, not just the first."""
+        conn = _make_db()
+        _add_node(conn, "n_seed", "OrderService")
+        _add_node(conn, "n_contract", "POST /api/orders", sym_type="contract")
+        # The same class both defines and consumes the contract — two
+        # edges, two distinct line-precise anchors.
+        _add_edge(
+            conn, "n_seed", "n_contract", "defines",
+            annotations={"via": ["route=/api/orders"]},
+        )
+        _add_edge(
+            conn, "n_seed", "n_contract", "consumes",
+            annotations={"via": ["callsite=client.ts@L88"]},
+        )
+        conn.commit()
+        with patch(
+            "plugin_implementation.cluster_expansion.get_feature_flags",
+            return_value=FeatureFlags(),
+        ):
+            pool = _collect_expansion_neighbors(
+                _DBStub(conn),
+                seed_ids=["n_seed"],
+                seen_ids={"n_seed"},
+                macro_id=0,
+            )
+        entries = [t for t in pool if t[0] == "n_contract"]
+        assert entries, "contract neighbour missing from pool"
+        _nid, node, _rel = entries[0]
+        via = node.get("_via_context", "")
+        assert "route=/api/orders" in via
+        assert "callsite=client.ts@L88" in via

@@ -17,6 +17,7 @@ import networkx as nx
 from plugin_implementation.code_graph.api_surface_extractor import (
     APISurface,
     _match_grpc,
+    _match_rest_typescript,
     materialize_contract_nodes,
     _contract_node_id,
 )
@@ -394,3 +395,96 @@ class TestProtoNoCrossProduct:
         surfaces = _match_grpc(proto_text, "proto")
         assert len(surfaces) == 1
         assert surfaces[0]["surface"] == "grpc:Greeter/SayHello"
+
+
+# ─── 7. Phase B3: defines vs consumes role discrimination ───────────────
+
+class TestConsumesRole:
+    """A server route registration *defines* a contract; an outbound client
+    call *consumes* it. The shared contract node couples both directions."""
+
+    def test_client_surface_emits_consumes_edge(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "ts_client": [APISurface(
+                kind="rest_route", surface="POST /api/users",
+                weight_hint=0.7,
+                metadata={"method": "POST", "path": "/api/users", "role": "client"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        edges = [d for _, v, d in g.edges("ts_client", data=True) if v == nid]
+        assert len(edges) == 1
+        assert edges[0]["relationship_type"] == "consumes"
+        assert edges[0]["edge_class"] == "structural"
+
+    def test_server_role_emits_defines_edge(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="rest_route", surface="POST /api/users",
+                weight_hint=0.8,
+                metadata={"method": "POST", "path": "/api/users", "role": "server"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        edges = [d for _, v, d in g.edges("py_handler", data=True) if v == nid]
+        assert edges[0]["relationship_type"] == "defines"
+
+    def test_missing_role_defaults_to_defines(self):
+        """Non-REST surfaces (gRPC/GraphQL/FFI) carry no role and must keep
+        their historical ``defines`` semantics."""
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="grpc", surface="grpc:UserSvc/Get",
+                weight_hint=0.8, metadata={"service": "UserSvc", "method": "Get"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("grpc", "grpc:UserSvc/Get")
+        edges = [d for _, v, d in g.edges("py_handler", data=True) if v == nid]
+        assert edges[0]["relationship_type"] == "defines"
+
+    def test_ts_client_matcher_tags_role_client(self):
+        surfaces = _match_rest_typescript('axios.get("/api/users")')
+        assert surfaces, "expected the axios client call to be matched"
+        assert all(s["metadata"].get("role") == "client" for s in surfaces)
+
+    def test_ts_fetch_matcher_tags_role_client(self):
+        surfaces = _match_rest_typescript('fetch("/api/items", {method: "POST"})')
+        assert surfaces
+        assert all(s["metadata"].get("role") == "client" for s in surfaces)
+
+    def test_ts_decorator_matcher_tags_role_server(self):
+        surfaces = _match_rest_typescript('@Post("/api/users")\nfn() {}')
+        assert surfaces
+        assert all(s["metadata"].get("role") == "server" for s in surfaces)
+
+    def test_l1_pairs_consumer_with_definer(self):
+        """A Python handler defining ``POST /api/users`` and a TS client
+        consuming it must be cross-language coupled through the contract."""
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="rest_route", surface="POST /api/users",
+                weight_hint=0.8,
+                metadata={"method": "POST", "path": "/api/users", "role": "server"},
+            )],
+            "ts_client": [APISurface(
+                kind="rest_route", surface="POST /api/users",
+                weight_hint=0.7,
+                metadata={"method": "POST", "path": "/api/users", "role": "client"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        edges = link_l1_api_surface(g)
+        pairs = {frozenset((u, v)) for u, v, _ in edges}
+        assert frozenset(("py_handler", "ts_client")) in pairs
+        attrs = next(a for u, v, a in edges
+                     if {u, v} == {"py_handler", "ts_client"})
+        assert attrs["relationship_type"] == "cross_language_L1"
+        assert attrs["edge_class"] == "cross_language"
+

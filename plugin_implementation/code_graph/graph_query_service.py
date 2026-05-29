@@ -62,6 +62,69 @@ class RelationshipResult:
     source_type: str = ''
     target_type: str = ''
     hop_distance: int = 1
+    # Edge provenance (K2). ``edge_class`` is the taxonomy bucket
+    # (structural / cross_language / cross_repo / test_link / member_uses
+    # / lexical / semantic / doc / directory / bridge); ``confidence`` is
+    # the producer's self-reported strength ('high' / 'medium' / 'low' or
+    # ''); ``via`` carries any line-precise anchors the edge producer
+    # attached (e.g. ``["route=/api/users", "callsite=client.ts@L88"]``)
+    # so consumers can cite the exact source location.
+    edge_class: str = ''
+    confidence: str = ''
+    via: list = field(default_factory=list)
+
+
+def _edge_via(edata: dict) -> list:
+    """Extract ``annotations.via`` anchors from an edge attribute dict.
+
+    NetworkX edge producers store via anchors under
+    ``annotations['via']`` (a list of strings like ``"route=/api/users"``).
+    Some producers attach a top-level ``via`` directly. The storage
+    backend serialises ``annotations`` to a JSON string. Returns a list
+    of stripped strings; empty when no anchors are present.
+    """
+    annotations = _edge_annotations(edata)
+    via = annotations.get('via') if isinstance(annotations, dict) else None
+    if via is None:
+        via = edata.get('via')
+    if not via:
+        return []
+    if isinstance(via, str):
+        return [via.strip()] if via.strip() else []
+    if isinstance(via, (list, tuple)):
+        return [str(p).strip() for p in via if str(p).strip()]
+    return []
+
+
+def _edge_annotations(edata: dict) -> dict:
+    """Return the edge's ``annotations`` as a dict, decoding a JSON string
+    from the storage backend when needed. Returns ``{}`` on any failure."""
+    annotations = edata.get('annotations')
+    if isinstance(annotations, str) and annotations:
+        try:
+            import json as _json
+            annotations = _json.loads(annotations)
+        except (ValueError, TypeError):
+            return {}
+    return annotations if isinstance(annotations, dict) else {}
+
+
+def _edge_confidence(edata: dict) -> str:
+    """Resolve an edge's confidence label.
+
+    Prefers a top-level ``confidence`` attribute (NetworkX edges may carry
+    one directly); falls back to ``annotations['confidence']`` since the
+    deepwiki_plugin ``repo_edges`` schema has no dedicated column and
+    producers stash it in the annotations blob. Returns '' when absent.
+    """
+    top = edata.get('confidence')
+    if top:
+        return str(top)
+    annotations = _edge_annotations(edata)
+    return str(annotations.get('confidence', '') or '')
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +511,9 @@ class GraphQueryService:
                     source_type=(src_data.get('symbol_type') or '').lower(),
                     target_type=(tgt_data.get('symbol_type') or '').lower(),
                     hop_distance=hop,
+                    edge_class=str(edata.get('edge_class', '') or ''),
+                    confidence=_edge_confidence(edata),
+                    via=_edge_via(edata),
                 ))
 
                 if other_node not in visited:

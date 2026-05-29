@@ -9,7 +9,7 @@ from typing import Any, Iterable, Optional
 
 from ..constants import classify_symbol_layer
 from .graph_query_builder import EDGE_TYPE_ALIASES
-from .graph_query_service import RelationshipResult, SymbolResult
+from .graph_query_service import RelationshipResult, SymbolResult, _edge_via, _edge_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -126,20 +126,20 @@ class StorageQueryService:
             if depth >= max_depth:
                 continue
 
-            edges: list[tuple[str, str, str, str]] = []
+            edges: list[tuple[str, str, str, str, dict[str, Any]]] = []
             if direction in ('outgoing', 'out', 'both'):
                 for edge in self.storage.get_edges_from(current):
                     target = edge.get('target_id') or ''
                     if target:
-                        edges.append((current, target, self._edge_type(edge), target))
+                        edges.append((current, target, self._edge_type(edge), target, edge))
             if direction in ('incoming', 'in', 'both'):
                 for edge in self.storage.get_edges_to(current):
                     source = edge.get('source_id') or ''
                     if source:
-                        edges.append((source, current, self._edge_type(edge), source))
+                        edges.append((source, current, self._edge_type(edge), source, edge))
 
             node_rows = self._nodes_by_id({src for src, *_ in edges} | {tgt for _, tgt, *_ in edges})
-            for source, target, rel_type, other in edges:
+            for source, target, rel_type, other, edge in edges:
                 if len(results) >= max_results:
                     break
                 edge_key = (source, target, rel_type)
@@ -156,6 +156,9 @@ class StorageQueryService:
                     source_type=(source_row.get('symbol_type') or '').lower(),
                     target_type=(target_row.get('symbol_type') or '').lower(),
                     hop_distance=depth + 1,
+                    edge_class=str(edge.get('edge_class', '') or ''),
+                    confidence=_edge_confidence(edge),
+                    via=_edge_via(edge),
                 ))
 
                 if other not in visited:

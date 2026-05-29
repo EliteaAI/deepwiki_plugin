@@ -919,6 +919,29 @@ def _extract_via_from_annotations(raw: Any) -> str:
     return "via " + "; ".join(parts) if parts else ""
 
 
+def _accumulate_via(
+    via_by_neighbor: Dict[str, List[str]], neighbor_id: str, raw: Any
+) -> None:
+    """Merge an edge's ``annotations.via`` anchors into the neighbour's
+    running list, preserving order and dropping duplicates.
+
+    Multiple edges can connect the seed set to the same neighbour (a
+    class that both ``defines`` and ``consumes`` the same contract, or
+    two distinct callsites into one symbol). Each edge's anchors are
+    line-precise context the writer can cite, so we keep them all rather
+    than letting the first edge win.
+    """
+    via_str = _extract_via_from_annotations(raw)
+    if not via_str:
+        return
+    inner = via_str[len("via "):] if via_str.startswith("via ") else via_str
+    bucket = via_by_neighbor.setdefault(neighbor_id, [])
+    for part in inner.split("; "):
+        part = part.strip()
+        if part and part not in bucket:
+            bucket.append(part)
+
+
 def _collect_expansion_neighbors(
     db,
     seed_ids: List[str],
@@ -948,8 +971,13 @@ def _collect_expansion_neighbors(
     # Per-neighbour via= context, populated from edge annotations when
     # contraction (or any edge producer) attached one. Stitched onto the
     # node dict below so ``_node_to_document`` surfaces it without a
-    # signature change.
-    via_by_neighbor: Dict[str, str] = {}
+    # signature change. We accumulate *all* distinct anchors across every
+    # edge between the seed set and the neighbour (order-preserving,
+    # deduplicated) rather than keeping only the first — multiple edges
+    # (e.g. a class that both defines and consumes the same contract, or
+    # two callsites into the same symbol) each contribute line-precise
+    # context the writer can cite.
+    via_by_neighbor: Dict[str, List[str]] = {}
 
     for seed_id in seed_ids:
         # Outgoing edges
@@ -971,24 +999,27 @@ def _collect_expansion_neighbors(
             if apply_edge_class_filter and edge_class not in WRITER_ALLOWED_EDGE_CLASSES:
                 continue
             tid = row[0]
-            if tid not in seen_ids and tid not in neighbor_ids:
+            if tid in seen_ids:
+                continue
+            # Accumulate via= for every passing edge — a neighbour reached
+            # by multiple edges (e.g. defines + consumes on one contract)
+            # contributes each edge's anchors, not just the first.
+            _accumulate_via(via_by_neighbor, tid, row[4])
+            if tid not in neighbor_ids:
                 neighbor_ids.add(tid)
                 edge_info.append((tid, row[1] or "unknown", row[2] or 1.0))
-                via_str = _extract_via_from_annotations(row[4])
-                if via_str:
-                    via_by_neighbor.setdefault(tid, via_str)
 
         for row in in_edges:
             edge_class = row[3] or "structural"
             if apply_edge_class_filter and edge_class not in WRITER_ALLOWED_EDGE_CLASSES:
                 continue
             sid = row[0]
-            if sid not in seen_ids and sid not in neighbor_ids:
+            if sid in seen_ids:
+                continue
+            _accumulate_via(via_by_neighbor, sid, row[4])
+            if sid not in neighbor_ids:
                 neighbor_ids.add(sid)
                 edge_info.append((sid, row[1] or "unknown", row[2] or 1.0))
-                via_str = _extract_via_from_annotations(row[4])
-                if via_str:
-                    via_by_neighbor.setdefault(sid, via_str)
 
         if not neighbor_ids:
             continue
@@ -1025,12 +1056,13 @@ def _collect_expansion_neighbors(
                 continue
             # Stitch via= context (when present) onto the node dict so
             # ``_node_to_document`` can surface it as ``expansion_via``
-            # without a tuple-shape change. ``setdefault`` keeps the
-            # first-seen edge's via — multiple edges between the same
-            # two nodes is rare, and when it happens any one anchor is
-            # enough to make the writer claim line-precise.
-            if nid in via_by_neighbor:
-                node.setdefault("_via_context", via_by_neighbor[nid])
+            # without a tuple-shape change. We join *all* accumulated
+            # anchors for this neighbour so the writer sees every
+            # line-precise callsite, not just the first edge's.
+            if nid in via_by_neighbor and via_by_neighbor[nid]:
+                node.setdefault(
+                    "_via_context", "via " + "; ".join(via_by_neighbor[nid])
+                )
             candidates.append((nid, node, rel_type, weight))
 
     # Deduplicate (first occurrence wins) and sort by weight descending

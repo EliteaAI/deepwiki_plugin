@@ -148,15 +148,17 @@ class FeatureFlags:
     # ── Weight calibration (A.12 pilot) ────────────────────────────────
     #: Selects how synthetic-edge weights are floored in ``apply_edge_weights``.
     #:
-    #: - ``"legacy"`` (default): uniform ``SYNTHETIC_WEIGHT_FLOOR = 0.5`` for
-    #:   every synthetic edge class — current production behaviour.
-    #: - ``"calibrated"``: per-class floor table scaled by ``raw_similarity``
-    #:   when available. Higher floor for embedding-derived edges, lower for
-    #:   pure heuristics. Documented in
-    #:   ``_graph_audit/GAP_ANALYSIS_AND_ROADMAP.md`` §A.12.
+    #: - ``"legacy"``: uniform ``SYNTHETIC_WEIGHT_FLOOR = 0.5`` for
+    #:   every synthetic edge class — the pre-Phase-B behaviour.
+    #: - ``"calibrated"`` (default): per-class floor table scaled by
+    #:   ``raw_similarity`` when available. Higher floor for embedding-derived
+    #:   edges, lower for pure heuristics. Documented in
+    #:   ``_graph_audit/GAP_ANALYSIS_AND_ROADMAP.md`` §A.12. Promoted to the
+    #:   default as the Phase B merge gate — the contract-node algebra and
+    #:   downstream phases assume calibrated weights.
     #:
     #: Env: ``DEEPWIKI_WEIGHT_CALIBRATION_PROFILE=legacy|calibrated``.
-    weight_calibration_profile: str = "legacy"
+    weight_calibration_profile: str = "calibrated"
 
 
 def get_feature_flags() -> FeatureFlags:
@@ -170,7 +172,7 @@ def get_feature_flags() -> FeatureFlags:
         ),
         weight_calibration_profile=_env_choice(
             "DEEPWIKI_WEIGHT_CALIBRATION_PROFILE",
-            default="legacy",
+            default="calibrated",
             allowed=("legacy", "calibrated"),
         ),
     )

@@ -342,10 +342,10 @@ def find_orphans(G: nx.MultiDiGraph, *, strict: bool = False) -> List[str]:
 
     Two profiles, controlled by ``feature_flags.weight_calibration_profile``:
 
-    * **legacy** (default) — nodes with both ``in_degree == 0`` and
+    * **legacy** — nodes with both ``in_degree == 0`` and
       ``out_degree == 0``. Truly disconnected: documentation files,
       standalone scripts, cross-language stubs, etc.
-    * **calibrated** (A.11) — nodes with ``in_degree == 0`` regardless
+    * **calibrated** (A.11, default) — nodes with ``in_degree == 0`` regardless
       of ``out_degree``. Catches top-level scripts (``main.go``, app
       entry points) and isolated event handlers that *import*
       dependencies but are never *imported by* anything else. Today
