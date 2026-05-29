@@ -124,6 +124,34 @@ def _edge_confidence(edata: dict) -> str:
     return str(annotations.get('confidence', '') or '')
 
 
+def _merge_edge_provenance(existing: RelationshipResult, edata: dict) -> None:
+    """Fold a parallel edge's provenance into an existing ``RelationshipResult``.
+
+    The graph (both NetworkX MultiDiGraph and the SQLite backend) may hold
+    multiple edges sharing the same ``(source, target, relationship_type)``
+    key but carrying distinct ``via`` anchors / ``confidence`` / ``edge_class``.
+    Deduplicating by that key alone would silently drop the extra provenance,
+    so this merges it in place:
+
+    - ``via``: union, order-preserving, de-duped (existing anchors win order).
+    - ``confidence`` / ``edge_class``: fill only when the existing value is
+      empty (first non-empty wins, matching traversal order).
+    """
+    extra_via = _edge_via(edata)
+    if extra_via:
+        seen = set(existing.via)
+        for anchor in extra_via:
+            if anchor not in seen:
+                existing.via.append(anchor)
+                seen.add(anchor)
+    if not existing.confidence:
+        conf = _edge_confidence(edata)
+        if conf:
+            existing.confidence = conf
+    if not existing.edge_class:
+        ec = str(edata.get('edge_class', '') or '')
+        if ec:
+            existing.edge_class = ec
 
 
 
@@ -465,7 +493,7 @@ class GraphQueryService:
 
         results: List[RelationshipResult] = []
         visited: Set[str] = {node_id}
-        seen_edges: Set[Tuple[str, str, str]] = set()  # (src, tgt, rel_type)
+        seen_edges: dict[Tuple[str, str, str], RelationshipResult] = {}  # (src, tgt, rel_type) -> result
         frontier: List[Tuple[str, int]] = [(node_id, 0)]
 
         while frontier and len(results) < max_results:
@@ -493,18 +521,20 @@ class GraphQueryService:
 
                 rel_type = str(edata.get('relationship_type', '') or edata.get('type', ''))
                 edge_key = (src, tgt, rel_type)
-                if edge_key in seen_edges:
-                    # Still advance the frontier through this node
+                existing = seen_edges.get(edge_key)
+                if existing is not None:
+                    # Parallel edge: fold its provenance into the first result
+                    # rather than dropping it, then advance the frontier.
+                    _merge_edge_provenance(existing, edata)
                     if other_node not in visited:
                         visited.add(other_node)
                         frontier.append((other_node, depth + 1))
                     continue
-                seen_edges.add(edge_key)
 
                 src_data = self.graph.nodes.get(src, {})
                 tgt_data = self.graph.nodes.get(tgt, {})
 
-                results.append(RelationshipResult(
+                result = RelationshipResult(
                     source_name=src_data.get('symbol_name', '') or src_data.get('name', src),
                     target_name=tgt_data.get('symbol_name', '') or tgt_data.get('name', tgt),
                     relationship_type=rel_type,
@@ -514,7 +544,9 @@ class GraphQueryService:
                     edge_class=str(edata.get('edge_class', '') or ''),
                     confidence=_edge_confidence(edata),
                     via=_edge_via(edata),
-                ))
+                )
+                results.append(result)
+                seen_edges[edge_key] = result
 
                 if other_node not in visited:
                     visited.add(other_node)

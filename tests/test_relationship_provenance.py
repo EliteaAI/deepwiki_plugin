@@ -141,3 +141,112 @@ def test_storage_query_service_surfaces_provenance(provenance_db):
     assert r.edge_class == "structural"
     assert r.confidence == "high"
     assert r.via == ["route=/api/orders"]
+
+
+# ─── 5. Parallel-edge provenance merge (PR #18 review) ──────────────────
+# The graph may hold multiple edges with the same (source, target,
+# rel_type) but distinct via/confidence/edge_class. Dedup by that key
+# alone would drop the extra provenance; both backends must MERGE it.
+
+def _nx_graph_with_parallel_edges() -> nx.MultiDiGraph:
+    g = nx.MultiDiGraph()
+    g.add_node("client", symbol_name="ApiClient", symbol_type="class")
+    g.add_node("ct", symbol_name="POST /api/orders", symbol_type="contract")
+    g._node_index = {}
+    # First parallel edge: has via + confidence, no edge_class.
+    g.add_edge(
+        "client", "ct",
+        relationship_type="consumes",
+        annotations={"via": ["callsite=client.ts@L88"], "confidence": "high"},
+    )
+    # Second parallel edge: same key, different via + edge_class, no confidence.
+    g.add_edge(
+        "client", "ct",
+        relationship_type="consumes",
+        edge_class="cross_language",
+        annotations={"via": ["route=/api/orders"]},
+    )
+    # Third: duplicate via anchor (must be de-duped).
+    g.add_edge(
+        "client", "ct",
+        relationship_type="consumes",
+        annotations={"via": ["callsite=client.ts@L88"]},
+    )
+    return g
+
+
+def test_nx_parallel_edges_merge_provenance():
+    g = _nx_graph_with_parallel_edges()
+    svc = GraphQueryService(g)
+    rels = svc.get_relationships("client", direction="outgoing", max_depth=1)
+    consumes = [r for r in rels if r.relationship_type == "consumes"]
+    # Parallel edges collapse into a single result with MERGED provenance.
+    assert len(consumes) == 1
+    r = consumes[0]
+    # via: union, order-preserving (first edge's anchor first), de-duped.
+    assert r.via == ["callsite=client.ts@L88", "route=/api/orders"]
+    # confidence: first non-empty wins.
+    assert r.confidence == "high"
+    # edge_class: filled from the parallel edge that carried it.
+    assert r.edge_class == "cross_language"
+
+
+def test_storage_parallel_edges_merge_provenance(tmp_path):
+    db = UnifiedWikiDB(str(tmp_path / "parallel.wiki.db"), embedding_dim=4)
+    db._upsert_nodes_batch([
+        {
+            "node_id": "client", "rel_path": "src/client.ts", "file_name": "client.ts",
+            "language": "typescript", "symbol_name": "ApiClient",
+            "symbol_type": "class", "source_text": "class ApiClient {}",
+            "is_architectural": 1, "is_doc": 0,
+        },
+        {
+            "node_id": "ct", "rel_path": "src/svc.py", "file_name": "svc.py",
+            "language": "python", "symbol_name": "POST /api/orders",
+            "symbol_type": "contract", "source_text": "",
+            "signature": "rest_route", "is_architectural": 1, "is_doc": 0,
+        },
+    ])
+    # Two parallel CONSUMES edges with distinct provenance.
+    db.upsert_edge(
+        "client", "ct", "consumes",
+        annotations='{"via": ["callsite=client.ts@L88"], "confidence": "high"}',
+    )
+    db.upsert_edge(
+        "client", "ct", "consumes",
+        edge_class="cross_language",
+        annotations='{"via": ["route=/api/orders"]}',
+    )
+    db.conn.commit()
+
+    svc = StorageQueryService(db)
+    rels = svc.get_relationships("client", direction="outgoing", max_depth=1)
+    consumes = [r for r in rels if r.relationship_type == "consumes"]
+    assert len(consumes) == 1
+    r = consumes[0]
+    assert r.via == ["callsite=client.ts@L88", "route=/api/orders"]
+    assert r.confidence == "high"
+    db.close()
+
+
+def test_merge_edge_provenance_helper():
+    from plugin_implementation.code_graph.graph_query_service import _merge_edge_provenance
+    existing = RelationshipResult(
+        source_name="a", target_name="b", relationship_type="consumes",
+        edge_class="", confidence="", via=["x"],
+    )
+    _merge_edge_provenance(existing, {
+        "edge_class": "cross_language",
+        "annotations": {"via": ["x", "y"], "confidence": "low"},
+    })
+    assert existing.via == ["x", "y"]          # de-duped union
+    assert existing.confidence == "low"        # filled (was empty)
+    assert existing.edge_class == "cross_language"
+    # A second merge must not override already-set scalars.
+    _merge_edge_provenance(existing, {
+        "edge_class": "structural",
+        "annotations": {"confidence": "high"},
+    })
+    assert existing.confidence == "low"
+    assert existing.edge_class == "cross_language"
+

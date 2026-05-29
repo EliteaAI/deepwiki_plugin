@@ -9,7 +9,7 @@ from typing import Any, Iterable, Optional
 
 from ..constants import classify_symbol_layer
 from .graph_query_builder import EDGE_TYPE_ALIASES
-from .graph_query_service import RelationshipResult, SymbolResult, _edge_via, _edge_confidence
+from .graph_query_service import RelationshipResult, SymbolResult, _edge_via, _edge_confidence, _merge_edge_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class StorageQueryService:
 
         results: list[RelationshipResult] = []
         visited = {node_id}
-        seen_edges: set[tuple[str, str, str]] = set()
+        seen_edges: dict[tuple[str, str, str], RelationshipResult] = {}
         frontier: deque[tuple[str, int]] = deque([(node_id, 0)])
 
         while frontier and len(results) < max_results:
@@ -144,12 +144,14 @@ class StorageQueryService:
                     break
                 edge_key = (source, target, rel_type)
                 if edge_key in seen_edges:
+                    # Parallel edge: merge its provenance into the first result
+                    # so distinct via/confidence are not silently dropped.
+                    _merge_edge_provenance(seen_edges[edge_key], edge)
                     continue
-                seen_edges.add(edge_key)
 
                 source_row = node_rows.get(source, {})
                 target_row = node_rows.get(target, {})
-                results.append(RelationshipResult(
+                result = RelationshipResult(
                     source_name=source_row.get('symbol_name') or source,
                     target_name=target_row.get('symbol_name') or target,
                     relationship_type=rel_type,
@@ -159,7 +161,9 @@ class StorageQueryService:
                     edge_class=str(edge.get('edge_class', '') or ''),
                     confidence=_edge_confidence(edge),
                     via=_edge_via(edge),
-                ))
+                )
+                results.append(result)
+                seen_edges[edge_key] = result
 
                 if other not in visited:
                     visited.add(other)
