@@ -9,7 +9,7 @@ from typing import Any, Iterable, Optional
 
 from ..constants import classify_symbol_layer
 from .graph_query_builder import EDGE_TYPE_ALIASES
-from .graph_query_service import RelationshipResult, SymbolResult
+from .graph_query_service import RelationshipResult, SymbolResult, _edge_via, _edge_confidence, _merge_edge_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class StorageQueryService:
 
         results: list[RelationshipResult] = []
         visited = {node_id}
-        seen_edges: set[tuple[str, str, str]] = set()
+        seen_edges: dict[tuple[str, str, str], RelationshipResult] = {}
         frontier: deque[tuple[str, int]] = deque([(node_id, 0)])
 
         while frontier and len(results) < max_results:
@@ -126,37 +126,44 @@ class StorageQueryService:
             if depth >= max_depth:
                 continue
 
-            edges: list[tuple[str, str, str, str]] = []
+            edges: list[tuple[str, str, str, str, dict[str, Any]]] = []
             if direction in ('outgoing', 'out', 'both'):
                 for edge in self.storage.get_edges_from(current):
                     target = edge.get('target_id') or ''
                     if target:
-                        edges.append((current, target, self._edge_type(edge), target))
+                        edges.append((current, target, self._edge_type(edge), target, edge))
             if direction in ('incoming', 'in', 'both'):
                 for edge in self.storage.get_edges_to(current):
                     source = edge.get('source_id') or ''
                     if source:
-                        edges.append((source, current, self._edge_type(edge), source))
+                        edges.append((source, current, self._edge_type(edge), source, edge))
 
             node_rows = self._nodes_by_id({src for src, *_ in edges} | {tgt for _, tgt, *_ in edges})
-            for source, target, rel_type, other in edges:
+            for source, target, rel_type, other, edge in edges:
                 if len(results) >= max_results:
                     break
                 edge_key = (source, target, rel_type)
                 if edge_key in seen_edges:
+                    # Parallel edge: merge its provenance into the first result
+                    # so distinct via/confidence are not silently dropped.
+                    _merge_edge_provenance(seen_edges[edge_key], edge)
                     continue
-                seen_edges.add(edge_key)
 
                 source_row = node_rows.get(source, {})
                 target_row = node_rows.get(target, {})
-                results.append(RelationshipResult(
+                result = RelationshipResult(
                     source_name=source_row.get('symbol_name') or source,
                     target_name=target_row.get('symbol_name') or target,
                     relationship_type=rel_type,
                     source_type=(source_row.get('symbol_type') or '').lower(),
                     target_type=(target_row.get('symbol_type') or '').lower(),
                     hop_distance=depth + 1,
-                ))
+                    edge_class=str(edge.get('edge_class', '') or ''),
+                    confidence=_edge_confidence(edge),
+                    via=_edge_via(edge),
+                )
+                results.append(result)
+                seen_edges[edge_key] = result
 
                 if other not in visited:
                     visited.add(other)

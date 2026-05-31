@@ -95,7 +95,8 @@ class TestFindOrphans:
             ("b", "src/b.cpp"),
             ("c", "src/c.cpp"),
         ], edges=[("a", "b")])
-        orphans = find_orphans(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            orphans = find_orphans(G)
         assert orphans == ["c"]
 
     def test_no_orphans(self):
@@ -103,7 +104,8 @@ class TestFindOrphans:
             ("a", "src/a.cpp"),
             ("b", "src/b.cpp"),
         ], edges=[("a", "b")])
-        orphans = find_orphans(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            orphans = find_orphans(G)
         assert orphans == []
 
     def test_all_orphans(self):
@@ -140,7 +142,8 @@ class TestDirectoryOrphanResolution:
 
         assert edges_added == 1
         assert G.has_edge("orphan", "anchor1") or G.has_edge("orphan", "anchor2")
-        assert find_orphans(G) == []  # no longer orphaned
+        with _patched_flags(weight_calibration_profile="legacy"):
+            assert find_orphans(G) == []  # no longer orphaned
 
     def test_parent_directory_fallback(self):
         """Orphan climbs to parent directory if no anchor in same dir."""
@@ -351,6 +354,7 @@ class TestResolveOrphansIntegration:
             orphan_cascade_v2=False,
             orphan_lexical_tiered=False,
             fts_stopword_gate=False,
+            weight_calibration_profile="legacy",
         ):
             stats = resolve_orphans(db, G, embedding_fn=None)
 
@@ -410,6 +414,7 @@ class TestResolveOrphansIntegration:
             orphan_cascade_v2=False,
             orphan_lexical_tiered=False,
             fts_stopword_gate=False,
+            weight_calibration_profile="legacy",
         ):
             stats = resolve_orphans(db, G, embedding_fn=None)
 
@@ -513,7 +518,8 @@ class TestSyntheticEdgeWeights:
         G.add_edge("orphan", "anchor", relationship_type="directory_link",
                    edge_class="directory", created_by="dir_proximity_fallback")
 
-        apply_edge_weights(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            apply_edge_weights(G)
 
         dir_edge = G.edges["orphan", "anchor", 0]
         assert dir_edge["weight"] >= SYNTHETIC_WEIGHT_FLOOR, (
@@ -536,7 +542,8 @@ class TestSyntheticEdgeWeights:
         G.add_edge("a", "b", relationship_type="lexical_link",
                    edge_class="lexical", created_by="fts5_lexical")
 
-        apply_edge_weights(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            apply_edge_weights(G)
 
         lex_edge = G.edges["a", "b", 0]
         assert lex_edge["weight"] >= SYNTHETIC_WEIGHT_FLOOR
@@ -556,7 +563,8 @@ class TestSyntheticEdgeWeights:
         G.add_edge("doc", "code", relationship_type="hyperlink",
                    edge_class="doc", created_by="md_hyperlink")
 
-        apply_edge_weights(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            apply_edge_weights(G)
 
         doc_edge = G.edges["doc", "code", 0]
         assert doc_edge["weight"] >= SYNTHETIC_WEIGHT_FLOOR
@@ -620,7 +628,8 @@ class TestSyntheticEdgeWeights:
             G.add_edge(n, "anchor", edge_class="directory",
                        relationship_type="directory_link")
 
-        apply_edge_weights(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            apply_edge_weights(G)
 
         # Structural edges: w = 1/log(20+2) ≈ 0.3234
         expected_structural = 1.0 / math.log(20 + 2)

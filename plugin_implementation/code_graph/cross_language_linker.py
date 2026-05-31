@@ -148,11 +148,16 @@ def _link_l1_via_contract_nodes(
     for contract_id, cdata in contract_nodes:
         kind = cdata.get("signature", "")
         surface = cdata.get("symbol_name", "")
+        # Pair every code node coupled to this contract — whether it
+        # ``defines`` it (server/handler) or ``consumes`` it (outbound
+        # client call). A TS client that consumes ``POST /users`` is just
+        # as coupled to the Python handler that defines it as two handlers
+        # of the same surface are to each other.
         predecessors = [
             src for src in g.predecessors(contract_id)
             if g.nodes.get(src, {}).get("symbol_type") != "contract"
             and any(
-                d.get("relationship_type") == "defines"
+                d.get("relationship_type") in ("defines", "consumes")
                 for d in g[src][contract_id].values()
             )
         ]

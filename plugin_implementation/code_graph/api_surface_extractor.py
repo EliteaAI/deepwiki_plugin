@@ -155,12 +155,14 @@ def _normalize_path(path: str) -> str:
     return p
 
 
-def _surface_rest(method: str, path: str, weight_hint: float = 0.7) -> APISurface:
+def _surface_rest(
+    method: str, path: str, weight_hint: float = 0.7, *, role: str = "server"
+) -> APISurface:
     return APISurface(
         kind="rest",
         surface=f"{method.upper()} {_normalize_path(path)}",
         weight_hint=weight_hint,
-        metadata={"method": method.upper(), "path": _normalize_path(path)},
+        metadata={"method": method.upper(), "path": _normalize_path(path), "role": role},
     )
 
 
@@ -181,7 +183,12 @@ def _strip_common_api_prefix(path: str) -> str:
 
 
 def _emit_rest_surfaces(
-    method: str, path: str, weight_hint: float = 0.7, *, router_prefix: str = ""
+    method: str,
+    path: str,
+    weight_hint: float = 0.7,
+    *,
+    router_prefix: str = "",
+    role: str = "server",
 ) -> List[APISurface]:
     """Yield 1-2 surfaces for a single decorator/call site.
 
@@ -191,6 +198,12 @@ def _emit_rest_surfaces(
     additionally emits a ``prefix_stripped`` alternate so that
     cross-language pairing works against routes declared without the
     gateway prefix.
+
+    ``role`` records whether the matched site *defines* the surface
+    (``"server"`` — a route registration / handler) or *consumes* it
+    (``"client"`` — an outbound HTTP call). Downstream
+    :func:`materialize_contract_nodes` turns this into a ``defines`` vs
+    ``consumes`` edge against the shared contract node.
     """
     full_path = path
     if router_prefix:
@@ -199,7 +212,9 @@ def _emit_rest_surfaces(
         # Avoid double-prefixing if the route already starts with it.
         if not rest.startswith(prefix + "/") and rest != prefix:
             full_path = (prefix.rstrip("/") + ("" if rest == "/" else rest)) or "/"
-    surfaces: List[APISurface] = [_surface_rest(method, full_path, weight_hint)]
+    surfaces: List[APISurface] = [
+        _surface_rest(method, full_path, weight_hint, role=role)
+    ]
     stripped = _strip_common_api_prefix(full_path)
     if stripped and stripped != _normalize_path(full_path):
         surfaces.append(APISurface(
@@ -210,6 +225,7 @@ def _emit_rest_surfaces(
                 "method": method.upper(),
                 "path": stripped,
                 "prefix_stripped": True,
+                "role": role,
             },
         ))
     return surfaces
@@ -264,24 +280,25 @@ def _match_rest_typescript(text: str) -> List[APISurface]:
         path_match = _QUOTED_PATH.search(args)
         if path_match:
             out.extend(_emit_rest_surfaces(method, path_match.group(1)))
-    # OpenAPI-generated / generic HTTP clients (axios.get, client.post, ...)
+    # OpenAPI-generated / generic HTTP clients (axios.get, client.post, ...).
+    # These are *outbound* calls — the code consuming a remote contract.
     for m in _TS_HTTP_CLIENT_CALL.finditer(text):
-        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path")))
+        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path"), role="client"))
     # Bare fetch("/path", {method: "POST"}) — default GET when no method opt.
     for m in _TS_FETCH_CALL.finditer(text):
         path = m.group("path")
         rest = m.group("rest") or ""
         method_match = _TS_FETCH_METHOD_OPT.search(rest)
         method = method_match.group("method") if method_match else "GET"
-        out.extend(_emit_rest_surfaces(method, path))
+        out.extend(_emit_rest_surfaces(method, path, role="client"))
     # OpenAPI-generated request-options style:
     #   __request(OpenAPI, { method: 'POST', url: '/api/v1/items/' })
     # Both field orders observed in the wild (hey-api emits method-first,
     # openapi-typescript-codegen sometimes emits url-first).
     for m in _TS_REQUEST_OPTIONS.finditer(text):
-        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path")))
+        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path"), role="client"))
     for m in _TS_REQUEST_OPTIONS_REVERSED.finditer(text):
-        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path")))
+        out.extend(_emit_rest_surfaces(m.group("method"), m.group("path"), role="client"))
     return out
 
 
@@ -1470,8 +1487,14 @@ def materialize_contract_nodes(
     """Create first-class contract nodes from extracted API surfaces.
 
     For each unique (kind, surface) in *surfaces_by_node*, adds a
-    ``symbol_type="contract"`` node to *g* (if not already present) and a
-    ``DEFINES`` edge from the owning symbol to the contract node.
+    ``symbol_type="contract"`` node to *g* (if not already present) and an
+    edge from the owning symbol to the contract node. The edge is
+    ``relationship_type="defines"`` when the surface was matched at a
+    *server* site (a route registration / handler) and
+    ``relationship_type="consumes"`` when matched at a *client* site (an
+    outbound HTTP call). The ``role`` discriminator lives in the surface
+    ``metadata`` (defaulting to ``"server"`` so non-REST surfaces \u2014 gRPC,
+    GraphQL, FFI \u2014 keep their historical ``defines`` semantics).
 
     The ``signature`` attribute on each contract node stores the
     ``contract_kind`` discriminator (``"rest_route"``, ``"grpc_service"``,
@@ -1526,10 +1549,16 @@ def materialize_contract_nodes(
             if via_entries:
                 annotations["via"] = via_entries
 
+            # Server sites *define* the contract; client sites *consume* it.
+            # Non-REST surfaces (gRPC/GraphQL/FFI) carry no role and default
+            # to "server" → defines, preserving historical behaviour.
+            role = (meta.get("role") or "server").lower()
+            rel_type = "consumes" if role == "client" else "defines"
+
             g.add_edge(
                 owner_id,
                 nid,
-                relationship_type="defines",
+                relationship_type=rel_type,
                 edge_class="structural",
                 weight=1.0,
                 annotations=annotations,

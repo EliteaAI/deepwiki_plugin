@@ -289,24 +289,28 @@ class TestFindOrphans(unittest.TestCase):
 
     def test_no_orphans(self):
         G = _make_graph(("A", "B"), ("B", "C"))
-        self.assertEqual(find_orphans(G), [])
+        with _patched_flags(weight_calibration_profile="legacy"):
+            self.assertEqual(find_orphans(G), [])
 
     def test_source_node_not_orphan(self):
         """Node with out_degree > 0 is NOT an orphan (it has outgoing)."""
         G = _make_graph(("A", "B"))
-        orphans = find_orphans(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            orphans = find_orphans(G)
         # A has out_degree=1, B has in_degree=1 — neither is orphan
         self.assertNotIn("A", orphans)
         self.assertNotIn("B", orphans)
 
     def test_isolated_node_is_orphan(self):
         G = _make_graph(("A", "B"), orphans=["Z"])
-        orphans = find_orphans(G)
+        with _patched_flags(weight_calibration_profile="legacy"):
+            orphans = find_orphans(G)
         self.assertEqual(orphans, ["Z"])
 
     def test_multiple_orphans(self):
         G = _make_graph(("A", "B"), orphans=["X", "Y", "Z"])
-        orphans = set(find_orphans(G))
+        with _patched_flags(weight_calibration_profile="legacy"):
+            orphans = set(find_orphans(G))
         self.assertEqual(orphans, {"X", "Y", "Z"})
 
 
@@ -345,7 +349,7 @@ class TestResolveOrphans(unittest.TestCase):
 
     def test_no_orphans(self):
         """No orphans → nothing to do."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(weight_calibration_profile="legacy"):
             db = _make_db(tmp, nodes=[
                 _make_node_dict("A"), _make_node_dict("B")
             ])
@@ -356,7 +360,7 @@ class TestResolveOrphans(unittest.TestCase):
 
     def test_lexical_resolution_via_fts5(self):
         """Orphan matched by symbol name via FTS5."""
-        with tempfile.TemporaryDirectory() as tmp, _patched_flags(orphan_cascade_v2=False, orphan_lexical_tiered=False, fts_stopword_gate=False):
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(orphan_cascade_v2=False, orphan_lexical_tiered=False, fts_stopword_gate=False, weight_calibration_profile="legacy"):
             nodes = [
                 _make_node_dict("connected_a", symbol_name="UserService",
                                 source_text="class UserService: pass"),
@@ -588,7 +592,7 @@ class TestRunPhase2(unittest.TestCase):
 
     def test_pipeline_no_orphans_no_hubs(self):
         """Pipeline works when there are no special cases."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, _patched_flags(weight_calibration_profile="legacy"):
             nodes = [
                 _make_node_dict("A", symbol_name="ClassA"),
                 _make_node_dict("B", symbol_name="ClassB"),

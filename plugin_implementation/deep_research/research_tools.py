@@ -1423,7 +1423,16 @@ def create_codebase_tools(
                     arrow, other, other_type = '←', r.source_name, r.source_type
                 hop_str = f' (hop {r.hop_distance})' if r.hop_distance > 1 else ''
                 type_str = f' ({other_type})' if other_type else ''
-                lines.append(f'  {arrow} `{other}`{type_str} [{r.relationship_type}]{hop_str}')
+                # Surface line-precise provenance (route/callsite anchors)
+                # so the agent can trace contract consumption to the exact
+                # source location rather than guessing.
+                via_str = ''
+                via_anchors = getattr(r, 'via', None)
+                if via_anchors:
+                    via_str = ' via ' + ', '.join(via_anchors)
+                lines.append(
+                    f'  {arrow} `{other}`{type_str} [{r.relationship_type}]{hop_str}{via_str}'
+                )
 
             # If ALL rels are structural 'defines' edges, the container
             # only has child-containment links — also run orphan FTS to
