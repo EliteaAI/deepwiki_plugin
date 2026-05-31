@@ -3375,7 +3375,10 @@ class OptimizedWikiGenerationAgent:
         
         documents = []
         for score, file_path, node_data, content, symbol_type in doc_candidates[:max_docs]:
-            # Build metadata
+            # Build metadata. Propagate line span (when present, e.g. for
+            # markdown_section nodes) so the writer can render a
+            # <document_source: path:Lstart-Lend> citation anchored to the
+            # real document — not just the file path.
             metadata = {
                 'source': file_path,
                 'symbol': node_data.get('symbol_name', '') or node_data.get('name', file_path),
@@ -3386,6 +3389,8 @@ class OptimizedWikiGenerationAgent:
                 'graph_retrieved': True,
                 'is_documentation': True,
                 'relevance_score': score,
+                'start_line': node_data.get('start_line', 0) or 0,
+                'end_line': node_data.get('end_line', 0) or 0,
             }
             
             doc = Document(page_content=content, metadata=metadata)
@@ -4869,9 +4874,18 @@ class OptimizedWikiGenerationAgent:
             for doc in documentation_docs:  # Include ALL documentation files
                 source = doc.metadata.get('source', 'unknown')
                 content = doc.page_content  # FULL content (no truncation)
-                context_parts.append(f"<documentation_source: {source}>")
+                # Anchor the citation to the real document. When the node
+                # carries a line span (markdown_section nodes do), include it
+                # so the writer can cite <document_source: path:Lstart-Lend>.
+                start = doc.metadata.get('start_line', 0) or 0
+                end = doc.metadata.get('end_line', 0) or 0
+                if start and end:
+                    marker = f"<document_source: {source}:L{start}-L{end}>"
+                else:
+                    marker = f"<document_source: {source}>"
+                context_parts.append(marker)
                 context_parts.append(content)
-                context_parts.append("</documentation_source>")
+                context_parts.append("</document_source>")
             context_parts.append("")
 
         # Code context section - include ALL files (no truncation)

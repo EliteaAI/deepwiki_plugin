@@ -584,6 +584,193 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# gRPC client (consumer) detection
+# ──────────────────────────────────────────────────────────────────────
+# These match *outbound* gRPC call sites — code that consumes a remote
+# service — so ``materialize_contract_nodes`` emits a ``consumes`` edge
+# (``role="client"``) into the same ``contract::grpc::grpc:<Svc>/<Rpc>``
+# node the provider ``defines``. RPC method names are normalised to the
+# proto-canonical PascalCase used by the server-side matchers above so the
+# two sides dedupe onto one shared contract node.
+
+# Go: chained ``pb.NewCartServiceClient(conn).GetCart(ctx, ...)`` — the
+# service is on the constructor, the RPC on the immediate method call
+# (possibly on the next line, hence ``\s*\.\s*``).
+_GO_GRPC_CLIENT_CHAIN = re.compile(
+    r"New(?P<svc>[A-Z]\w*?)Client\s*\([^()]*\)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(",
+)
+# Go: stored client ``cs := pb.NewCartServiceClient(conn)`` → var→service.
+_GO_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*:?=\s*[\w.]*New(?P<svc>[A-Z]\w*?)Client\s*\(",
+)
+
+# Python: chained ``ProductCatalogServiceStub(channel).ListProducts(...)``.
+_PY_GRPC_CLIENT_CHAIN = re.compile(
+    r"(?P<svc>[A-Z]\w*?)Stub\s*\([^()]*\)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(",
+)
+# Python: ``stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)``.
+_PY_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*[\w.]*?(?P<svc>[A-Z]\w*?)Stub\s*\(",
+)
+
+# Java: ``blockingStub = AdServiceGrpc.newBlockingStub(channel)`` plus the
+# type declaration ``AdServiceGrpc.AdServiceBlockingStub blockingStub;``.
+_JAVA_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*(?:\w+\.)*(?P<svc>[A-Z]\w*?)Grpc\.new\w*Stub\s*\(",
+)
+_JAVA_GRPC_CLIENT_TYPE = re.compile(
+    r"(?:\w+\.)*(?P<svc>[A-Z]\w*?)Grpc\.\w*Stub\s+(?P<var>\w+)\b",
+)
+
+# C#: ``var client = new CartServiceClient(channel)``.
+_CS_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
+)
+
+# JavaScript / TypeScript (grpc-js): ``const c = new pkg.<Svc>Client(addr, creds)``
+# — same generated-name convention as C#. Method calls are lowerCamel.
+_JS_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
+)
+
+# C++ (gRPC): ``auto stub = <Svc>::NewStub(channel)`` plus the unique_ptr
+# type declaration ``std::unique_ptr<<Svc>::Stub> stub``. Calls use ``->``.
+_CPP_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*(?:[\w:]+::)?(?P<svc>[A-Z]\w*?)::NewStub\s*\(",
+)
+_CPP_GRPC_CLIENT_TYPE = re.compile(
+    r"(?:\w+::)*(?P<svc>[A-Z]\w*?)::Stub\s*>\s*(?P<var>\w+)\b",
+)
+
+# Rust (tonic): ``let mut c = <Svc>Client::connect(addr)`` / ``::new(channel)``.
+# Method calls are snake_case → PascalCase.
+_RUST_GRPC_CLIENT_BIND = re.compile(
+    r"(?P<var>\w+)\s*=\s*(?:\w+::)*(?P<svc>[A-Z]\w*?)Client::(?:connect|new|with_\w+)\s*\(",
+)
+
+# Generic ``<var>.<Rpc>(`` call site (PascalCase rpc — Go/Python/C#).
+_GRPC_CLIENT_CALL = re.compile(r"\b(?P<var>\w+)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(")
+# Java / JS / TS call sites use lowerCamel method names.
+_JAVA_GRPC_CLIENT_CALL = re.compile(r"\b(?P<var>\w+)\s*\.\s*(?P<rpc>[a-z]\w*)\s*\(")
+# C++ call sites use the ``->`` operator with PascalCase methods.
+_CPP_GRPC_CLIENT_CALL = re.compile(r"\b(?P<var>\w+)\s*->\s*(?P<rpc>[A-Z]\w*)\s*\(")
+# Rust call sites use snake_case methods.
+_RUST_GRPC_CLIENT_CALL = re.compile(r"\b(?P<var>\w+)\s*\.\s*(?P<rpc>[a-z][a-z0-9_]*)\s*\(")
+
+
+def extract_grpc_stub_bindings(text: str, language: str) -> Dict[str, str]:
+    """Return ``{var_name: service}`` for gRPC client stubs bound in *text*.
+
+    The orchestrator scans each file once and merges these across the
+    whole file so that a stub constructed in one symbol (e.g. a module-
+    level ``__init__``/``main``) resolves call sites in another symbol
+    (cross-slice). Call sites alone don't reveal the service, so without
+    this map a ``stub.ListProducts(...)`` invocation can't be attributed
+    to ``ProductCatalogService``.
+    """
+    bindings: Dict[str, str] = {}
+    if language == "go":
+        for m in _GO_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+    elif language == "python":
+        for m in _PY_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+    elif language == "java":
+        for m in _JAVA_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+        for m in _JAVA_GRPC_CLIENT_TYPE.finditer(text):
+            bindings.setdefault(m.group("var"), m.group("svc"))
+    elif language == "csharp":
+        for m in _CS_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+    elif language in ("javascript", "typescript"):
+        for m in _JS_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+    elif language in ("cpp", "c++"):
+        for m in _CPP_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+        for m in _CPP_GRPC_CLIENT_TYPE.finditer(text):
+            bindings.setdefault(m.group("var"), m.group("svc"))
+    elif language == "rust":
+        for m in _RUST_GRPC_CLIENT_BIND.finditer(text):
+            bindings[m.group("var")] = m.group("svc")
+    return bindings
+
+
+def _match_grpc_client(
+    text: str,
+    language: str,
+    stub_bindings: Optional[Dict[str, str]] = None,
+) -> List[APISurface]:
+    """Detect outbound gRPC calls (consumers) → ``role="client"`` surfaces.
+
+    Two resolution strategies:
+
+    1. *Chained* — ``New<Svc>Client(conn).<Rpc>(`` (Go) or
+       ``<Svc>Stub(channel).<Rpc>(`` (Python). Service and RPC are
+       co-located so no binding map is needed.
+    2. *Bound* — a stub variable is assigned the client elsewhere (often
+       in a different symbol/slice) and invoked here as ``<var>.<Rpc>(``.
+       ``stub_bindings`` (built file-wide by the orchestrator) maps the
+       variable to its service; same-slice bindings supplement it.
+
+    Every surface carries ``metadata['role'] = 'client'`` so
+    :func:`materialize_contract_nodes` produces a ``consumes`` edge.
+    """
+    out: List[APISurface] = []
+    seen: set = set()
+
+    def _emit(svc: str, rpc: str) -> None:
+        if not svc or not rpc:
+            return
+        key = (svc, rpc)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(APISurface(
+            kind="grpc",
+            surface=f"grpc:{svc}/{rpc}",
+            weight_hint=0.7,
+            metadata={"service": svc, "method": rpc, "role": "client"},
+        ))
+
+    # ── Chained construct + call (service + RPC co-located) ─────────
+    if language == "go":
+        for m in _GO_GRPC_CLIENT_CHAIN.finditer(text):
+            _emit(m.group("svc"), m.group("rpc"))
+    elif language == "python":
+        for m in _PY_GRPC_CLIENT_CHAIN.finditer(text):
+            _emit(m.group("svc"), m.group("rpc"))
+
+    # ── Bound stub variable → call site ────────────────────────────
+    bindings = dict(stub_bindings or {})
+    for var, svc in extract_grpc_stub_bindings(text, language).items():
+        bindings.setdefault(var, svc)
+    if bindings:
+        if language in ("java", "javascript", "typescript"):
+            call_re = _JAVA_GRPC_CLIENT_CALL
+        elif language in ("cpp", "c++"):
+            call_re = _CPP_GRPC_CLIENT_CALL
+        elif language == "rust":
+            call_re = _RUST_GRPC_CLIENT_CALL
+        else:
+            call_re = _GRPC_CLIENT_CALL
+        for m in call_re.finditer(text):
+            svc = bindings.get(m.group("var"))
+            if not svc:
+                continue
+            rpc = m.group("rpc")
+            if language in ("java", "javascript", "typescript"):
+                rpc = rpc[0].upper() + rpc[1:]
+            elif language == "rust":
+                rpc = "".join(w.capitalize() for w in rpc.split("_"))
+            elif language == "csharp" and rpc.endswith("Async") and len(rpc) > 5:
+                rpc = rpc[:-5]
+            _emit(svc, rpc)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
 # GraphQL
 # ──────────────────────────────────────────────────────────────────────
 
@@ -1161,6 +1348,7 @@ def extract_api_surfaces(
     parser_metadata: Optional[dict] = None,
     *,
     plugin_name: str = "",
+    grpc_stub_bindings: Optional[Dict[str, str]] = None,
 ) -> List[APISurface]:
     """Return all API surfaces visible in *node_data*.
 
@@ -1173,6 +1361,11 @@ def extract_api_surfaces(
     ``metadata.json`` by ``extract_api_surfaces_for_graph``). When
     supplied, ``_match_pylon_api`` emits both the on-disk source path
     and the deployed ``/api/vN/<plugin_name>/...`` twin.
+
+    ``grpc_stub_bindings`` is the file-level ``{var: service}`` map built
+    by the orchestrator so outbound gRPC call sites whose stub was
+    constructed in a *different* symbol (cross-slice) still resolve to a
+    ``consumes`` surface. ``None`` falls back to same-slice bindings only.
     """
     existing = node_data.get("api_surface") or []
     if existing:
@@ -1200,6 +1393,7 @@ def extract_api_surfaces(
     rel_path = node_data.get("rel_path") or ""
 
     surfaces.extend(_match_grpc(text, language))
+    surfaces.extend(_match_grpc_client(text, language, grpc_stub_bindings))
     surfaces.extend(_match_graphql(text))
     surfaces.extend(_match_ffi(text, symbol_name))
     surfaces.extend(_match_objects(text, language))
@@ -1266,6 +1460,10 @@ def extract_api_surfaces_for_graph(
     # Per-file source-line cache for the empty-source_text fallback below
     # (rel_path -> list[str] of file lines, or [] if read failed).
     file_lines_cache: Dict[str, List[str]] = {}
+    # Per-file gRPC stub-binding cache (rel_path -> {var: service}). Built
+    # by scanning the *whole* file so a stub constructed in one symbol
+    # resolves outbound call sites in another (cross-slice consumers).
+    file_grpc_bindings: Dict[str, Dict[str, str]] = {}
 
     def _file_slice(rel_path: str, start_line: int, end_line: int) -> str:
         """Return source ``[start_line..end_line]`` (1-based, inclusive)
@@ -1335,6 +1533,38 @@ def extract_api_surfaces_for_graph(
         names = {m.group("var") for m in _PY_CTYPES_LIB.finditer(content)}
         file_ctypes_libs[rel_path] = names
         return names
+
+    def _grpc_stub_bindings(rel_path: str, language: str) -> Dict[str, str]:
+        """File-level ``{var: service}`` map for gRPC client stubs.
+
+        Scans the whole file once (cached) so a stub bound in one symbol
+        (e.g. a module-scope ``stub = FooServiceStub(channel)``) resolves
+        ``stub.Bar(...)`` call sites that live in a *different* symbol —
+        the common cross-slice shape in real services (Python
+        recommendationservice binds at module scope, calls inside a
+        method). Returns ``{}`` when the language has no client matcher
+        or the file can't be read.
+        """
+        if not rel_path or not repo_root or language not in (
+            "go", "python", "java", "csharp",
+            "javascript", "typescript", "cpp", "c++", "rust",
+        ):
+            return {}
+        if rel_path in file_grpc_bindings:
+            return file_grpc_bindings[rel_path]
+        try:
+            from pathlib import Path as _Path
+            full = _Path(repo_root) / rel_path
+            if not full.is_file():
+                file_grpc_bindings[rel_path] = {}
+                return {}
+            content = full.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            file_grpc_bindings[rel_path] = {}
+            return {}
+        bindings = extract_grpc_stub_bindings(content, language)
+        file_grpc_bindings[rel_path] = bindings
+        return bindings
 
     def _plugin_name_from_metadata_text(text: str) -> str:
         """Parse a Pylon plugin's ``metadata.json`` and return its
@@ -1417,6 +1647,9 @@ def extract_api_surfaces_for_graph(
                 data,
                 parser_metadata=parser_metadata_by_node.get(str(node_id)),
                 plugin_name=plugin_name,
+                grpc_stub_bindings=_grpc_stub_bindings(
+                    data.get("rel_path") or "", language
+                ),
             )
             # Python ctypes wrapper detection (file-level lib var ↔
             # ``<libvar>.<func>(`` call sites in the symbol body).
@@ -1555,12 +1788,29 @@ def materialize_contract_nodes(
             role = (meta.get("role") or "server").lower()
             rel_type = "consumes" if role == "client" else "defines"
 
+            # Persist the contract-edge provenance that was previously dropped
+            # (Phase-2 follow-up):
+            #   * ``obj_kind`` — the contract-kind discriminator (rest_route,
+            #     grpc_service, …) so the edge is self-describing without
+            #     dereferencing the target node's ``signature``.
+            #   * ``confidence`` — server *defines* edges are directly observed
+            #     in the AST (EXTRACTED); client *consumes* edges are resolved
+            #     by name/regex stub matching (INFERRED). The repo_edges schema
+            #     has no dedicated column, so it rides in the annotations blob
+            #     (read back by graph_query_service._edge_confidence).
+            annotations["obj_kind"] = kind
+            annotations["confidence"] = "INFERRED" if role == "client" else "EXTRACTED"
+
             g.add_edge(
                 owner_id,
                 nid,
                 relationship_type=rel_type,
                 edge_class="structural",
                 weight=1.0,
+                # ``language`` is a first-class repo_edges column; carry the
+                # owning symbol's language so the contract edge is no longer
+                # persisted with an empty language.
+                language=owner_language,
                 annotations=annotations,
             )
 

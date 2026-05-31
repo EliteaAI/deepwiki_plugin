@@ -224,9 +224,10 @@ class EnhancedUnifiedGraphBuilder:
         '.php': 'php',
         '.rs': 'rust',
         '.kt': 'kotlin',
-        '.scala': 'scala'
-    }
-    
+        '.scala': 'scala',
+        '.sql': 'sql',    # DDL — handled by sql_extractor (not tree-sitter)
+        '.ddl': 'sql',
+    }    
     # Documentation file extensions — imported from constants.py (single source of truth)
     DOCUMENTATION_EXTENSIONS = _DOC_EXTENSIONS_MAP
 
@@ -546,6 +547,10 @@ class EnhancedUnifiedGraphBuilder:
                     # Process documentation files with text chunking
                     doc_results = self._parse_documentation_files(file_paths, repo_path)
                     parse_results.update(doc_results)
+                elif language == 'sql':
+                    # SQL/DDL is handled by the dedicated sql_extractor after the
+                    # multi-tier graph is built (it produces its own subgraph).
+                    continue
                 elif language in self.rich_parsers:
                     # Use rich parser for comprehensive analysis
                     rich_results = self._parse_with_rich_parser(language, file_paths)
@@ -564,7 +569,43 @@ class EnhancedUnifiedGraphBuilder:
         # Phase 3: Build multi-tier unified code_graph
         with resource_monitor("graph_builder.build_graph", logger):
             unified_graph = self._build_multi_tier_graph(parse_results)
-        
+
+        # Phase 3b: SQL/DDL extraction (roadmap C1/§3.1) — merge the typed
+        # SQL subgraph (tables/views/columns/... + defines/references/
+        # triggered_by/calls) into the unified graph.
+        sql_files = files_by_language.get('sql') or []
+        if sql_files:
+            try:
+                from ..feature_flags import get_feature_flags as _get_flags
+                if getattr(_get_flags(), 'sql_extraction', True):
+                    from .sql_extractor import build_sql_graph
+                    sql_graph, sql_stats = build_sql_graph(sql_files, repo_path)
+                    if sql_graph and sql_graph.number_of_nodes() > 0:
+                        self._merge_graph(unified_graph, sql_graph)
+                        logger.info(
+                            "SQL extraction merged: %d nodes, %d edges "
+                            "(%d tables, %d views, %d FK/view refs)",
+                            sql_graph.number_of_nodes(), sql_graph.number_of_edges(),
+                            sql_stats.get('tables', 0), sql_stats.get('views', 0),
+                            sql_stats.get('references_edges', 0),
+                        )
+            except Exception as exc:
+                logger.warning("SQL extraction failed (non-fatal): %s", exc)
+
+        # Phase 3b.1: ORM model → SQL table linking (roadmap C4). Runs after the
+        # SQL subgraph is merged so ``sql_table`` nodes exist. Emits
+        # ``models_table`` cross-language edges from ORM model classes
+        # (SQLAlchemy/Django/Hibernate) to their table counterparts.
+        try:
+            from ..feature_flags import get_feature_flags as _get_flags
+            if getattr(_get_flags(), 'orm_linking', True):
+                from .orm_linker import link_orm_models
+                orm_edges = link_orm_models(unified_graph)
+                if orm_edges:
+                    logger.info("ORM linking merged: %d models_table edge(s)", orm_edges)
+        except Exception as exc:
+            logger.warning("ORM linking failed (non-fatal): %s", exc)
+
         # Phase 3.5: Build node index for O(1) lookups (for relationship hints)
         with resource_monitor("graph_builder.build_node_index", logger):
             self._build_node_index(unified_graph)

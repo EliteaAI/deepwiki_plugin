@@ -657,6 +657,22 @@ class FilesystemRepositoryIndexer:
                                 "Phase 1c: test linker added %d edges",
                                 len(tl_edges),
                             )
+
+                        if _flags.markdown_structure:
+                            from .markdown_structure import (
+                                wire_markdown_structure,
+                            )
+
+                            md_stats = wire_markdown_structure(
+                                self.relationship_graph, flags=_flags,
+                            )
+                            logger.info(
+                                "Phase 1c: markdown structure added %d contains "
+                                "+ %d references edges (%d documents synthesized)",
+                                md_stats["contains_edges"],
+                                md_stats["references_edges"],
+                                md_stats["documents_synthesized"],
+                            )
                     except Exception as exc:
                         logger.warning("Phase 1c enrichment failed (non-fatal): %s", exc)
 

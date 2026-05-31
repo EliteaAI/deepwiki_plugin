@@ -63,6 +63,8 @@ class RelationshipType(Enum):
     ALIAS_OF = "alias_of"               # type alias / typedef ultimate target mapping
     # Phase B: contract-node algebra
     CONSUMES = "consumes"                # implementation consumes a contract (handles the route/method)
+    # Phase C: SQL / DDL relationships
+    TRIGGERED_BY = "triggered_by"        # trigger fires on a table
 
 
 class SymbolType(Enum):
@@ -87,6 +89,14 @@ class SymbolType(Enum):
     DECORATOR = "decorator"
     MACRO = "macro"
     CONTRACT = "contract"
+    # SQL / DDL symbol types
+    SQL_SCHEMA = "sql_schema"
+    SQL_TABLE = "sql_table"
+    SQL_VIEW = "sql_view"
+    SQL_COLUMN = "sql_column"
+    SQL_INDEX = "sql_index"
+    SQL_FUNCTION = "sql_function"
+    SQL_TRIGGER = "sql_trigger"
 
 
 class Scope(Enum):

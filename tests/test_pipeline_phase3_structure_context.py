@@ -642,6 +642,65 @@ class TestLineNumbers:
         assert "`src/file.py`" in result
 
 
+class TestDocumentSourceCitation:
+    """Tests for the <document_source> citation marker on documentation context."""
+
+    def _make_doc(self, source, content, start_line=0, end_line=0):
+        doc = MagicMock()
+        doc.page_content = content
+        doc.metadata = {
+            'source': source,
+            'file_path': source,
+            'symbol_name': source,
+            'start_line': start_line,
+            'end_line': end_line,
+            'symbol_type': 'markdown_section',
+            'chunk_type': 'documentation',
+            'is_documentation': True,
+        }
+        return doc
+
+    def _make_page_spec(self):
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+        return page_spec
+
+    def test_doc_marker_includes_line_span(self):
+        """Documentation context with a line span should emit <document_source: path:Lstart-Lend>."""
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: True
+
+        doc = self._make_doc("docs/architecture.md", "# Overview\nThe system ...", 12, 40)
+        result = OptimizedWikiGenerationAgent._format_simple_context(
+            agent, [doc], self._make_page_spec()
+        )
+        content = result["content"]
+
+        assert "<document_source: docs/architecture.md:L12-L40>" in content
+        assert "</document_source>" in content
+        # Legacy marker name must be gone.
+        assert "<documentation_source:" not in content
+
+    def test_doc_marker_without_lines(self):
+        """Documentation context without a line span should emit path-only marker."""
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: True
+
+        doc = self._make_doc("README.md", "# Project\nHello", 0, 0)
+        result = OptimizedWikiGenerationAgent._format_simple_context(
+            agent, [doc], self._make_page_spec()
+        )
+        content = result["content"]
+
+        assert "<document_source: README.md>" in content
+        assert ":L0" not in content
+
+
 # ============================================================================
 # 3.6 + 3.7 — Graph-based import extraction
 # ============================================================================

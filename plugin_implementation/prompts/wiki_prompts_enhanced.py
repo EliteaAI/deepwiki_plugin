@@ -1429,6 +1429,16 @@ When referencing code in your documentation, include line ranges whenever they a
 - ✅ `<code_source: path/to/file.py>` — acceptable when line annotations are not available
 - ❌ Never fabricate line numbers. Use them ONLY when they appear in the context annotations.
 
+**DOCUMENTATION SOURCE CITATIONS — cite the document, never the void:**
+Claims drawn from documentation (README, docs/*.md, design notes) appear in the
+"Documentation Context:" block, each wrapped in a `<document_source: path[:Lstart-Lend]>` marker.
+EVERY statement you take from documentation MUST carry that document's citation — do not present a
+documentation-derived claim as if it had no source.
+- ✅ `<document_source: docs/architecture.md:L12-L40>` — precise reference with section lines
+- ✅ `<document_source: README.md>` — acceptable when no line span is shown
+- ❌ Never make a claim sourced from documentation without its `<document_source: ...>` marker.
+- ❌ Never fabricate a path or line span — copy them exactly as shown in the context.
+
 **SENSITIVE DATA GUARD:**
 - Redact middle of any credential-like strings: `abcd****wxyz` and note redaction.
 """
