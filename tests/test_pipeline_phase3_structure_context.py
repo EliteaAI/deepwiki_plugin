@@ -880,3 +880,73 @@ class TestAnalyzeModuleDocCounting:
             
             assert "2 code" in result
             assert "1 doc" in result
+
+
+class TestPylonApiEndpointsContext:
+    """`_format_simple_context` should render an <api_endpoints> block with
+    the deployed Pylon URL so the writer documents endpoints verbatim."""
+
+    def _make_doc(self, source, rel_path, content):
+        doc = MagicMock()
+        doc.page_content = content
+        doc.metadata = {
+            'source': source,
+            'file_path': source,
+            'rel_path': rel_path,
+            'symbol_name': 'API',
+            'start_line': 1,
+            'end_line': 8,
+            'symbol_type': 'class',
+            'chunk_type': 'code',
+        }
+        return doc
+
+    def _agent(self):
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: False
+        agent._extract_imports_for_file = lambda f, c: ""
+        agent._pylon_plugin_name_cache = None
+        # Bind the real methods under test.
+        agent._pylon_endpoints_for_file = (
+            OptimizedWikiGenerationAgent._pylon_endpoints_for_file.__get__(agent)
+        )
+        agent._resolve_pylon_plugin_name = (
+            OptimizedWikiGenerationAgent._resolve_pylon_plugin_name.__get__(agent)
+        )
+        return agent, OptimizedWikiGenerationAgent
+
+    def test_renders_deployed_url_from_plugins_path(self):
+        agent, cls = self._agent()
+        src = (
+            "class API(APIBase):\n"
+            "    url_params = ['<int:project_id>']\n"
+            "    def get(self, project_id, **kwargs): ...\n"
+            "    def post(self, project_id, **kwargs): ...\n"
+        )
+        doc = self._make_doc(
+            "pylon_main/plugins/configurations/api/v1/configurations.py",
+            "plugins/configurations/api/v1/configurations.py",
+            src,
+        )
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+
+        content = cls._format_simple_context(agent, [doc], page_spec)["content"]
+
+        assert "<api_endpoints>" in content
+        assert "[ENDPOINT] GET /api/v1/configurations/configurations/{project_id}" in content
+        assert "[ENDPOINT] POST /api/v1/configurations/configurations/{project_id}" in content
+
+    def test_non_pylon_file_has_no_block(self):
+        agent, cls = self._agent()
+        doc = self._make_doc(
+            "src/util.py", "src/util.py", "def helper():\n    return 1\n"
+        )
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+
+        content = cls._format_simple_context(agent, [doc], page_spec)["content"]
+        assert "<api_endpoints>" not in content

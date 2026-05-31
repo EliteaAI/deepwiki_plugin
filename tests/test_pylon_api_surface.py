@@ -254,3 +254,86 @@ class TestPluginNameTwin:
         # one is expected and shared with all REST matchers.
         assert "GET /api/v2/configuration" in rests
         assert not any("configurations" in s for s in rests)
+
+
+# ─── deployed-URL derivation for documentation ────────────────────────
+
+from plugin_implementation.code_graph.api_surface_extractor import (  # noqa: E402
+    derive_pylon_endpoints,
+    plugin_name_from_metadata_text,
+)
+
+
+class TestDerivePylonEndpoints:
+    """``derive_pylon_endpoints`` renders the human-readable deployed URL
+    used to ground the wiki writer (keeps param names, mounts plugin)."""
+
+    CONFIG_SRC = (
+        "class API(APIBase):\n"
+        "    url_params = ['<int:project_id>']\n"
+        "    def get(self, project_id, **kwargs): ...\n"
+        "    def post(self, project_id, **kwargs): ...\n"
+    )
+
+    def test_monorepo_plugins_path_mounts_and_doubles(self):
+        # File named like its plugin doubles the segment at deploy time.
+        eps = derive_pylon_endpoints(
+            "plugins/configurations/api/v1/configurations.py",
+            self.CONFIG_SRC,
+            "configurations",
+        )
+        assert eps == [
+            "GET /api/v1/configurations/configurations/{project_id}",
+            "POST /api/v1/configurations/configurations/{project_id}",
+        ]
+
+    def test_keeps_param_name_not_var(self):
+        eps = derive_pylon_endpoints(
+            "api/v1/configurations.py", self.CONFIG_SRC, "configurations"
+        )
+        assert all("{project_id}" in e for e in eps)
+        assert not any("{var}" in e for e in eps)
+
+    def test_already_mounted_path_not_doubled(self):
+        eps = derive_pylon_endpoints(
+            "api/v1/configurations/sub.py", self.CONFIG_SRC, "configurations"
+        )
+        assert eps[0] == "GET /api/v1/configurations/sub/{project_id}"
+
+    def test_no_plugin_name_bare_base(self):
+        eps = derive_pylon_endpoints(
+            "api/v1/configurations.py", self.CONFIG_SRC, ""
+        )
+        assert eps == [
+            "GET /api/v1/configurations/{project_id}",
+            "POST /api/v1/configurations/{project_id}",
+        ]
+
+    def test_non_pylon_source_returns_empty(self):
+        assert derive_pylon_endpoints(
+            "api/v1/configurations.py", "def helper():\n    return 1\n", "x"
+        ) == []
+
+    def test_no_url_params_no_suffix(self):
+        src = "class API(APIBase):\n    def get(self): ...\n"
+        eps = derive_pylon_endpoints(
+            "plugins/configurations/api/v1/configurations.py", src, "configurations"
+        )
+        assert eps == ["GET /api/v1/configurations/configurations"]
+
+
+class TestPluginNameFromMetadataText:
+
+    def test_plain_json(self):
+        assert plugin_name_from_metadata_text('{"name": "configurations"}') == "configurations"
+
+    def test_tolerates_file_header(self):
+        assert plugin_name_from_metadata_text(
+            '[File: metadata.json]\n{"name": "configurations"}'
+        ) == "configurations"
+
+    def test_rejects_non_identifier(self):
+        assert plugin_name_from_metadata_text('{"name": "../etc"}') == ""
+
+    def test_empty(self):
+        assert plugin_name_from_metadata_text("") == ""

@@ -1329,6 +1329,124 @@ def _match_pylon_api(node_data: dict, plugin_name: str = "") -> List[APISurface]
     return out
 
 
+# Pylon path param ``<int:project_id>`` / ``<string:cfg>`` / ``<id>`` →
+# keep the *name* (drop the optional ``type:`` prefix) for human-readable
+# documentation URLs. This differs from the graph-linker collapse to
+# ``{var}`` (which exists so source routes pair against consumer
+# f-strings); doc readers want ``{project_id}``, not ``{var}``.
+_PYLON_PARAM_NAMED = re.compile(r"<(?:[^:>]+:)?(?P<name>[^>]+)>")
+
+
+def plugin_name_from_metadata_text(text: str) -> str:
+    """Parse a Pylon plugin ``metadata.json`` blob and return its
+    ``name`` field (the deployed URL mount segment).
+
+    Tolerates a ``[File: metadata.json]`` header some parsers prepend
+    and restricts the result to an identifier-like shape so we never
+    splice arbitrary user strings into a rendered route. Returns ``""``
+    when nothing usable is found.
+    """
+    if not text:
+        return ""
+    try:
+        import json as _json
+        payload = text
+        if payload.startswith("[File:"):
+            nl = payload.find("\n")
+            if nl != -1:
+                payload = payload[nl + 1:]
+        meta = _json.loads(payload)
+        name = (meta.get("name") or "").strip()
+        if name and re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", name):
+            return name
+    except Exception:
+        return ""
+    return ""
+
+
+def derive_pylon_endpoints(
+    rel_path: str,
+    source_text: str,
+    plugin_name: str = "",
+) -> List[str]:
+    """Derive human-readable *deployed* Pylon REST endpoints for a class.
+
+    This is the documentation-facing companion to ``_match_pylon_api``
+    (which produces graph-linkage surfaces, including noisy
+    prefix-stripped and bare-source variants). Here we emit exactly the
+    URL a reader would call, following Pylon's deploy-time convention::
+
+        /api/v{version}/{plugin_name}/{file_name}{url_params}
+
+    where ``version`` + ``file_name`` come from the file location
+    (``api/v1/configurations.py``), ``plugin_name`` from the plugin's
+    ``metadata.json`` ``name`` (or the ``plugins/<name>/`` path
+    segment), and the ``url_params`` suffix from the class attribute.
+
+    Example — ``plugins/configurations/api/v1/configurations.py`` with
+    ``url_params = ['<int:project_id>']`` and ``get``/``post`` handlers,
+    ``plugin_name='configurations'`` yields::
+
+        ["GET /api/v1/configurations/configurations/{project_id}",
+         "POST /api/v1/configurations/configurations/{project_id}"]
+
+    Returns ``[]`` for any source that is not a Pylon/Flask
+    class-dispatch handler (``APIBase`` / ``MethodView`` / ``Resource``)
+    or whose route cannot be derived from *rel_path*.
+    """
+    text = source_text or ""
+    if not text or not _PYLON_API_BASE.search(text):
+        return []
+    base = _pylon_route_from_rel_path(rel_path or "")
+    if not base:
+        return []
+
+    # Insert the plugin mount segment after ``/api/vN/`` (deploy-time
+    # behaviour). Skip if the path already carries it.
+    deployed = base
+    if plugin_name:
+        mm = re.match(r"^(/api(?:/v\d+\w*)?)/(.+)$", base)
+        # Insert the mount unless the path already begins with it. Note a
+        # file named like its plugin (``configurations.py`` in plugin
+        # ``configurations``) DOES double at deploy time
+        # (``/api/v1/configurations/configurations``), so an exact match
+        # of the *whole* remainder must still be mounted.
+        if mm and not mm.group(2).startswith(plugin_name + "/"):
+            deployed = f"{mm.group(1)}/{plugin_name}/{mm.group(2)}"
+
+    # url_params suffixes — keep param *names* for readability.
+    suffixes: List[str] = [""]
+    pm = _PYLON_URL_PARAMS.search(text)
+    if pm:
+        custom: List[str] = []
+        for raw in pm.group("body").split(","):
+            tok = raw.strip().strip("'\"")
+            if not tok:
+                custom.append("")
+                continue
+            named = _PYLON_PARAM_NAMED.sub(lambda m: "{" + m.group("name") + "}", tok)
+            named = "/" + named.lstrip("/")
+            custom.append(named)
+        if custom:
+            suffixes = custom
+
+    methods = sorted({m.group("m").upper() for m in _PYLON_METHOD_DEF.finditer(text)})
+    if not methods:
+        return []
+
+    out: List[str] = []
+    seen: set = set()
+    for method in methods:
+        for suffix in suffixes:
+            full = deployed + suffix if suffix else deployed
+            line = f"{method} {full}"
+            if line in seen:
+                continue
+            seen.add(line)
+            out.append(line)
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Dispatcher
 # ──────────────────────────────────────────────────────────────────────

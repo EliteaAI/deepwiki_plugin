@@ -1429,6 +1429,16 @@ When referencing code in your documentation, include line ranges whenever they a
 - ✅ `<code_source: path/to/file.py>` — acceptable when line annotations are not available
 - ❌ Never fabricate line numbers. Use them ONLY when they appear in the context annotations.
 
+**API ENDPOINTS — use the deployed URL verbatim:**
+When a `<code_source>` block contains an `<api_endpoints>` section, those `[ENDPOINT] METHOD /path`
+lines are the AUTHORITATIVE deploy-time URLs (resolved from the framework's routing convention, e.g.
+Pylon mounts a route as `/api/v{version}/{plugin_name}/{file_name}{params}`). When documenting an
+endpoint, copy the method and path EXACTLY as shown.
+- ✅ `GET /api/v1/configurations/configurations/{project_id}` — copied verbatim from `<api_endpoints>`
+- ❌ Never invent a REST-ish path from a handler's parameter name (e.g. do NOT write
+  `/api/v1/projects/<int:project_id>/configurations` when the `<api_endpoints>` block says otherwise).
+- ❌ Never drop the plugin mount segment or rename path parameters.
+
 **DOCUMENTATION SOURCE CITATIONS — cite the document, never the void:**
 Claims drawn from documentation (README, docs/*.md, design notes) appear in the
 "Documentation Context:" block, each wrapped in a `<document_source: path[:Lstart-Lend]>` marker.
