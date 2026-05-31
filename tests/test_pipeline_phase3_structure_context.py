@@ -950,3 +950,42 @@ class TestPylonApiEndpointsContext:
 
         content = cls._format_simple_context(agent, [doc], page_spec)["content"]
         assert "<api_endpoints>" not in content
+
+
+class TestContentPromptFormatsWithoutKeyError:
+    """Regression: the API-ENDPOINTS instruction block must not introduce
+    unescaped ``{...}`` placeholders that break ``str.format`` at page-gen
+    time (previously raised ``KeyError: 'version'``)."""
+
+    def test_v3_tone_adjusted_template_formats(self):
+        from langchain_core.prompts import ChatPromptTemplate
+        from plugin_implementation.prompts.wiki_prompts_enhanced import (
+            ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED,
+        )
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", "You are an expert technical writer."),
+                ("human", ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED),
+            ]
+        )
+
+        # The exact kwargs supplied by _generate_simple.
+        messages = prompt.format_messages(
+            section_name="Main",
+            page_name="Type Information Endpoints",
+            page_description="desc",
+            content_focus="focus",
+            repository_url="https://example.com/repo",
+            wiki_style="comprehensive",
+            repository_context="",
+            relevant_content="<api_endpoints>\n  [ENDPOINT] GET /api/v1/x/y/{project_id}\n</api_endpoints>",
+            related_files="a.py",
+            target_audience="Mixed audience",
+        )
+
+        rendered = messages[-1].content
+        # Escaped literals must survive as single braces in the rendered text.
+        assert "/api/v{version}/{plugin_name}/{file_name}{params}" in rendered
+        # And the injected value's braces are preserved verbatim.
+        assert "[ENDPOINT] GET /api/v1/x/y/{project_id}" in rendered
