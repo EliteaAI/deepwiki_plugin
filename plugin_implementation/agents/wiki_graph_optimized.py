@@ -180,6 +180,10 @@ class OptimizedWikiGenerationAgent:
         # all pages in a single wiki generation run.
         self._cluster_db_path: Optional[str] = None
         self._cluster_db: Optional[UnifiedWikiDB] = None
+
+        # Pylon plugin name cache: populated on first metadata.json lookup
+        # for repos where the path has no ``plugins/<name>/`` segment.
+        self._pylon_plugin_name_cache: Optional[str] = None
         
         # Log component initialization for debugging
         logger.info(f"OptimizedWikiGenerationAgent initialized with:")
@@ -4826,13 +4830,12 @@ class OptimizedWikiGenerationAgent:
         repos where the path has no ``plugins/`` segment). Result is
         cached per repo. Returns ``""`` when nothing usable is found.
         """
-        import re as _re
         if rel_path:
-            m = _re.search(r"(?:^|/)plugins/([^/]+)/", rel_path)
+            m = re.search(r"(?:^|/)plugins/([^/]+)/", rel_path)
             if m:
                 return m.group(1)
         # Repo-level metadata.json fallback (cached).
-        cached = getattr(self, "_pylon_plugin_name_cache", None)
+        cached = self._pylon_plugin_name_cache
         if cached is not None:
             return cached
         plugin_name = ""

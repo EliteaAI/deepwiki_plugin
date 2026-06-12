@@ -46,9 +46,9 @@ import networkx as nx
 
 from .feature_flags import FeatureFlags, get_feature_flags
 from .graph_orphan_cascade_v2 import (
-    _build_path_index,
-    _build_simple_name_index,
-    _resolve_doc_orphan_links,
+    build_path_index as _build_path_index,
+    build_simple_name_index as _build_simple_name_index,
+    resolve_doc_orphan_links as _resolve_doc_orphan_links,
 )
 
 logger = logging.getLogger(__name__)

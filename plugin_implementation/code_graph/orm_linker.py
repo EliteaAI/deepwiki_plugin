@@ -123,14 +123,40 @@ def _build_table_index(g: nx.MultiDiGraph) -> Dict[str, str]:
     return index
 
 
+def _build_view_index(g: nx.MultiDiGraph) -> Dict[str, str]:
+    """Map ``lower(view_name) -> sql_view node_id`` for ORM→view matching.
+
+    Some ORM classes legitimately map to database views (e.g. SQLAlchemy
+    ``selectable`` mappings).  Kept separate from the table index so
+    the caller can distinguish ``models_table`` from ``models_view``
+    edges and avoid mixing the two concepts.
+    """
+    index: Dict[str, str] = {}
+    for node_id, data in g.nodes(data=True):
+        stype = data.get("symbol_type") or data.get("type") or ""
+        if hasattr(stype, "value"):
+            stype = stype.value
+        if str(stype).lower() != "sql_view":
+            continue
+        name = data.get("name") or data.get("symbol_name") or ""
+        if name:
+            index.setdefault(name.lower(), node_id)
+    return index
+
+
 def link_orm_models(g: nx.MultiDiGraph) -> int:
-    """Add ``models_table`` edges from ORM model classes to ``sql_table`` nodes.
+    """Add ``models_table`` / ``models_view`` edges from ORM model classes.
+
+    * ``models_table`` — ORM class maps to a ``sql_table`` node.
+    * ``models_view`` — ORM class maps to a ``sql_view`` node (e.g. SQLAlchemy
+      ``selectable`` mappings).
 
     Returns the number of edges added. No-op (returns 0) when the graph has no
-    ``sql_table`` nodes.
+    ``sql_table`` or ``sql_view`` nodes.
     """
     table_index = _build_table_index(g)
-    if not table_index:
+    view_index = _build_view_index(g)
+    if not table_index and not view_index:
         return 0
 
     added = 0
@@ -150,24 +176,36 @@ def link_orm_models(g: nx.MultiDiGraph) -> int:
         if not class_name:
             continue
 
+        # First try to match a sql_table; then fall back to sql_view.
         target_id: Optional[str] = None
         matched_name: Optional[str] = None
+        edge_key = "models_table"
         for cand in _candidate_table_names(class_name, source_text, language):
             tid = table_index.get(cand.lower())
             if tid is not None:
                 target_id = tid
                 matched_name = cand
+                edge_key = "models_table"
                 break
 
-        if target_id is None or g.has_edge(node_id, target_id, key="models_table"):
+        if target_id is None:
+            for cand in _candidate_table_names(class_name, source_text, language):
+                vid = view_index.get(cand.lower())
+                if vid is not None:
+                    target_id = vid
+                    matched_name = cand
+                    edge_key = "models_view"
+                    break
+
+        if target_id is None or g.has_edge(node_id, target_id, key=edge_key):
             continue
 
         g.add_edge(
             node_id,
             target_id,
-            key="models_table",
-            relationship_type="models_table",
-            type="models_table",
+            key=edge_key,
+            relationship_type=edge_key,
+            type=edge_key,
             edge_class="cross_language",
             weight=0.85,
             language=language,
@@ -181,5 +219,5 @@ def link_orm_models(g: nx.MultiDiGraph) -> int:
         added += 1
 
     if added:
-        logger.info("ORM linker: added %d models_table edge(s)", added)
+        logger.info("ORM linker: added %d models_table/models_view edge(s)", added)
     return added

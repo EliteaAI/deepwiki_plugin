@@ -3238,6 +3238,26 @@ Show how components fit into larger workflows and system operations.
 - No fabricated version numbers or metrics.
 - Only use information present in Tier 1/2/3 content or request via NEED_CONTEXT if needed.
 
+**API ENDPOINTS — use the deployed URL verbatim:**
+When a `<code_source>` block contains an `<api_endpoints>` section, those `[ENDPOINT] METHOD /path`
+lines are the AUTHORITATIVE deploy-time URLs (resolved from the framework's routing convention, e.g.
+Pylon mounts a route as `/api/v{{version}}/{{plugin_name}}/{{file_name}}{{params}}`). When documenting an
+endpoint, copy the method and path EXACTLY as shown.
+- ✅ `GET /api/v1/configurations/configurations/{{project_id}}` — copied verbatim from `<api_endpoints>`
+- ❌ Never invent a REST-ish path from a handler's parameter name (e.g. do NOT write
+  `/api/v1/projects/<int:project_id>/configurations` when the `<api_endpoints>` block says otherwise).
+- ❌ Never drop the plugin mount segment or rename path parameters.
+
+**DOCUMENTATION SOURCE CITATIONS — cite the document, never the void:**
+Claims drawn from documentation (README, docs/*.md, design notes) appear in the
+"Documentation Context:" block, each wrapped in a `<document_source: path[:Lstart-Lend]>` marker.
+EVERY statement you take from documentation MUST carry that document's citation — do not present a
+documentation-derived claim as if it had no source.
+- ✅ `<document_source: docs/architecture.md:L12-L40>` — precise reference with section lines
+- ✅ `<document_source: README.md>` — acceptable when no line span is shown
+- ❌ Never make a claim sourced from documentation without its `<document_source: ...>` marker.
+- ❌ Never fabricate a path or line span — copy them exactly as shown in the context.
+
 **SENSITIVE DATA GUARD:**
 - Redact middle of any credential-like strings: `abcd****wxyz` and note redaction.
 """

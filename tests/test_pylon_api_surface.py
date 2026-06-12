@@ -337,3 +337,131 @@ class TestPluginNameFromMetadataText:
 
     def test_empty(self):
         assert plugin_name_from_metadata_text("") == ""
+
+
+class TestGrpcClientDetection:
+    """Tests for _match_grpc_client and extract_grpc_stub_bindings (gRPC consumers)."""
+
+    # Python ─────────────────────────────────────────────────────────────
+
+    def test_python_chained_stub(self):
+        """Chained Stub(channel).Rpc( is resolved without a binding map."""
+        from plugin_implementation.code_graph.api_surface_extractor import _match_grpc_client
+
+        text = "resp = ProductCatalogServiceStub(channel).ListProducts(req)"
+        surfaces = _match_grpc_client(text, "python")
+        assert len(surfaces) == 1
+        s = surfaces[0]
+        assert s["kind"] == "grpc"
+        assert s["metadata"]["service"] == "ProductCatalogService"
+        assert s["metadata"]["method"] == "ListProducts"
+        assert s["metadata"]["role"] == "client"
+        assert s["weight_hint"] == 0.7
+
+    def test_python_bound_stub_binding_extracted(self):
+        """Bound stub assignment populates the binding map with the service name."""
+        from plugin_implementation.code_graph.api_surface_extractor import extract_grpc_stub_bindings
+
+        bind_text = "stub = demo_pb2_grpc.CartServiceStub(channel)"
+        bindings = extract_grpc_stub_bindings(bind_text, "python")
+        assert bindings == {"stub": "CartService"}
+
+    def test_python_bound_stub_call(self):
+        """Bound stub variable resolves via an external binding map."""
+        from plugin_implementation.code_graph.api_surface_extractor import _match_grpc_client
+
+        call_text = "stub.AddItem(req)"
+        surfaces = _match_grpc_client(call_text, "python", stub_bindings={"stub": "CartService"})
+        assert any(s["metadata"]["service"] == "CartService" and s["metadata"]["method"] == "AddItem"
+                   for s in surfaces)
+
+    # Go ─────────────────────────────────────────────────────────────────
+
+    def test_go_chained_client(self):
+        """Go NewSvcClient(conn).Rpc( chained pattern."""
+        from plugin_implementation.code_graph.api_surface_extractor import _match_grpc_client
+
+        text = "res, err := pb.NewCartServiceClient(conn).AddItem(ctx, req, opts)"
+        surfaces = _match_grpc_client(text, "go")
+        assert any(s["metadata"]["service"] == "CartService" and s["metadata"]["method"] == "AddItem"
+                   for s in surfaces)
+
+    def test_go_bound_client_cross_slice(self):
+        """Go client stored in a variable resolves via binding map."""
+        from plugin_implementation.code_graph.api_surface_extractor import (
+            _match_grpc_client,
+            extract_grpc_stub_bindings,
+        )
+
+        bind_text = "cs := pb.NewCartServiceClient(conn)"
+        call_text = "cs.AddItem(ctx, req)"
+        bindings = extract_grpc_stub_bindings(bind_text, "go")
+        assert bindings == {"cs": "CartService"}
+
+        surfaces = _match_grpc_client(call_text, "go", stub_bindings=bindings)
+        assert any(s["metadata"]["service"] == "CartService" and s["metadata"]["method"] == "AddItem"
+                   for s in surfaces)
+
+    # Java ────────────────────────────────────────────────────────────────
+
+    def test_java_lowercase_rpc_normalized(self):
+        """Java call sites use lowerCamel; the linker promotes to PascalCase."""
+        from plugin_implementation.code_graph.api_surface_extractor import (
+            _match_grpc_client,
+            extract_grpc_stub_bindings,
+        )
+
+        bind_text = "blockingStub = AdServiceGrpc.newBlockingStub(channel)"
+        call_text = "blockingStub.getAd(request)"
+        bindings = extract_grpc_stub_bindings(bind_text, "java")
+        assert bindings.get("blockingStub") == "AdService"
+
+        surfaces = _match_grpc_client(call_text, "java", stub_bindings=bindings)
+        assert any(s["metadata"]["service"] == "AdService" and s["metadata"]["method"] == "GetAd"
+                   for s in surfaces), f"surfaces={surfaces}"
+
+    # Rust ────────────────────────────────────────────────────────────────
+
+    def test_rust_snake_case_rpc_normalized(self):
+        """Rust call sites use snake_case; the linker converts to PascalCase."""
+        from plugin_implementation.code_graph.api_surface_extractor import (
+            _match_grpc_client,
+            extract_grpc_stub_bindings,
+        )
+
+        bind_text = "let mut client = ShippingServiceClient::connect(addr).await?"
+        call_text = "client.ship_order(request).await?"
+        bindings = extract_grpc_stub_bindings(bind_text, "rust")
+        assert bindings.get("client") == "ShippingService"
+
+        surfaces = _match_grpc_client(call_text, "rust", stub_bindings=bindings)
+        assert any(s["metadata"]["service"] == "ShippingService" and s["metadata"]["method"] == "ShipOrder"
+                   for s in surfaces), f"surfaces={surfaces}"
+
+    # C# ──────────────────────────────────────────────────────────────────
+
+    def test_csharp_async_suffix_stripped(self):
+        """C# Async suffix is removed from the RPC name."""
+        from plugin_implementation.code_graph.api_surface_extractor import (
+            _match_grpc_client,
+            extract_grpc_stub_bindings,
+        )
+
+        bind_text = "var client = new CartServiceClient(channel)"
+        call_text = "await client.AddItemAsync(request)"
+        bindings = extract_grpc_stub_bindings(bind_text, "csharp")
+        assert bindings.get("client") == "CartService"
+
+        surfaces = _match_grpc_client(call_text, "csharp", stub_bindings=bindings)
+        assert any(s["metadata"]["service"] == "CartService" and s["metadata"]["method"] == "AddItem"
+                   for s in surfaces), f"surfaces={surfaces}"
+
+    # No-false-positive guard ─────────────────────────────────────────────
+
+    def test_no_false_positive_on_plain_method_call(self):
+        """A plain object method call without a gRPC stub binding produces no surfaces."""
+        from plugin_implementation.code_graph.api_surface_extractor import _match_grpc_client
+
+        text = "result = db.find_all(query)"
+        surfaces = _match_grpc_client(text, "python")
+        assert surfaces == [], f"Expected no surfaces, got {surfaces}"

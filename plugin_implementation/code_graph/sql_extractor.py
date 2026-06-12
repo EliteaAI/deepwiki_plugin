@@ -266,7 +266,8 @@ class _SqlGraph:
         # name (lower) → node_id
         self.tables: Dict[str, str] = {}
         self.columns: Dict[str, str] = {}     # "table.col" lower → node_id
-        self.functions: Dict[str, str] = {}   # name lower → node_id
+        self.functions: Dict[str, str] = {}
+        self.schemas: Dict[str, str] = {}     # bare_lower → sql_schema node_id (O(1) lookup)   # name lower → node_id
         # Deferred references resolved after all nodes are created.
         self._pending_fk: List[Tuple[str, str, Optional[str]]] = []   # (col_node, ref_table, ref_col)
         self._pending_view: List[Tuple[str, List[str]]] = []          # (view_node, [tables])
@@ -327,6 +328,7 @@ class _SqlGraph:
         self.graph.add_edge(
             src,
             dst,
+            key=f"sql::{rel_type}",
             relationship_type=rel_type,
             edge_class=_EDGE_CLASS,
             analysis_level=_ANALYSIS_LEVEL,
@@ -368,6 +370,7 @@ class _SqlGraph:
             nid = self._node_id("schema", rel_path, bare)
             self._add_node(nid, bare, "sql_schema", rel_path, file_path,
                            start_line, end_line, orig_stmt.strip()[:2000])
+            self.schemas[bare.lower()] = nid
             self.stats["schemas"] += 1
             return
 
@@ -487,13 +490,8 @@ class _SqlGraph:
         for src_nid, ref_table, ref_col in self._pending_fk:
             tbl_nid = self.tables.get(ref_table.lower())
             if ref_col == "__schema__":
-                # src is the table; resolve the schema node by bare name.
-                schema_nid = next(
-                    (nid for nid, d in self.graph.nodes(data=True)
-                     if d.get("symbol_type") == "sql_schema"
-                     and d.get("name", "").lower() == ref_table.lower()),
-                    None,
-                )
+                # src is the table; resolve the schema node by bare name (O(1)).
+                schema_nid = self.schemas.get(ref_table.lower())
                 if schema_nid:
                     self._add_edge(schema_nid, src_nid, "defines")
                     self.stats["defines_edges"] += 1
