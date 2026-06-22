@@ -642,6 +642,65 @@ class TestLineNumbers:
         assert "`src/file.py`" in result
 
 
+class TestDocumentSourceCitation:
+    """Tests for the <document_source> citation marker on documentation context."""
+
+    def _make_doc(self, source, content, start_line=0, end_line=0):
+        doc = MagicMock()
+        doc.page_content = content
+        doc.metadata = {
+            'source': source,
+            'file_path': source,
+            'symbol_name': source,
+            'start_line': start_line,
+            'end_line': end_line,
+            'symbol_type': 'markdown_section',
+            'chunk_type': 'documentation',
+            'is_documentation': True,
+        }
+        return doc
+
+    def _make_page_spec(self):
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+        return page_spec
+
+    def test_doc_marker_includes_line_span(self):
+        """Documentation context with a line span should emit <document_source: path:Lstart-Lend>."""
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: True
+
+        doc = self._make_doc("docs/architecture.md", "# Overview\nThe system ...", 12, 40)
+        result = OptimizedWikiGenerationAgent._format_simple_context(
+            agent, [doc], self._make_page_spec()
+        )
+        content = result["content"]
+
+        assert "<document_source: docs/architecture.md:L12-L40>" in content
+        assert "</document_source>" in content
+        # Legacy marker name must be gone.
+        assert "<documentation_source:" not in content
+
+    def test_doc_marker_without_lines(self):
+        """Documentation context without a line span should emit path-only marker."""
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: True
+
+        doc = self._make_doc("README.md", "# Project\nHello", 0, 0)
+        result = OptimizedWikiGenerationAgent._format_simple_context(
+            agent, [doc], self._make_page_spec()
+        )
+        content = result["content"]
+
+        assert "<document_source: README.md>" in content
+        assert ":L0" not in content
+
+
 # ============================================================================
 # 3.6 + 3.7 — Graph-based import extraction
 # ============================================================================
@@ -821,3 +880,112 @@ class TestAnalyzeModuleDocCounting:
             
             assert "2 code" in result
             assert "1 doc" in result
+
+
+class TestPylonApiEndpointsContext:
+    """`_format_simple_context` should render an <api_endpoints> block with
+    the deployed Pylon URL so the writer documents endpoints verbatim."""
+
+    def _make_doc(self, source, rel_path, content):
+        doc = MagicMock()
+        doc.page_content = content
+        doc.metadata = {
+            'source': source,
+            'file_path': source,
+            'rel_path': rel_path,
+            'symbol_name': 'API',
+            'start_line': 1,
+            'end_line': 8,
+            'symbol_type': 'class',
+            'chunk_type': 'code',
+        }
+        return doc
+
+    def _agent(self):
+        from plugin_implementation.agents.wiki_graph_optimized import OptimizedWikiGenerationAgent
+        agent = MagicMock(spec=OptimizedWikiGenerationAgent)
+        agent._is_documentation_file = lambda x: False
+        agent._extract_imports_for_file = lambda f, c: ""
+        agent._pylon_plugin_name_cache = None
+        # Bind the real methods under test.
+        agent._pylon_endpoints_for_file = (
+            OptimizedWikiGenerationAgent._pylon_endpoints_for_file.__get__(agent)
+        )
+        agent._resolve_pylon_plugin_name = (
+            OptimizedWikiGenerationAgent._resolve_pylon_plugin_name.__get__(agent)
+        )
+        return agent, OptimizedWikiGenerationAgent
+
+    def test_renders_deployed_url_from_plugins_path(self):
+        agent, cls = self._agent()
+        src = (
+            "class API(APIBase):\n"
+            "    url_params = ['<int:project_id>']\n"
+            "    def get(self, project_id, **kwargs): ...\n"
+            "    def post(self, project_id, **kwargs): ...\n"
+        )
+        doc = self._make_doc(
+            "pylon_main/plugins/configurations/api/v1/configurations.py",
+            "plugins/configurations/api/v1/configurations.py",
+            src,
+        )
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+
+        content = cls._format_simple_context(agent, [doc], page_spec)["content"]
+
+        assert "<api_endpoints>" in content
+        assert "[ENDPOINT] GET /api/v1/configurations/configurations/{project_id}" in content
+        assert "[ENDPOINT] POST /api/v1/configurations/configurations/{project_id}" in content
+
+    def test_non_pylon_file_has_no_block(self):
+        agent, cls = self._agent()
+        doc = self._make_doc(
+            "src/util.py", "src/util.py", "def helper():\n    return 1\n"
+        )
+        page_spec = MagicMock()
+        page_spec.target_folders = []
+        page_spec.key_files = []
+
+        content = cls._format_simple_context(agent, [doc], page_spec)["content"]
+        assert "<api_endpoints>" not in content
+
+
+class TestContentPromptFormatsWithoutKeyError:
+    """Regression: the API-ENDPOINTS instruction block must not introduce
+    unescaped ``{...}`` placeholders that break ``str.format`` at page-gen
+    time (previously raised ``KeyError: 'version'``)."""
+
+    def test_v3_tone_adjusted_template_formats(self):
+        from langchain_core.prompts import ChatPromptTemplate
+        from plugin_implementation.prompts.wiki_prompts_enhanced import (
+            ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED,
+        )
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", "You are an expert technical writer."),
+                ("human", ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED),
+            ]
+        )
+
+        # The exact kwargs supplied by _generate_simple.
+        messages = prompt.format_messages(
+            section_name="Main",
+            page_name="Type Information Endpoints",
+            page_description="desc",
+            content_focus="focus",
+            repository_url="https://example.com/repo",
+            wiki_style="comprehensive",
+            repository_context="",
+            relevant_content="<api_endpoints>\n  [ENDPOINT] GET /api/v1/x/y/{project_id}\n</api_endpoints>",
+            related_files="a.py",
+            target_audience="Mixed audience",
+        )
+
+        rendered = messages[-1].content
+        # Escaped literals must survive as single braces in the rendered text.
+        assert "/api/v{version}/{plugin_name}/{file_name}{params}" in rendered
+        # And the injected value's braces are preserved verbatim.
+        assert "[ENDPOINT] GET /api/v1/x/y/{project_id}" in rendered

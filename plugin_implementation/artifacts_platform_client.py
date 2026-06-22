@@ -6,10 +6,10 @@ MiniArtifactClient and elitea-sdk's EliteAClient use) instead of direct S3/boto3
 connections.
 
 In ELITEA, all artifact storage goes through the platform's artifact endpoints:
-    - Upload:   POST  /api/v1/artifacts/artifacts/default/{project_id}/{bucket}
-    - Download: GET   /api/v1/artifacts/artifact/default/{project_id}/{bucket}/{name}
-    - List:     GET   /api/v1/artifacts/artifacts/default/{project_id}/{bucket}
-    - Delete:   DELETE /api/v1/artifacts/artifact/default/{project_id}/{bucket}/{name}
+    - Upload:   POST  /api/v2/artifacts/artifacts/default/{project_id}/{bucket}
+    - Download: GET   /api/v2/artifacts/artifact/default/{project_id}/{bucket}/{name}
+    - List:     GET   /api/v2/artifacts/artifacts/default/{project_id}/{bucket}
+    - Delete:   DELETE /api/v2/artifacts/artifact/default/{project_id}/{bucket}/{name}
 
 The platform internally routes these to Minio/S3 with proper bucket prefixing,
 access control, and project scoping.
@@ -63,7 +63,7 @@ ARTIFACT_ENV_VARS = [
 ]
 
 DEFAULT_BUCKET = "wiki-artifacts"
-DEFAULT_API_PATH = "/api/v1"
+DEFAULT_API_PATH = "/api/v2"
 
 
 # ---------------------------------------------------------------------------

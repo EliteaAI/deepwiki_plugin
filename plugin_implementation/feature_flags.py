@@ -102,6 +102,22 @@ class FeatureFlags:
     cross_language_linking: bool = True
     #: Extract API surfaces (REST/gRPC/GraphQL/FFI/...) per node.
     api_surface_extraction: bool = True
+    #: Wire markdown document structure: synthesize ``contains`` edges from a
+    #: parent ``markdown_document`` node to its ``markdown_section`` children
+    #: and ``references`` edges from sections to the code symbols they mention
+    #: (roadmap B6/§3.5).
+    markdown_structure: bool = True
+    #: Extract SQL/DDL schema structure: parse ``.sql`` / ``.ddl`` files into
+    #: ``sql_table`` / ``sql_view`` / ``sql_column`` / ``sql_index`` /
+    #: ``sql_function`` / ``sql_trigger`` / ``sql_schema`` nodes plus
+    #: ``defines`` / ``references`` / ``triggered_by`` / ``calls`` edges
+    #: (roadmap C1/§3.1).
+    sql_extraction: bool = True
+    #: Link ORM model classes (SQLAlchemy ``Column`` / Django ``Field`` /
+    #: Hibernate ``@Entity``) to their ``sql_table`` counterparts via a
+    #: ``models_table`` cross-language edge (roadmap C4). Runs after SQL
+    #: extraction merges ``sql_table`` nodes.
+    orm_linking: bool = True
     #: Skip FTS lookups for short / generic stop-token queries.
     fts_stopword_gate: bool = True
     #: Use the tiered T1–T4 lexical cascade inside orphan resolution.

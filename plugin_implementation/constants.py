@@ -194,6 +194,9 @@ ARCHITECTURAL_SYMBOLS = frozenset({
     'type_alias',    # Type aliases (using/typedef)
     'macro',         # C/C++ preprocessor definitions
     'contract',      # API surface contracts (rest_route, grpc_service, …)
+    # SQL / DDL entity symbols (sql_extractor)
+    'sql_schema', 'sql_table', 'sql_view', 'sql_function',
+    'sql_column', 'sql_index', 'sql_trigger',
 }) | DOC_SYMBOL_TYPES  # ← every doc type passes _is_architectural_symbol()
 
 # Subset used when expanding graph context for wiki page generation.
@@ -207,6 +210,8 @@ EXPANSION_SYMBOL_TYPES = frozenset({
     'macro',         # C/C++ macros are architecturally significant
     'contract',      # API surface contracts (rest_route, grpc_service, …)
     'module_doc', 'file_doc',
+    # SQL / DDL entity symbols (sql_extractor)
+    'sql_schema', 'sql_table', 'sql_view', 'sql_function',
 })
 
 # =============================================================================
@@ -222,6 +227,8 @@ PAGE_IDENTITY_SYMBOLS = frozenset({
     'enum', 'struct', 'record',
     'module', 'namespace',
     'function',
+    # SQL / DDL entities that can anchor a page
+    'sql_table', 'sql_view', 'sql_function',
 })
 
 # Symbols that support page content but do not drive page identity
@@ -229,6 +236,8 @@ PAGE_IDENTITY_SYMBOLS = frozenset({
 SUPPORTING_CODE_SYMBOLS = frozenset({
     'constant', 'type_alias', 'macro',
     'method', 'property',
+    # SQL / DDL supporting members
+    'sql_column', 'sql_index', 'sql_trigger', 'sql_schema',
 })
 
 # Documentation symbol kinds used for docs-only page detection.
@@ -281,6 +290,9 @@ SYMBOL_TYPE_PRIORITY = {
     'constant': 6, 'type_alias': 6, 'macro': 6,
     'contract': 5,
     'method': 3, 'property': 2,
+    # SQL / DDL entities — tables/views anchor like structs; functions like funcs.
+    'sql_table': 9, 'sql_view': 9, 'sql_schema': 8, 'sql_function': 7,
+    'sql_index': 3, 'sql_trigger': 3, 'sql_column': 2,
     # Doc symbols — must cover every DOC_CLUSTER_SYMBOLS member.
     'markdown_document': 1,
     'markdown_section': 1,
@@ -309,6 +321,9 @@ CODE_SYMBOL_TYPES = frozenset({
     'constant',
     'type_alias',
     'macro',         # C/C++ macros are architecturally significant
+    # SQL / DDL entities
+    'sql_schema', 'sql_table', 'sql_view', 'sql_function',
+    'sql_column', 'sql_index', 'sql_trigger',
 })
 
 # =============================================================================

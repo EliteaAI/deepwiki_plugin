@@ -180,6 +180,10 @@ class OptimizedWikiGenerationAgent:
         # all pages in a single wiki generation run.
         self._cluster_db_path: Optional[str] = None
         self._cluster_db: Optional[UnifiedWikiDB] = None
+
+        # Pylon plugin name cache: populated on first metadata.json lookup
+        # for repos where the path has no ``plugins/<name>/`` segment.
+        self._pylon_plugin_name_cache: Optional[str] = None
         
         # Log component initialization for debugging
         logger.info(f"OptimizedWikiGenerationAgent initialized with:")
@@ -3375,7 +3379,10 @@ class OptimizedWikiGenerationAgent:
         
         documents = []
         for score, file_path, node_data, content, symbol_type in doc_candidates[:max_docs]:
-            # Build metadata
+            # Build metadata. Propagate line span (when present, e.g. for
+            # markdown_section nodes) so the writer can render a
+            # <document_source: path:Lstart-Lend> citation anchored to the
+            # real document — not just the file path.
             metadata = {
                 'source': file_path,
                 'symbol': node_data.get('symbol_name', '') or node_data.get('name', file_path),
@@ -3386,6 +3393,8 @@ class OptimizedWikiGenerationAgent:
                 'graph_retrieved': True,
                 'is_documentation': True,
                 'relevance_score': score,
+                'start_line': node_data.get('start_line', 0) or 0,
+                'end_line': node_data.get('end_line', 0) or 0,
             }
             
             doc = Document(page_content=content, metadata=metadata)
@@ -4812,10 +4821,72 @@ class OptimizedWikiGenerationAgent:
 
         return included
 
+    def _resolve_pylon_plugin_name(self, rel_path: str) -> str:
+        """Resolve the Pylon plugin mount name for a file.
+
+        Prefers the ``plugins/<name>/`` path segment (works for monorepo
+        layouts like ``pylon_main/plugins/configurations/...``); falls
+        back to the repo's ``metadata.json`` ``name`` field (single-plugin
+        repos where the path has no ``plugins/`` segment). Result is
+        cached per repo. Returns ``""`` when nothing usable is found.
+        """
+        if rel_path:
+            m = re.search(r"(?:^|/)plugins/([^/]+)/", rel_path)
+            if m:
+                return m.group(1)
+        # Repo-level metadata.json fallback (cached).
+        cached = self._pylon_plugin_name_cache
+        if cached is not None:
+            return cached
+        plugin_name = ""
+        try:
+            from ..code_graph.api_surface_extractor import (
+                plugin_name_from_metadata_text,
+            )
+            repo_root_getter = getattr(self.indexer, "get_repo_root", None)
+            repo_root = repo_root_getter() if callable(repo_root_getter) else None
+            if repo_root:
+                from pathlib import Path as _Path
+                meta = _Path(repo_root) / "metadata.json"
+                if meta.is_file():
+                    plugin_name = plugin_name_from_metadata_text(
+                        meta.read_text(encoding="utf-8", errors="ignore")
+                    )
+        except Exception:
+            plugin_name = ""
+        self._pylon_plugin_name_cache = plugin_name
+        return plugin_name
+
+    def _pylon_endpoints_for_file(
+        self, file_path: str, file_docs: List[Any], combined_content: str
+    ) -> List[str]:
+        """Derive deployed Pylon REST endpoints for the symbols of one file.
+
+        Returns ``[]`` for non-Pylon files. Used to ground the writer in
+        the *actual* deployed URL (e.g.
+        ``/api/v1/configurations/configurations/{project_id}``) so it does
+        not hallucinate a REST-ish path from a method parameter name.
+        """
+        try:
+            from ..code_graph.api_surface_extractor import derive_pylon_endpoints
+        except Exception:
+            return []
+        rel_path = file_path
+        for doc in file_docs:
+            rp = doc.metadata.get("rel_path")
+            if rp:
+                rel_path = rp
+                break
+        plugin_name = self._resolve_pylon_plugin_name(rel_path)
+        try:
+            return derive_pylon_endpoints(rel_path, combined_content, plugin_name)
+        except Exception:
+            return []
+
     def _format_simple_context(self, relevant_docs: List[Any], page_spec: PageSpec) -> Dict[str, Any]:
         """
         Format context using SIMPLE MODE (all documents fit within token budget).
-        
+
         Uses all documents with full content - preserves current system behavior.
         No compression, no tiering, straightforward context building.
         Applied when total context tokens <= CONTEXT_TOKEN_BUDGET (50K).
@@ -4869,9 +4940,19 @@ class OptimizedWikiGenerationAgent:
             for doc in documentation_docs:  # Include ALL documentation files
                 source = doc.metadata.get('source', 'unknown')
                 content = doc.page_content  # FULL content (no truncation)
-                context_parts.append(f"<documentation_source: {source}>")
+                # Anchor the citation to the real document. When the node
+                # carries a line span (markdown_section nodes do), include it
+                # so the writer can cite <document_source: path:Lstart-Lend>.
+                start = doc.metadata.get('start_line', 0) or 0
+                end = doc.metadata.get('end_line', 0) or 0
+                # Only include line numbers if both are positive (0 means unknown/unset)
+                if start > 0 and end > 0:
+                    marker = f"<document_source: {source}:L{start}-L{end}>"
+                else:
+                    marker = f"<document_source: {source}>"
+                context_parts.append(marker)
                 context_parts.append(content)
-                context_parts.append("</documentation_source>")
+                context_parts.append("</document_source>")
             context_parts.append("")
 
         # Code context section - include ALL files (no truncation)
@@ -4891,7 +4972,19 @@ class OptimizedWikiGenerationAgent:
                 imports = self._extract_imports_for_file(file_path, combined_content)
                 
                 context_parts.append(f"<code_source: {file_path}>")
-                
+
+                # Deployed REST endpoints (Pylon). Ground the writer in the
+                # ACTUAL deploy-time URL so it documents endpoints verbatim
+                # instead of inventing a REST-ish path from a parameter name.
+                api_endpoints = self._pylon_endpoints_for_file(
+                    file_path, file_docs, combined_content
+                )
+                if isinstance(api_endpoints, list) and api_endpoints:
+                    context_parts.append("<api_endpoints>")
+                    for ep in api_endpoints:
+                        context_parts.append(f"  [ENDPOINT] {ep}")
+                    context_parts.append("</api_endpoints>")
+
                 # Add per-symbol line annotations — use visible markers (not HTML
                 # comments) so the LLM reliably picks them up for citations.
                 line_annotations = []

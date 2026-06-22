@@ -283,4 +283,16 @@ def collect_orphan_embeddings(
 __all__ = [
     "resolve_orphans_explicit_refs",
     "collect_orphan_embeddings",
+    # Public aliases for the helper functions used by markdown_structure.
+    # The originals carry a leading underscore (module-private convention)
+    # but are consumed by markdown_structure, so we export them here to
+    # make the dependency explicit and stable against renames.
+    "build_path_index",
+    "build_simple_name_index",
+    "resolve_doc_orphan_links",
 ]
+
+# Public re-exports of the private helpers above.
+build_path_index = _build_path_index
+build_simple_name_index = _build_simple_name_index
+resolve_doc_orphan_links = _resolve_doc_orphan_links

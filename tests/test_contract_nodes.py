@@ -17,7 +17,11 @@ import networkx as nx
 from plugin_implementation.code_graph.api_surface_extractor import (
     APISurface,
     _match_grpc,
+    _match_grpc_client,
     _match_rest_typescript,
+    extract_api_surfaces,
+    extract_api_surfaces_for_graph,
+    extract_grpc_stub_bindings,
     materialize_contract_nodes,
     _contract_node_id,
 )
@@ -488,3 +492,505 @@ class TestConsumesRole:
         assert attrs["relationship_type"] == "cross_language_L1"
         assert attrs["edge_class"] == "cross_language"
 
+
+# ─── 8. Phase B3: multi-language gRPC consumer (client) detection ────────
+
+# Real call-site shapes taken verbatim (modulo whitespace) from
+# GoogleCloudPlatform/microservices-demo so the matcher is pinned against
+# production code rather than synthetic stubs.
+
+class TestGrpcClientMatcher:
+    """Unit-level coverage of ``_match_grpc_client`` per language.
+
+    The proto-canonical RPC name (PascalCase) is what the server-side
+    matcher emits, so each client surface must normalise to it — otherwise
+    consumer and provider would never dedupe onto a shared contract node.
+    """
+
+    def test_go_chained_construct_and_call(self):
+        # frontend/rpc.go: pb.NewProductCatalogServiceClient(conn).ListProducts(...)
+        text = (
+            "resp, err := pb.NewProductCatalogServiceClient(fe.productCatalogSvcConn)"
+            ".ListProducts(ctx, &pb.Empty{})"
+        )
+        surfaces = _match_grpc_client(text, "go")
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:ProductCatalogService/ListProducts"
+        }
+        assert all(s["metadata"]["role"] == "client" for s in surfaces)
+
+    def test_go_chained_call_on_next_line(self):
+        # frontend/handlers.go: constructor and RPC split across lines.
+        text = (
+            "order, err := pb.NewCheckoutServiceClient(fe.checkoutSvcConn).\n"
+            "\t\tPlaceOrder(ctx, req)"
+        )
+        surfaces = _match_grpc_client(text, "go")
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:CheckoutService/PlaceOrder"
+        }
+
+    def test_go_generated_stub_definition_not_matched(self):
+        """The generated ``func New<Svc>Client`` definition and the stub's
+        own method definitions must never be mistaken for consumer calls."""
+        text = (
+            "func NewCartServiceClient(cc grpc.ClientConnInterface) CartServiceClient {\n"
+            "\treturn &cartServiceClient{cc}\n"
+            "}\n"
+            "func (c *cartServiceClient) AddItem(ctx context.Context) {}\n"
+        )
+        assert _match_grpc_client(text, "go") == []
+
+    def test_python_bound_stub_resolves_call(self):
+        # recommendationservice: module-scope bind + in-method call.
+        bindings = extract_grpc_stub_bindings(
+            "product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)",
+            "python",
+        )
+        assert bindings == {"product_catalog_stub": "ProductCatalogService"}
+        call_text = "        response = product_catalog_stub.ListProducts(demo_pb2.Empty())"
+        surfaces = _match_grpc_client(call_text, "python", bindings)
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:ProductCatalogService/ListProducts"
+        }
+        assert surfaces[0]["metadata"]["role"] == "client"
+
+    def test_java_lowercamel_call_normalises_to_pascal(self):
+        # adservice/AdServiceClient.java: blockingStub.getAds(...)
+        bindings = extract_grpc_stub_bindings(
+            "blockingStub = AdServiceGrpc.newBlockingStub(channel);", "java"
+        )
+        assert bindings == {"blockingStub": "AdService"}
+        surfaces = _match_grpc_client(
+            "AdResponse response = blockingStub.getAds(request);", "java", bindings
+        )
+        assert {s["surface"] for s in surfaces} == {"grpc:AdService/GetAds"}
+
+    def test_java_type_declaration_binds_stub(self):
+        """The field type decl alone is enough to bind the variable."""
+        bindings = extract_grpc_stub_bindings(
+            "private AdServiceGrpc.AdServiceBlockingStub blockingStub;", "java"
+        )
+        assert bindings.get("blockingStub") == "AdService"
+
+    def test_csharp_strips_async_suffix(self):
+        # cartservice/tests: cartClient.GetCartAsync(request)
+        bindings = extract_grpc_stub_bindings(
+            "var cartClient = new CartServiceClient(channel);", "csharp"
+        )
+        assert bindings == {"cartClient": "CartService"}
+        surfaces = _match_grpc_client(
+            "var cart = await cartClient.GetCartAsync(request);", "csharp", bindings
+        )
+        assert {s["surface"] for s in surfaces} == {"grpc:CartService/GetCart"}
+
+    def test_unbound_call_site_is_ignored(self):
+        """A method call on a variable with no stub binding must not emit."""
+        assert _match_grpc_client("logger.Info(\"hi\")", "go") == []
+        assert _match_grpc_client("self.helper.compute(x)", "python") == []
+
+
+def _grpc_server_client_graph(server_lang, server_text, client_lang, client_text):
+    """Two-node graph: a gRPC provider + a consumer in another language."""
+    g = nx.MultiDiGraph()
+    g.add_node("server", symbol_name="ServiceImpl", symbol_type="class",
+               rel_path=f"server.{server_lang}", file_name=f"server.{server_lang}",
+               language=server_lang, start_line=1, end_line=40,
+               source_text=server_text)
+    g.add_node("client", symbol_name="ClientCaller", symbol_type="function",
+               rel_path=f"client.{client_lang}", file_name=f"client.{client_lang}",
+               language=client_lang, start_line=1, end_line=40,
+               source_text=client_text)
+    return g
+
+
+class TestGrpcConsumesIntegration:
+    """End-to-end: orchestrator extraction → contract materialization, with a
+    provider and a consumer landing on the *same* contract node via
+    ``defines`` and ``consumes`` edges respectively."""
+
+    def _assert_defines_and_consumes(self, g, surface):
+        surfaces = extract_api_surfaces_for_graph(g)
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("grpc", surface)
+        assert g.has_node(nid), f"missing contract node for {surface}"
+        # Provider → defines
+        server_edges = [d for _, v, d in g.edges("server", data=True) if v == nid]
+        assert server_edges, "provider produced no edge into the contract"
+        assert any(d["relationship_type"] == "defines" for d in server_edges)
+        # Consumer → consumes
+        client_edges = [d for _, v, d in g.edges("client", data=True) if v == nid]
+        assert client_edges, "consumer produced no edge into the contract"
+        assert any(d["relationship_type"] == "consumes" for d in client_edges)
+        return nid
+
+    def test_go_consumer_links_to_go_provider(self):
+        server = (
+            "type CartServiceServer interface {\n"
+            "    AddItem(context.Context, *AddItemRequest) (*Empty, error)\n"
+            "}\n"
+        )
+        client = (
+            "func (fe *frontendServer) addToCart(ctx context.Context) error {\n"
+            "    _, err := pb.NewCartServiceClient(fe.cartSvcConn).AddItem(ctx, req)\n"
+            "    return err\n"
+            "}\n"
+        )
+        g = _grpc_server_client_graph("go", server, "go", client)
+        self._assert_defines_and_consumes(g, "grpc:CartService/AddItem")
+
+    def test_java_consumer_links_to_java_provider(self):
+        server = (
+            "public class AdServiceImpl extends AdServiceGrpc.AdServiceImplBase {\n"
+            "    @Override public void getAds(AdRequest r, StreamObserver<AdResponse> o) {}\n"
+            "}\n"
+        )
+        client = (
+            "AdServiceGrpc.AdServiceBlockingStub blockingStub = "
+            "AdServiceGrpc.newBlockingStub(channel);\n"
+            "AdResponse response = blockingStub.getAds(request);\n"
+        )
+        g = _grpc_server_client_graph("java", server, "java", client)
+        self._assert_defines_and_consumes(g, "grpc:AdService/GetAds")
+
+    def test_csharp_consumer_links_to_csharp_provider(self):
+        server = (
+            "public class CartServiceImpl : CartService.CartServiceBase {\n"
+            "    public override Task<Cart> GetCart(GetCartRequest r, "
+            "ServerCallContext c) {}\n"
+            "}\n"
+        )
+        client = (
+            "var cartClient = new CartServiceClient(channel);\n"
+            "var cart = await cartClient.GetCartAsync(request);\n"
+        )
+        g = _grpc_server_client_graph("csharp", server, "csharp", client)
+        self._assert_defines_and_consumes(g, "grpc:CartService/GetCart")
+
+    def test_python_cross_slice_consumer(self, tmp_path):
+        """The Python binding lives in a different symbol/slice than the call,
+        so the orchestrator must read the *whole file* via ``repo_root`` to
+        resolve the stub variable. Mirrors recommendationservice."""
+        src = (
+            "import demo_pb2\n"
+            "import demo_pb2_grpc\n"
+            "\n"
+            "channel = grpc.insecure_channel('localhost:3550')\n"
+            "product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)\n"
+            "\n"
+            "class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):\n"
+            "    def ListRecommendations(self, request, context):\n"
+            "        response = product_catalog_stub.ListProducts(demo_pb2.Empty())\n"
+            "        return response\n"
+        )
+        repo_root = tmp_path
+        (repo_root / "recommendation_server.py").write_text(src, encoding="utf-8")
+
+        g = nx.MultiDiGraph()
+        # Provider node: the gRPC servicer (a different proto service).
+        g.add_node(
+            "provider", symbol_name="ProductCatalogServiceServicer",
+            symbol_type="class", rel_path="product_catalog_server.py",
+            file_name="product_catalog_server.py", language="python",
+            start_line=1, end_line=20,
+            source_text=(
+                "class ProductCatalogServiceServicer(object):\n"
+                "    def ListProducts(self, request, context):\n"
+                "        pass\n"
+            ),
+        )
+        # Consumer node: ONLY the method body (binding is in another slice).
+        g.add_node(
+            "consumer", symbol_name="ListRecommendations", symbol_type="method",
+            rel_path="recommendation_server.py", file_name="recommendation_server.py",
+            language="python", start_line=8, end_line=10,
+            source_text=(
+                "    def ListRecommendations(self, request, context):\n"
+                "        response = product_catalog_stub.ListProducts(demo_pb2.Empty())\n"
+                "        return response\n"
+            ),
+        )
+
+        surfaces = extract_api_surfaces_for_graph(g, repo_root=str(repo_root))
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("grpc", "grpc:ProductCatalogService/ListProducts")
+        assert g.has_node(nid)
+        provider_edges = [d for _, v, d in g.edges("provider", data=True) if v == nid]
+        assert any(d["relationship_type"] == "defines" for d in provider_edges)
+        consumer_edges = [d for _, v, d in g.edges("consumer", data=True) if v == nid]
+        assert consumer_edges, "cross-slice consumer failed to resolve the stub"
+        assert any(d["relationship_type"] == "consumes" for d in consumer_edges)
+
+    def test_python_consumer_without_repo_root_does_not_resolve_cross_slice(self):
+        """Without ``repo_root`` the file-level binding pre-pass can't run, so
+        a call site whose binding lives in another slice yields no surface —
+        documents why the orchestrator pre-pass is required."""
+        g = nx.MultiDiGraph()
+        g.add_node(
+            "consumer", symbol_name="ListRecommendations", symbol_type="method",
+            rel_path="recommendation_server.py", file_name="recommendation_server.py",
+            language="python", start_line=8, end_line=10,
+            source_text=(
+                "    def ListRecommendations(self, request, context):\n"
+                "        response = product_catalog_stub.ListProducts(demo_pb2.Empty())\n"
+                "        return response\n"
+            ),
+        )
+        surfaces = extract_api_surfaces_for_graph(g)  # no repo_root
+        assert "consumer" not in surfaces
+
+    def test_consumes_edge_carries_dispatch_via(self):
+        """The consumes edge records the RPC method in its ``via`` trail."""
+        server = (
+            "type CartServiceServer interface {\n"
+            "    AddItem(context.Context, *AddItemRequest) (*Empty, error)\n"
+            "}\n"
+        )
+        client = (
+            "func f() { pb.NewCartServiceClient(conn).AddItem(ctx, req) }\n"
+        )
+        g = _grpc_server_client_graph("go", server, "go", client)
+        surfaces = extract_api_surfaces_for_graph(g)
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("grpc", "grpc:CartService/AddItem")
+        client_edges = [d for _, v, d in g.edges("client", data=True) if v == nid]
+        via = client_edges[0].get("annotations", {}).get("via", [])
+        assert "dispatch=AddItem" in via
+
+
+# ─── 9. Phase B3 (rich parsers): TypeScript/JS, C++, Rust gRPC consumers ─
+
+class TestGrpcClientMatcherRichLangs:
+    """``_match_grpc_client`` coverage for the remaining rich-parser
+    languages: JavaScript/TypeScript (grpc-js), C++ (gRPC ``NewStub``) and
+    Rust (tonic). Each must normalise its call-site method name to the
+    proto-canonical PascalCase the server matchers emit."""
+
+    def test_typescript_camelcase_call_normalises_to_pascal(self):
+        # grpc-js: new pkg.<Svc>Client(addr, creds); client.listProducts(...)
+        bindings = extract_grpc_stub_bindings(
+            "const client = new shop.ProductCatalogServiceClient(addr, creds);",
+            "typescript",
+        )
+        assert bindings == {"client": "ProductCatalogService"}
+        surfaces = _match_grpc_client(
+            "client.listProducts(req, (err, res) => {});", "typescript", bindings
+        )
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:ProductCatalogService/ListProducts"
+        }
+        assert surfaces[0]["metadata"]["role"] == "client"
+
+    def test_javascript_shares_typescript_path(self):
+        bindings = extract_grpc_stub_bindings(
+            "const c = new demo.CartServiceClient(addr, creds);", "javascript"
+        )
+        surfaces = _match_grpc_client("c.getCart(req, cb);", "javascript", bindings)
+        assert {s["surface"] for s in surfaces} == {"grpc:CartService/GetCart"}
+
+    def test_cpp_newstub_bind_and_arrow_call(self):
+        # auto stub = <Svc>::NewStub(channel); stub->ListProducts(...)
+        text = (
+            "auto stub = ProductCatalogService::NewStub(channel);\n"
+            "Status s = stub->ListProducts(&ctx, req, &resp);\n"
+        )
+        surfaces = _match_grpc_client(text, "cpp")
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:ProductCatalogService/ListProducts"
+        }
+        assert surfaces[0]["metadata"]["role"] == "client"
+
+    def test_cpp_unique_ptr_type_declaration_binds_stub(self):
+        text = (
+            "std::unique_ptr<CartService::Stub> cart = CartService::NewStub(ch);\n"
+            "cart->GetCart(&ctx, req, &resp);\n"
+        )
+        surfaces = _match_grpc_client(text, "cpp")
+        assert {s["surface"] for s in surfaces} == {"grpc:CartService/GetCart"}
+
+    def test_rust_snake_case_call_normalises_to_pascal(self):
+        # tonic: let mut c = <Svc>Client::connect(addr); c.list_products(req)
+        text = (
+            "let mut client = ProductCatalogServiceClient::connect(addr).await?;\n"
+            "let resp = client.list_products(request).await?;\n"
+        )
+        surfaces = _match_grpc_client(text, "rust")
+        assert {s["surface"] for s in surfaces} == {
+            "grpc:ProductCatalogService/ListProducts"
+        }
+        assert surfaces[0]["metadata"]["role"] == "client"
+
+    def test_rust_new_constructor_binds_stub(self):
+        text = (
+            "let mut cart = CartServiceClient::new(channel);\n"
+            "cart.get_cart(req).await?;\n"
+        )
+        surfaces = _match_grpc_client(text, "rust")
+        assert {s["surface"] for s in surfaces} == {"grpc:CartService/GetCart"}
+
+    def test_cpp_unbound_arrow_call_is_ignored(self):
+        assert _match_grpc_client("stub->ListProducts(&ctx, req, &resp);", "cpp") == []
+
+    def test_rust_unbound_call_is_ignored(self):
+        assert _match_grpc_client("client.list_products(request).await?;", "rust") == []
+
+
+def _assert_grpc_defines_and_consumes(g, surface):
+    """Module-level mirror of the integration assert (no inheritance, so the
+    parent class's tests aren't re-collected under this class)."""
+    surfaces = extract_api_surfaces_for_graph(g)
+    materialize_contract_nodes(g, surfaces)
+    nid = _contract_node_id("grpc", surface)
+    assert g.has_node(nid), f"missing contract node for {surface}"
+    server_edges = [d for _, v, d in g.edges("server", data=True) if v == nid]
+    assert server_edges, "provider produced no edge into the contract"
+    assert any(d["relationship_type"] == "defines" for d in server_edges)
+    client_edges = [d for _, v, d in g.edges("client", data=True) if v == nid]
+    assert client_edges, "consumer produced no edge into the contract"
+    assert any(d["relationship_type"] == "consumes" for d in client_edges)
+    return nid
+
+
+class TestGrpcConsumesIntegrationRichLangs:
+    """End-to-end provider+consumer dedupe for the rich-parser languages,
+    reusing the same orchestrator → materialize assertions."""
+
+    def test_typescript_consumer_links_to_ts_provider(self):
+        server = (
+            "server.addService(shop.ProductCatalogService.service, {\n"
+            "    listProducts: listProductsHandler,\n"
+            "});\n"
+        )
+        client = (
+            "const client = new shop.ProductCatalogServiceClient(addr, creds);\n"
+            "client.listProducts(req, (err, res) => {});\n"
+        )
+        g = _grpc_server_client_graph("typescript", server, "typescript", client)
+        _assert_grpc_defines_and_consumes(g, "grpc:ProductCatalogService/ListProducts")
+
+    def test_cpp_consumer_links_to_cpp_provider(self):
+        server = (
+            "class CartServiceImpl final : public CartService::Service {\n"
+            "    Status GetCart(ServerContext* c, const Req* r, Resp* w) override {}\n"
+            "};\n"
+        )
+        client = (
+            "auto stub = CartService::NewStub(channel);\n"
+            "Status s = stub->GetCart(&ctx, req, &resp);\n"
+        )
+        g = _grpc_server_client_graph("cpp", server, "cpp", client)
+        _assert_grpc_defines_and_consumes(g, "grpc:CartService/GetCart")
+
+    def test_rust_consumer_links_to_rust_provider(self):
+        server = (
+            "#[tonic::async_trait]\n"
+            "impl CartService for MyCart {\n"
+            "    async fn get_cart(&self, request: Request<Req>) "
+            "-> Result<Response<Resp>, Status> {}\n"
+            "}\n"
+        )
+        client = (
+            "let mut cart = CartServiceClient::connect(addr).await?;\n"
+            "let resp = cart.get_cart(request).await?;\n"
+        )
+        g = _grpc_server_client_graph("rust", server, "rust", client)
+        _assert_grpc_defines_and_consumes(g, "grpc:CartService/GetCart")
+
+
+
+# ─── Contract-edge provenance (language / confidence / obj_kind) ─────────
+
+class TestContractEdgeProvenance:
+    """Phase-2 follow-up: the contract edge must carry the three fields that
+    were previously dropped — ``language`` (first-class repo_edges column),
+    ``confidence`` and ``obj_kind`` (in the annotations blob)."""
+
+    def test_defines_edge_carries_language(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="rest_route", surface="POST /api/users",
+                weight_hint=0.8, metadata={"method": "POST", "path": "/api/users"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        d = next(d for _, v, d in g.edges("py_handler", data=True) if v == nid)
+        # owner py_handler.language == "python"
+        assert d["language"] == "python"
+
+    def test_consumes_edge_carries_language(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "ts_client": [APISurface(
+                kind="rest_route", surface="POST /api/users", weight_hint=0.7,
+                metadata={"method": "POST", "path": "/api/users", "role": "client"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        d = next(d for _, v, d in g.edges("ts_client", data=True) if v == nid)
+        assert d["language"] == "typescript"
+
+    def test_defines_edge_confidence_is_extracted(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="rest_route", surface="POST /api/users", weight_hint=0.8,
+                metadata={"method": "POST", "path": "/api/users", "role": "server"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        d = next(d for _, v, d in g.edges("py_handler", data=True) if v == nid)
+        assert d["annotations"]["confidence"] == "EXTRACTED"
+
+    def test_consumes_edge_confidence_is_inferred(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "ts_client": [APISurface(
+                kind="rest_route", surface="POST /api/users", weight_hint=0.7,
+                metadata={"method": "POST", "path": "/api/users", "role": "client"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        d = next(d for _, v, d in g.edges("ts_client", data=True) if v == nid)
+        assert d["annotations"]["confidence"] == "INFERRED"
+
+    def test_edge_obj_kind_matches_contract_kind(self):
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "py_handler": [APISurface(
+                kind="grpc", surface="grpc:UserSvc/Get",
+                weight_hint=0.8, metadata={"service": "UserSvc", "method": "Get"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("grpc", "grpc:UserSvc/Get")
+        d = next(d for _, v, d in g.edges("py_handler", data=True) if v == nid)
+        assert d["annotations"]["obj_kind"] == "grpc"
+
+    def test_confidence_round_trips_through_query_helper(self):
+        """graph_query_service._edge_confidence must read back the label the
+        materializer stashed in the annotations blob (the canonical channel —
+        repo_edges has no confidence column)."""
+        from plugin_implementation.code_graph.graph_query_service import (
+            _edge_confidence,
+        )
+        import json
+
+        g = _make_graph_with_surfaces()
+        surfaces = {
+            "ts_client": [APISurface(
+                kind="rest_route", surface="POST /api/users", weight_hint=0.7,
+                metadata={"method": "POST", "path": "/api/users", "role": "client"},
+            )],
+        }
+        materialize_contract_nodes(g, surfaces)
+        nid = _contract_node_id("rest_route", "POST /api/users")
+        d = next(d for _, v, d in g.edges("ts_client", data=True) if v == nid)
+        assert _edge_confidence(d) == "INFERRED"
+        # Also survives the JSON-string form the storage backend produces.
+        serialized = {"annotations": json.dumps(d["annotations"])}
+        assert _edge_confidence(serialized) == "INFERRED"
