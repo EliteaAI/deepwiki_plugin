@@ -263,11 +263,12 @@ class _SqlGraph:
         self.graph = nx.MultiDiGraph()
         self.graph.graph["language"] = _LANGUAGE
         self.graph.graph["analysis_level"] = _ANALYSIS_LEVEL
-        # name (lower) → node_id
+        # name (lower) → node_id; stores both qualified (schema.table) and bare names
         self.tables: Dict[str, str] = {}
         self.columns: Dict[str, str] = {}     # "table.col" lower → node_id
         self.functions: Dict[str, str] = {}
-        self.schemas: Dict[str, str] = {}     # bare_lower → sql_schema node_id (O(1) lookup)   # name lower → node_id
+        self.schemas: Dict[str, str] = {}     # bare_lower → sql_schema node_id (O(1) lookup)
+        self.qualified_tables: Dict[str, str] = {}  # "schema.table" lower → node_id (for schema-qualified refs)
         # Deferred references resolved after all nodes are created.
         self._pending_fk: List[Tuple[str, str, Optional[str]]] = []   # (col_node, ref_table, ref_col)
         self._pending_view: List[Tuple[str, List[str]]] = []          # (view_node, [tables])
@@ -384,10 +385,16 @@ class _SqlGraph:
         m = _RE_VIEW.match(stmt)
         if m:
             schema, bare = _split_qualified(m.group("name"))
-            nid = self._node_id("view", rel_path, bare)
+            # Use qualified name in node ID to avoid collisions with same view names in different schemas.
+            qualified = f"{schema}.{bare}" if schema else bare
+            nid = self._node_id("view", rel_path, qualified)
             self._add_node(nid, bare, "sql_view", rel_path, file_path,
                            start_line, end_line, orig_stmt.strip()[:2000])
-            self.tables[bare.lower()] = nid  # views are FROM-able like tables
+            # Store by qualified name for disambiguation; views are FROM-able like tables.
+            self.qualified_tables[qualified.lower()] = nid
+            # Store by bare name only if not already present (first occurrence wins).
+            if bare.lower() not in self.tables:
+                self.tables[bare.lower()] = nid
             self.stats["views"] += 1
             refs = [_split_qualified(t.group("table"))[1]
                     for t in _RE_FROM_JOIN.finditer(m.group("query"))]
@@ -433,10 +440,18 @@ class _SqlGraph:
 
     def _handle_table(self, m, rel_path, file_path, start_line, end_line, orig_stmt):
         schema, bare = _split_qualified(m.group("name"))
-        tbl_nid = self._node_id("table", rel_path, bare)
+        # Use qualified name in node ID when schema is present to avoid collisions
+        # (e.g., tenant_a.users and tenant_b.users are different tables).
+        qualified = f"{schema}.{bare}" if schema else bare
+        tbl_nid = self._node_id("table", rel_path, qualified)
         self._add_node(tbl_nid, bare, "sql_table", rel_path, file_path,
                        start_line, end_line, orig_stmt.strip()[:4000])
-        self.tables[bare.lower()] = tbl_nid
+        # Store by qualified name for disambiguation when resolving schema-qualified refs.
+        self.qualified_tables[qualified.lower()] = tbl_nid
+        # Store by bare name only if not already present (first occurrence wins)
+        # to avoid overwrites when multiple schemas have the same table name.
+        if bare.lower() not in self.tables:
+            self.tables[bare.lower()] = tbl_nid
         self.stats["tables"] += 1
 
         # schema → table (defines), if schema named and present later
@@ -478,7 +493,8 @@ class _SqlGraph:
             # Inline REFERENCES (FK)
             ref = _RE_REFERENCES.search(part)
             if ref:
-                _, ref_tbl = _split_qualified(ref.group("table"))
+                # Preserve qualified table name for disambiguation in resolve()
+                ref_tbl = ref.group("table")  # may be "schema.table" or "table"
                 ref_col = ref.group("col")
                 ref_col = _split_qualified(ref_col)[1] if ref_col else None
                 self._pending_fk.append((col_nid, ref_tbl, ref_col))
@@ -488,10 +504,13 @@ class _SqlGraph:
         # schema→table, table→index, column FKs (all share the _pending_fk list,
         # discriminated by the sentinel ref_col value).
         for src_nid, ref_table, ref_col in self._pending_fk:
-            tbl_nid = self.tables.get(ref_table.lower())
+            # Extract bare name for fallback lookups (e.g., "users" from "schema.users")
+            _, bare_table = _split_qualified(ref_table)
+            # Try qualified lookup first, then bare-name fallback
+            tbl_nid = self.qualified_tables.get(ref_table.lower()) or self.tables.get(bare_table.lower())
             if ref_col == "__schema__":
                 # src is the table; resolve the schema node by bare name (O(1)).
-                schema_nid = self.schemas.get(ref_table.lower())
+                schema_nid = self.schemas.get(bare_table.lower())
                 if schema_nid:
                     self._add_edge(schema_nid, src_nid, "defines")
                     self.stats["defines_edges"] += 1
@@ -505,7 +524,7 @@ class _SqlGraph:
             # Foreign key: column → column, else column → table.
             target = None
             if ref_col:
-                target = self.columns.get(f"{ref_table}.{ref_col}".lower())
+                target = self.columns.get(f"{bare_table}.{ref_col}".lower())
             if target is None:
                 target = tbl_nid
             if target is not None:

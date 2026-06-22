@@ -4945,7 +4945,8 @@ class OptimizedWikiGenerationAgent:
                 # so the writer can cite <document_source: path:Lstart-Lend>.
                 start = doc.metadata.get('start_line', 0) or 0
                 end = doc.metadata.get('end_line', 0) or 0
-                if start and end:
+                # Only include line numbers if both are positive (0 means unknown/unset)
+                if start > 0 and end > 0:
                     marker = f"<document_source: {source}:L{start}-L{end}>"
                 else:
                     marker = f"<document_source: {source}>"

@@ -45,7 +45,10 @@ class TestSnakeCase:
         assert _to_snake_case("User") == "user"
 
     def test_acronym_run(self):
-        assert _to_snake_case("APIKey") == "a_p_i_key"
+        # Consecutive capitals should be treated as a unit, not split individually
+        assert _to_snake_case("APIKey") == "api_key"
+        assert _to_snake_case("HTTPSConnection") == "https_connection"
+        assert _to_snake_case("JSONData") == "json_data"
 
 
 class TestDetectOrm:

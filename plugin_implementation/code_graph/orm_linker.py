@@ -51,11 +51,13 @@ _HIBERNATE_TABLE = re.compile(
     r"@Table\s*\(\s*(?:[^)]*\b)?name\s*=\s*\"([A-Za-z_][\w]*)\""
 )
 
-_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")  # Handles consecutive capitals
 
 
 def _to_snake_case(name: str) -> str:
-    """``BlogPost`` → ``blog_post`` (Django/SQLAlchemy default table naming)."""
+    """Convert camelCase to snake_case, treating consecutive capitals as units.
+    Examples: ``BlogPost`` → ``blog_post``, ``APIKey`` → ``api_key``, ``HTTPSConnection`` → ``https_connection``.
+    """
     return _CAMEL_BOUNDARY.sub("_", name).lower()
 
 
