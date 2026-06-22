@@ -205,7 +205,7 @@ def extract_artifact_settings(llm_settings: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": base_url,
         "api_key": openai_api_key,
         "project_id": str(project_id),
-        "api_path": "/api/v1",
+        "api_path": "/api/v2",
         "x_secret": llm_settings.get("x_secret", "secret"),
     }
 
@@ -1400,6 +1400,7 @@ Do not include any explanation or other text."""
                 self.invocation_stop_checkpoint()
 
                 llm_settings = params.get('llm_settings') or {}
+                log.info(f"Generating Wiki artifacts !!!!!! with {llm_settings}")
                 model_name = None
                 if isinstance(llm_settings, dict):
                     model_name = llm_settings.get('model_name')
