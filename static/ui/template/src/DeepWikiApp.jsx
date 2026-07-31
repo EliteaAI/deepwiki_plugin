@@ -3,6 +3,7 @@ import { ThemeProvider, createTheme, CssBaseline } from '@mui/material';
 import { v4 as uuidv4 } from 'uuid';
 import * as Diff from 'diff';
 import { getEnvVar } from './utils/env';
+import { resolveBudgetError } from './utils/budgetError';
 import ThinkingStepsPanel from './components/ThinkingStepsPanel';
 import ChatDrawer, { DRAWER_WIDTH } from './components/ChatDrawer';
 import SlotsIndicator from './components/SlotsIndicator';
@@ -1697,6 +1698,10 @@ function DeepWikiApp() {
 
         const status = contentObj?.status || maybeMetadata?.status;
         const errorCategory = contentObj?.error_category || maybeMetadata?.error_category;
+        const budgetError = resolveBudgetError(contentObj, maybeMetadata, contentStr);
+        if (budgetError) {
+          return { isError: true, message: budgetError.message };
+        }
 
         // Check for various error markers in the content string
         const contentLower = typeof contentStr === 'string' ? contentStr.toLowerCase() : '';
@@ -1893,11 +1898,13 @@ function DeepWikiApp() {
       case SocketMessageType.Error:
       case SocketMessageType.LlmError: {
         // Error occurred
-        const errorMsg = typeof content === 'string' 
+        const rawErrorMsg = typeof content === 'string'
           ? content 
           : content?.message || content?.error || 'Wiki generation failed';
+        const errorMsg = resolveBudgetError(content, response_metadata, rawErrorMsg)?.message || rawErrorMsg;
         console.error('[DeepWiki] Error:', errorMsg);
-        
+
+        generationErroredRef.current = true;
         setGenerationStatus({
           status: 'error',
           message: errorMsg,

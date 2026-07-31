@@ -50,6 +50,7 @@ from .agentic_doc_generator_v2 import AgenticDocGeneratorV2
 from ..unified_db import UnifiedWikiDB, UNIFIED_DB_ENABLED
 from ..cluster_expansion import expand_for_page as cluster_expand_for_page
 from ..wiki_structure_planner.cluster_planner import ClusterStructurePlanner
+from ..budget_errors import budget_error_result, raise_if_budget_exceeded
 
 logger = logging.getLogger(__name__)
 
@@ -286,6 +287,7 @@ class OptimizedWikiGenerationAgent:
             }
 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Repository analysis failed: {e}", exc_info=True)
             # self._dispatch_progress("wiki_error", {
             #     "message": f"❌ Repository analysis failed: {str(e)}",
@@ -347,6 +349,7 @@ class OptimizedWikiGenerationAgent:
                         "current_phase": "structure_complete",
                     }
                 except Exception as cluster_error:
+                    raise_if_budget_exceeded(cluster_error)
                     logger.warning(
                         "Cluster-based structure planner failed, "
                         "falling back to deepagents: %s", cluster_error,
@@ -388,6 +391,7 @@ class OptimizedWikiGenerationAgent:
                         "current_phase": "structure_complete",
                     }
                 except Exception as deepagents_error:
+                    raise_if_budget_exceeded(deepagents_error)
                     logger.warning(
                         f"Deepagents structure planner failed, falling back to LLM: {deepagents_error}")
 
@@ -481,6 +485,7 @@ class OptimizedWikiGenerationAgent:
             }
 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Structure generation failed: {e}", exc_info=True)
             # self._dispatch_progress("wiki_error", {
             #     "message": f"❌ Structure generation failed: {str(e)}",
@@ -743,6 +748,7 @@ class OptimizedWikiGenerationAgent:
             }
 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Page generation failed for {display_page_id}: {e}", exc_info=True)
             if this and getattr(this, 'module', None):
                 this.module.invocation_thinking(
@@ -1255,7 +1261,7 @@ class OptimizedWikiGenerationAgent:
             stacktrace = traceback.format_exc()
             logger.error(f"Wiki generation failed: Error parsing payload params: {stacktrace}")
             logger.error(f"Wiki generation failed: {e}")
-            return {
+            return budget_error_result(e) or {
                 "success": False,
                 "error": str(e),
                 "execution_time": time.time() - initial_state["start_time"]
@@ -4032,6 +4038,7 @@ class OptimizedWikiGenerationAgent:
                 return self._format_simple_context(truncated_docs, page_spec)
 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.warning(f"Could not retrieve relevant content: {e}")
             return {
                 "content": repo_context,  # Fallback to repo context

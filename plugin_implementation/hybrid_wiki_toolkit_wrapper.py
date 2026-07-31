@@ -18,6 +18,7 @@ from .retrievers import WikiRetrieverStack
 from .filesystem_indexer import FilesystemRepositoryIndexer
 from .repo_providers import GitCloneConfig
 from .unified_retriever import UNIFIED_RETRIEVER_ENABLED
+from .budget_errors import budget_error_result
 
 logger = logging.getLogger(__name__)
 
@@ -369,9 +370,11 @@ class HybridWikiToolkitWrapper:
                     'provider_type': self.provider_type,
                 }
             else:
-                return {
+                return budget_error_result(wiki_result) or {
                     'success': False,
-                    'error': "Failed to generate wiki. Wiki generation agent failed to generate wiki."
+                    'error': wiki_result.get('error') if isinstance(wiki_result, dict) else (
+                        "Failed to generate wiki. Wiki generation agent failed to generate wiki."
+                    )
                 }
 
         except Exception as e:

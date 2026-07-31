@@ -24,6 +24,7 @@ from langchain_core.tools import tool
 from langchain_core.documents import Document
 
 from ..constants import DOC_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS, CODE_SYMBOL_TYPES
+from ..budget_errors import raise_if_budget_exceeded
 from ..code_graph.graph_query_service import GraphQueryService
 from .hybrid_fusion import (
     fuse_search_results,
@@ -611,6 +612,7 @@ def create_codebase_tools(
                                 query=query
                             ))
                         except Exception as e:
+                            raise_if_budget_exceeded(e)
                             logger.warning(f"EmbeddingsFilter failed, using top-k: {e}")
                             vs_docs = vs_docs[:k_doc]
                     else:
@@ -624,6 +626,7 @@ def create_codebase_tools(
                         f"(cap={k_doc}, query={query!r:.60})"
                     )
                 except Exception as e:
+                    raise_if_budget_exceeded(e)
                     logger.warning(f"[SEARCH_CODEBASE] Vector store search failed: {e}")
             
             # === Branch 2: Graph full-text search (code symbols, at least k) ===
@@ -745,6 +748,7 @@ def create_codebase_tools(
             return f"## Search Results for: {query}\n\nFound {len(all_docs)} relevant items:\n" + "\n---\n".join(results)
             
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Search failed: {e}", exc_info=True)
             emit({
                 "type": "tool_error",
@@ -1591,12 +1595,14 @@ def create_codebase_tools(
                                 similarity_threshold=similarity_threshold
                             )
                             vs_docs = list(ef.compress_documents(documents=vs_docs, query=query))
-                        except Exception:
+                        except Exception as exc:
+                            raise_if_budget_exceeded(exc)
                             vs_docs = vs_docs[:k]
                     else:
                         vs_docs = vs_docs[:k]
                     docs.extend(vs_docs)
                 except Exception as e:
+                    raise_if_budget_exceeded(e)
                     logger.warning(f"search_docs VS failed: {e}")
 
             emit({
@@ -1617,6 +1623,7 @@ def create_codebase_tools(
             return f"## Documentation: {query}\n\n" + "\n\n---\n\n".join(sections)
 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"search_docs failed: {e}", exc_info=True)
             return f"Documentation search failed: {str(e)}"
 

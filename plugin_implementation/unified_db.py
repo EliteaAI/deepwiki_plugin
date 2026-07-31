@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
+from .budget_errors import raise_if_budget_exceeded
+
 # ---------------------------------------------------------------------------
 # SQLite driver selection
 # ---------------------------------------------------------------------------
@@ -971,6 +973,7 @@ class UnifiedWikiDB:
             try:
                 vectors = embedding_fn(texts)
             except Exception as exc:
+                raise_if_budget_exceeded(exc)
                 logger.warning(
                     "populate_embeddings: batch %d–%d failed: %s",
                     i, i + len(batch), exc,

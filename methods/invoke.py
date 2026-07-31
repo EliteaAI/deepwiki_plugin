@@ -9,6 +9,17 @@ import requests
 from pylon.core.tools import log  # pylint: disable=E0611,E0401,W0611
 from pylon.core.tools import web  # pylint: disable=E0611,E0401,W0611
 
+try:
+    from ..plugin_implementation.budget_errors import (
+        BUDGET_ERROR_TYPE,
+        budget_exceeded_from,
+    )
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.budget_errors import (
+        BUDGET_ERROR_TYPE,
+        budget_exceeded_from,
+    )
+
 default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
@@ -456,13 +467,22 @@ class Method:  # pylint: disable=E1101,R0903,W0201
         error_type = type(exception).__name__
         error_category = "unknown_error"
         exception_str = str(exception)
+        budget_error = budget_exceeded_from(exception)
+
+        if budget_error is not None:
+            exception = budget_error
+            exception_str = str(budget_error)
+            error_type = type(budget_error).__name__
+            error_category = BUDGET_ERROR_TYPE
 
         try:
             lower = exception_str.lower()
         except Exception:
             lower = ""
 
-        if "not found" in lower or isinstance(exception, FileNotFoundError):
+        if budget_error is not None:
+            pass
+        elif "not found" in lower or isinstance(exception, FileNotFoundError):
             error_category = "resource_not_found"
         elif "[service_busy]" in lower or "service is busy" in lower or "deepwiki service is busy" in lower:
             error_category = "service_busy"
@@ -499,16 +519,23 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             # User-facing mode - just the error message, no technical noise
             error_message = f"{str(operation).capitalize()} failed{model_context}: {exception_str}"
 
-        result_objects = [
-            {
-                "object_type": "message",
-                "result_target": "response",
-                "result_encoding": "plain",
-                "data": error_message,
-            }
-        ]
+        result_object = {
+            "object_type": "message",
+            "result_target": "response",
+            "result_encoding": "plain",
+            "data": error_message,
+        }
+        if budget_error is not None:
+            # Keep the marker inside ``result`` as well as on the response.
+            # Provider clients always preserve this JSON string even when an
+            # older generated response model drops newly added top-level fields.
+            result_object.update({
+                "error_category": BUDGET_ERROR_TYPE,
+                "budget_error_code": budget_error.scope,
+            })
+        result_objects = [result_object]
 
-        return {
+        response = {
             "invocation_id": invocation_id,
             "status": "Error",
             "result": json.dumps(result_objects),
@@ -516,6 +543,18 @@ class Method:  # pylint: disable=E1101,R0903,W0201
             "error_category": error_category,
             "error_type": error_type,
         }
+        if budget_error is not None:
+            response["budget_error_code"] = budget_error.scope
+            # ``errors`` is part of the shared provider API schema.  The generic
+            # provider worker reads this marker and raises the SDK's terminal
+            # BudgetExceededError instead of returning the failure to the agent
+            # as ordinary tool content.
+            response["errors"] = json.dumps({
+                "type": BUDGET_ERROR_TYPE,
+                "code": budget_error.scope,
+                "message": exception_str,
+            })
+        return response
 
     @web.method()
     def _transform_deepwiki_query_request(self, request_data):
@@ -1721,6 +1760,15 @@ Do not include any explanation or other text."""
                     err = result.get("error")
                     err_type = result.get("error_type")
                     err_category = result.get("error_category")
+                budget_error = budget_exceeded_from(result)
+                if budget_error is not None:
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=model_name if tool_name == "generate_wiki" else None,
+                        exception=budget_error,
+                        include_traceback=False,
+                    )
                 if isinstance(err, str) and err.strip().startswith("[SERVICE_BUSY]"):
                     clean = err.strip()[len("[SERVICE_BUSY]"):].strip()
                     return self._create_error_response(

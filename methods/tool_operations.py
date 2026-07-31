@@ -515,11 +515,14 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                     self.invocation_thinking(f"Error: {error_msg} [category: {error_category}]")
                     
                     job_manager.cleanup_job(job_id, delete_k8s_job=True, llm_settings=llm_settings)
-                    return {
+                    failed_result = {
                         "success": False, 
                         "error": error_msg,
                         "error_category": error_category
                     }
+                    if result and result.get("budget_error_code"):
+                        failed_result["budget_error_code"] = result["budget_error_code"]
+                    return failed_result
                 elif status["phase"] == "not_found":
                     error_msg = f"Job {job_id} not found - may have been cleaned up"
                     return {"success": False, "error": error_msg}

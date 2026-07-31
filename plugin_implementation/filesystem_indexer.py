@@ -24,6 +24,7 @@ from .utils.resource_monitor import resource_monitor
 from .unified_db import UnifiedWikiDB, UNIFIED_DB_ENABLED
 from .graph_topology import run_phase2
 from .graph_clustering import run_phase3
+from .budget_errors import raise_if_budget_exceeded
 
 # Legacy multi-component artifacts (FAISS / BM25 / .code_graph.gz) are no
 # longer written — UnifiedWikiDB is the single source of truth. Kept as a
@@ -256,6 +257,7 @@ class FilesystemRepositoryIndexer:
             logger.info(f"[cache-hit] Loaded graph + vectorstore for {repo_identifier} from {repo_path}")
             return self._generate_index_stats(repo_identifier, from_cache=True)
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.debug(f"[cache-error] {e}")
             return None
     
@@ -412,6 +414,7 @@ class FilesystemRepositoryIndexer:
                         # Ensure repository metadata and source paths are set after build
                         self._add_repository_metadata()
             except Exception as e:
+                raise_if_budget_exceeded(e)
                 logger.error(f"Failed to build vector store: {e}")
                 import traceback
                 logger.error(f"Full traceback: {traceback.format_exc()}")
@@ -690,6 +693,7 @@ class FilesystemRepositoryIndexer:
                             )
                             logger.info("Unified DB: %d node embeddings stored", n_embedded)
                         except Exception as exc:
+                            raise_if_budget_exceeded(exc)
                             logger.warning("Embedding population failed (non-fatal): %s", exc)
                     else:
                         logger.info("No embeddings model available — repo_vec will be empty")
@@ -714,6 +718,7 @@ class FilesystemRepositoryIndexer:
                             phase2_stats.get("component_bridging", {}).get("components_after", 0),
                         )
                     except Exception as exc:
+                        raise_if_budget_exceeded(exc)
                         logger.warning("Phase 2 graph topology failed (non-fatal): %s", exc)
 
                     # Phase 3 — mathematical pre-clustering (Louvain)
@@ -751,6 +756,7 @@ class FilesystemRepositoryIndexer:
                     )
             return cache_key
         except Exception as exc:
+            raise_if_budget_exceeded(exc)
             # Non-fatal — unified DB is a dual-write bonus, not a hard requirement
             logger.warning("Failed to write unified DB: %s", exc)
             return None
