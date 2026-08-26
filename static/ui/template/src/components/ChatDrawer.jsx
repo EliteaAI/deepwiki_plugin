@@ -34,6 +34,7 @@ import remarkGfm from 'remark-gfm';
 import { v4 as uuidv4 } from 'uuid';
 import MermaidDiagram from './MermaidDiagram';
 import { useManualSocket, sioEvents, SocketMessageType, getSocketId, getSocket } from '../hooks/useSocket';
+import { resolveBudgetError } from '../utils/budgetError';
 
 const DEFAULT_DRAWER_WIDTH = 480;
 const MIN_DRAWER_WIDTH = 350;
@@ -1464,6 +1465,12 @@ const ChatDrawer = memo(function ChatDrawer({
           sources = content.sources || [];
         }
 
+        const budgetError = resolveBudgetError(content, response_metadata, answer);
+        if (budgetError) {
+          answer = budgetError.message;
+          isError = true;
+        }
+
         const capabilityUsed = pendingCapabilityRef.current || 'ask';
 
         // Mark thinking block completed for this request
@@ -1518,9 +1525,10 @@ const ChatDrawer = memo(function ChatDrawer({
       case SocketMessageType.AgentException:
       case SocketMessageType.Error:
       case SocketMessageType.LlmError: {
-        const errorMsg = typeof content === 'string' 
+        const rawErrorMsg = typeof content === 'string'
           ? content 
           : content?.message || content?.error || 'An error occurred';
+        const errorMsg = resolveBudgetError(content, response_metadata, rawErrorMsg)?.message || rawErrorMsg;
         
         console.error('[ChatDrawer] Error:', errorMsg);
         const capabilityUsed = pendingCapabilityRef.current || 'ask';

@@ -28,6 +28,7 @@ from .repository_analysis_store import (
     render_structured_analysis_as_markdown,
     get_files_for_query,
 )
+from .budget_errors import raise_if_budget_exceeded
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +311,7 @@ class AskTool:
                 logger.warning(f"Query optimization produced invalid result, using original")
                 
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.warning(f"Query optimization failed: {e}")
         
         return question
@@ -530,6 +532,7 @@ class AskTool:
                 k=k
             )
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Retrieval failed: {e}")
             return AskResponse(
                 answer=f"Sorry, I encountered an error while searching the repository: {str(e)}",
@@ -565,6 +568,7 @@ class AskTool:
         try:
             answer = self._generate_answer(question, context, sources)
         except Exception as e:
+            raise_if_budget_exceeded(e)
             logger.error(f"Answer generation failed: {e}")
             return AskResponse(
                 answer=f"I found relevant documents but encountered an error generating the answer: {str(e)}",

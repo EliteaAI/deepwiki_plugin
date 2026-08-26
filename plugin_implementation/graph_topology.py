@@ -47,6 +47,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
+from .budget_errors import raise_if_budget_exceeded
+
 # Optional sibling-module imports — guarded so this module remains
 # usable when imported via a sys.path insertion (legacy tests) rather
 # than as part of the ``plugin_implementation`` package.
@@ -560,6 +562,7 @@ def _resolve_orphans_v2(
                     flags=flags,
                 )
             except Exception as exc:  # noqa: BLE001
+                raise_if_budget_exceeded(exc)
                 logger.debug("hybrid pass failed for %s: %s", nid, exc)
                 continue
             if not hits:

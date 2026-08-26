@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from langchain_core.documents import Document
 
+from .budget_errors import raise_if_budget_exceeded
 from .constants import (
     ARCHITECTURAL_SYMBOLS,
     DOC_SYMBOL_TYPES,
@@ -386,6 +387,7 @@ class UnifiedRetriever:
         try:
             return self.embedding_fn(query)
         except Exception as exc:
+            raise_if_budget_exceeded(exc)
             logger.warning("[UNIFIED_RETRIEVER] Embedding failed: %s", exc)
             return None
 

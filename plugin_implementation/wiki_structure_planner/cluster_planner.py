@@ -35,6 +35,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import networkx as nx
 
 from ..constants import PAGE_IDENTITY_SYMBOLS, SUPPORTING_CODE_SYMBOLS, DOC_CLUSTER_SYMBOLS, SYMBOL_TYPE_PRIORITY
+from ..budget_errors import raise_if_budget_exceeded
 from ..feature_flags import get_feature_flags
 from ..graph_clustering import select_central_symbols
 from ..state.wiki_state import PageSpec, SectionSpec, WikiStructureSpec
@@ -619,6 +620,7 @@ class ClusterStructurePlanner:
                 sections.append(section)
                 section_order += 1
             except Exception as exc:
+                raise_if_budget_exceeded(exc)
                 logger.warning(
                     "LLM naming failed for macro %d, using fallback: %s",
                     macro_id, exc,
@@ -822,6 +824,7 @@ class ClusterStructurePlanner:
                 ])
                 parsed = _parse_json_response(_extract_text(response))
             except Exception as exc:
+                raise_if_budget_exceeded(exc)
                 logger.warning(
                     "Page naming failed for macro %d micro %d: %s",
                     macro_id, micro_id, exc,
@@ -858,6 +861,7 @@ class ClusterStructurePlanner:
                 section_name = section_naming.get("section_name") or section_name
                 section_desc = section_naming.get("section_description") or section_desc
             except Exception as exc:
+                raise_if_budget_exceeded(exc)
                 logger.warning(
                     "Section-from-pages naming failed for macro %d: %s",
                     macro_id, exc,
@@ -915,6 +919,7 @@ class ClusterStructurePlanner:
             ])
             parsed = _parse_json_response(_extract_text(response))
         except Exception as exc:
+            raise_if_budget_exceeded(exc)
             logger.warning(
                 "Batched naming failed for macro %d: %s; falling back to multi-call naming",
                 macro_id, exc,

@@ -44,6 +44,8 @@ from typing import Any, Dict
 from datetime import datetime, timezone
 import uuid
 
+from .budget_errors import budget_error_result
+
 
 def _configure_logging() -> None:
     """Ensure stdlib logging emits in the subprocess.
@@ -568,6 +570,8 @@ def main(argv=None) -> int:
         full_traceback = traceback.format_exc()
         _print(f"[worker] Error traceback:\n{full_traceback}")
         
+        budget_result = budget_error_result(ex)
+
         # Extract clean error message for user (no technical details)
         user_message = str(ex)
         
@@ -590,7 +594,7 @@ def main(argv=None) -> int:
         
         try:
             with open(args.output, "w", encoding="utf-8") as f:
-                json.dump({
+                json.dump(budget_result or {
                     "success": False, 
                     "error": user_message,  # Clean message only
                     "error_category": error_category

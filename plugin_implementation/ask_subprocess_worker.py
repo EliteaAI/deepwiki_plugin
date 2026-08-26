@@ -44,6 +44,8 @@ import sys
 import traceback
 from typing import Any, Dict, List, Optional
 
+from .budget_errors import budget_error_result, raise_if_budget_exceeded
+
 
 def _configure_logging() -> None:
     """Configure logging for the subprocess."""
@@ -486,6 +488,10 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return {
                     "success": False,
                     "error": error,
+                    **({
+                        "error_category": data["error_category"],
+                        "budget_error_code": data.get("budget_error_code"),
+                    } if data.get("error_category") else {}),
                     "thinking_steps": [e for e in collected_events if e.get('event_type') == 'thinking_step']
                 }
 
@@ -507,7 +513,7 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception("Agentic Ask failed")
         _emit_thinking_step('error', 'Ask Failed', str(e))
-        return {
+        return budget_error_result(e) or {
             "success": False,
             "error": f"Agentic Ask error: {str(e)}\n{traceback.format_exc()}"
         }
@@ -746,6 +752,7 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
                         f"{canonical_repo_identifier} — falling back to legacy retriever"
                     )
             except Exception as _ur_exc:
+                raise_if_budget_exceeded(_ur_exc)
                 _print(f"[UNIFIED_RETRIEVER] Upgrade failed, using legacy: {_ur_exc}")
 
         if retriever_stack is None:
@@ -830,7 +837,7 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
         
     except Exception as e:
         logger.exception("Ask tool failed")
-        return {
+        return budget_error_result(e) or {
             "success": False,
             "error": f"Ask tool error: {str(e)}\n{traceback.format_exc()}"
         }
@@ -862,7 +869,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = run_ask(payload)
     except Exception as e:
         logger.exception("Unhandled exception in ask worker")
-        result = {"success": False, "error": str(e)}
+        result = budget_error_result(e) or {"success": False, "error": str(e)}
     
     # Write output
     try:

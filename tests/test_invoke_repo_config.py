@@ -1,6 +1,7 @@
 """Regression tests for repo config extraction in methods.invoke."""
 
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -60,6 +61,35 @@ def _make_ado_config():
         'configuration_project_id': 2,
         'configuration_type': 'ado',
     }
+
+
+def test_budget_error_response_contains_terminal_provider_marker():
+    invoke = _load_invoke_module()
+
+    class ProviderBudgetError(Exception):
+        body = {
+            "type": "budget_exceeded",
+            "code": "member_budget_exceeded",
+            "message": "raw provider budget detail",
+        }
+
+    response = invoke.Method._create_error_response(
+        object(),
+        invocation_id="invocation-1",
+        operation="ask",
+        model_name=None,
+        exception=ProviderBudgetError("request rejected"),
+        include_traceback=False,
+    )
+
+    assert response["status"] == "Error"
+    assert response["error_category"] == "budget_exceeded"
+    assert response["budget_error_code"] == "member_budget_exceeded"
+    assert json.loads(response["errors"])["type"] == "budget_exceeded"
+    result_object = json.loads(response["result"])[0]
+    assert result_object["error_category"] == "budget_exceeded"
+    assert result_object["budget_error_code"] == "member_budget_exceeded"
+    assert "raw provider budget detail" not in result_object["data"]
 
 
 def test_extract_repo_config_from_nested_ado_toolkit_settings():

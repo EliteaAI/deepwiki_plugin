@@ -28,6 +28,7 @@ from .research_prompts import (
     RESEARCH_INSTRUCTIONS,
     get_research_prompt
 )
+from ..budget_errors import budget_error_result
 
 logger = logging.getLogger(__name__)
 
@@ -327,13 +328,18 @@ class DeepResearchEngine:
         except Exception as e:
             logger.error(f"Research failed: {e}", exc_info=True)
             self.status = 'failed'
-            self.error = str(e)
+            budget_result = budget_error_result(e)
+            self.error = budget_result["error"] if budget_result else str(e)
             
             yield {
                 'event_type': 'research_error',
                 'data': {
                     'session_id': self.session_id,
-                    'error': str(e),
+                    'error': self.error,
+                    **({
+                        'error_category': budget_result['error_category'],
+                        'budget_error_code': budget_result['budget_error_code'],
+                    } if budget_result else {}),
                     'timestamp': datetime.now().isoformat()
                 }
             }

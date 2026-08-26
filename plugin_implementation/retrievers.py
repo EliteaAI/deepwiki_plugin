@@ -68,6 +68,7 @@ USE_SEMANTIC_DOC_RETRIEVAL = os.getenv("DEEPWIKI_DOC_SEMANTIC_RETRIEVAL", "0") =
 
 # Documentation symbol types — single source of truth in constants.py
 from .constants import DOC_SYMBOL_TYPES, DOC_CHUNK_TYPES, DOCUMENTATION_EXTENSIONS_SET, KNOWN_FILENAMES
+from .budget_errors import raise_if_budget_exceeded
 
 if USE_SEMANTIC_DOC_RETRIEVAL:
     logger.info("[FEATURE FLAG] DEEPWIKI_DOC_SEMANTIC_RETRIEVAL=1: Semantic doc retrieval enabled in retriever stack")
@@ -402,6 +403,7 @@ class WikiRetrieverStack:
             try:
                 raw_candidates = self.repo_retriever.invoke(query)
             except Exception as retriever_error:
+                raise_if_budget_exceeded(retriever_error)
                 error_msg = str(retriever_error)
                 logger.warning(
                     f"[SEMANTIC_DOC_RETRIEVAL] Ensemble retriever failed: {error_msg}, trying dense retriever"
@@ -414,6 +416,7 @@ class WikiRetrieverStack:
                         raw_candidates = self.dense_retriever.invoke(query)
                         logger.info(f"[SEMANTIC_DOC_RETRIEVAL] Dense retriever fallback returned {len(raw_candidates)} candidates")
                     except Exception as dense_error:
+                        raise_if_budget_exceeded(dense_error)
                         logger.warning(f"[SEMANTIC_DOC_RETRIEVAL] Dense retriever also failed: {dense_error}")
                         return []
                 else:
@@ -475,6 +478,7 @@ class WikiRetrieverStack:
                         logger.warning("[SEMANTIC_DOC_RETRIEVAL] No embeddings available for EmbeddingsFilter")
                         doc_candidates = doc_candidates[:k]
                 except Exception as e:
+                    raise_if_budget_exceeded(e)
                     import traceback
                     logger.warning(f"[SEMANTIC_DOC_RETRIEVAL] EmbeddingsFilter failed: {e}")
                     logger.warning(f"[SEMANTIC_DOC_RETRIEVAL] EmbeddingsFilter traceback:\n{traceback.format_exc()}")
@@ -492,8 +496,8 @@ class WikiRetrieverStack:
             return doc_candidates
             
         except Exception as e:
+            raise_if_budget_exceeded(e)
             import traceback
             logger.error(f"[SEMANTIC_DOC_RETRIEVAL] Error: {e}")
             logger.error(f"[SEMANTIC_DOC_RETRIEVAL] Traceback:\n{traceback.format_exc()}")
             return []
-

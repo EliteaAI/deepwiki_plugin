@@ -22,6 +22,8 @@ from datetime import datetime
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
+from .budget_errors import budget_error_result
+
 logger = logging.getLogger(__name__)
 
 # Safety limits — Ask is lighter than deep research
@@ -354,13 +356,18 @@ class AskEngine:
         except Exception as e:
             logger.error(f"Agentic Ask failed: {e}", exc_info=True)
             self.status = "failed"
-            self.error = str(e)
+            budget_result = budget_error_result(e)
+            self.error = budget_result["error"] if budget_result else str(e)
 
             yield {
                 "event_type": "ask_error",
                 "data": {
                     "session_id": session_id,
-                    "error": str(e),
+                    "error": self.error,
+                    **({
+                        "error_category": budget_result["error_category"],
+                        "budget_error_code": budget_result["budget_error_code"],
+                    } if budget_result else {}),
                     "timestamp": datetime.now().isoformat(),
                 },
             }

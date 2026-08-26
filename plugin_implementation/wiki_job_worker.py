@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .budget_errors import budget_error_result
+
 # K8s termination log path (K8s reads this on container termination)
 TERMINATION_LOG_PATH = "/dev/termination-log"
 
@@ -627,8 +629,12 @@ def main():
         
         # Categorize the error for better UI messaging
         error_str = str(e)
+        budget_result = budget_error_result(e)
         error_category = "unknown_error"
-        if "OOM" in error_str or "memory" in error_str.lower():
+        if budget_result:
+            error_str = budget_result["error"]
+            error_category = budget_result["error_category"]
+        elif "OOM" in error_str or "memory" in error_str.lower():
             error_category = "out_of_memory"
         elif "timeout" in error_str.lower():
             error_category = "timeout"
@@ -651,7 +657,7 @@ def main():
         
         # Save error result
         try:
-            save_result(job_id, {
+            save_result(job_id, budget_result or {
                 "success": False,
                 "error": error_str,
                 "error_category": error_category,
