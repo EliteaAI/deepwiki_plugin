@@ -2,6 +2,9 @@
 
 import json
 import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,6 +14,22 @@ import requests
 from plugin_implementation.artifacts_platform_client import ARTIFACT_ENV_VARS
 from plugin_implementation.k8s_job_manager import K8sJobManager
 from plugin_implementation.wiki_job_worker import load_input
+
+
+def test_worker_script_starts_with_kubernetes_pythonpath():
+    plugin_root = Path(__file__).resolve().parents[1]
+    worker_script = plugin_root / "plugin_implementation" / "wiki_job_worker.py"
+
+    result = subprocess.run(
+        [sys.executable, str(worker_script), "--help"],
+        env={**os.environ, "PYTHONPATH": str(plugin_root)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--job-id" in result.stdout
 
 
 @pytest.fixture
