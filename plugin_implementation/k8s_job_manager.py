@@ -484,7 +484,7 @@ echo "[init] Bootstrap finished successfully"
         platform_client = None
         if self._uses_platform_transport():
             from .artifacts_platform_client import (
-                extract_artifact_settings, inject_artifact_env_vars,
+                inject_artifact_env_vars,
                 get_artifact_bucket,
             )
             llm_settings = input_data.get("llm_settings", {})
@@ -541,21 +541,26 @@ echo "[init] Bootstrap finished successfully"
         # manual whitelist.  Variables explicitly set above (JOB_ID, BASE_PATH)
         # are skipped to avoid duplicates.
         _already_set = {ev.name for ev in env_vars}
+        if platform_client is not None:
+            _already_set.update(self._artifact_env_var_names)
         for var_name, var_value in os.environ.items():
             if var_name.startswith("DEEPWIKI_") and var_name not in _already_set:
                 env_vars.append(client.V1EnvVar(name=var_name, value=var_value))
         
         # In platform-transport mode, inject artifact API credentials
         # so the worker can download input.json and upload results.
-        # These are derived per-request from llm_settings (the platform
-        # provides fresh credentials for each invocation).
+        # Use the client that uploaded input, including environment fallback,
+        # so the worker reads from the same platform with the same credentials.
         if self._uses_platform_transport() and platform_client is not None:
-            llm_settings = input_data.get("llm_settings", {})
-            art_settings = extract_artifact_settings(llm_settings)
+            art_settings = {
+                "base_url": platform_client.base_url,
+                "api_key": platform_client.api_key,
+                "project_id": platform_client.project_id,
+                "x_secret": platform_client.x_secret,
+            }
             art_env = inject_artifact_env_vars(art_settings, get_artifact_bucket())
             for var_name, var_value in art_env.items():
-                if var_value:
-                    env_vars.append(client.V1EnvVar(name=var_name, value=var_value))
+                env_vars.append(client.V1EnvVar(name=var_name, value=var_value))
         
         # Build init container for plugin bootstrap (clone + pip install)
         init_container = self._build_init_container(client)

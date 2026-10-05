@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .budget_errors import budget_error_result
+from plugin_implementation.budget_errors import budget_error_result
 
 # K8s termination log path (K8s reads this on container termination)
 TERMINATION_LOG_PATH = "/dev/termination-log"
