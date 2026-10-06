@@ -241,6 +241,23 @@ export DEEPWIKI_CACHE_DIR="/custom/cache/path"      # Optional
 export DEEPWIKI_MAX_WORKERS="8"                     # Optional
 ```
 
+### Kubernetes Job Storage
+
+Set these environment variables on the DeepWiki controller, which creates the worker Jobs:
+
+```bash
+export DEEPWIKI_JOB_EMPTY_DIR_SIZE_LIMIT="20Gi"
+export DEEPWIKI_JOB_EPHEMERAL_STORAGE_REQUEST="2Gi"
+export DEEPWIKI_JOB_EPHEMERAL_STORAGE_LIMIT="25Gi"
+```
+
+The request is used for scheduling; the limit sets the worker's ephemeral-storage
+budget. Disk-backed `emptyDir` usage counts toward the Pod's storage budget,
+alongside writable container layers and logs, so allow headroom beyond the volume
+cap. These settings are independent. Unset or empty values omit the corresponding
+field, leaving cluster defaults applicable. A controller/plugin rollout is needed;
+no worker image rebuild is required. Node storage pressure can still cause eviction.
+
 ### Repository Filters
 
 Create `repo.json` for custom filtering:
