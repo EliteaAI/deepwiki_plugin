@@ -78,6 +78,10 @@ class K8sJobManager:
                 "cpu": os.environ.get("DEEPWIKI_JOB_CPU_LIMIT", "4"),
             }
         }
+        for resource_type, suffix in (("requests", "REQUEST"), ("limits", "LIMIT")):
+            storage = os.environ.get(f"DEEPWIKI_JOB_EPHEMERAL_STORAGE_{suffix}")
+            if storage:
+                self.resources[resource_type]["ephemeral-storage"] = storage
         
         # PVC name for shared data
         self.pvc_name = os.environ.get("DEEPWIKI_PVC_NAME", "deepwiki-data")
