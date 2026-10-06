@@ -646,7 +646,9 @@ echo "[init] Bootstrap finished successfully"
                             # PVC mode: shared PVC (controller + worker share filesystem).
                             client.V1Volume(
                                 name="data",
-                                empty_dir=client.V1EmptyDirVolumeSource()
+                                empty_dir=client.V1EmptyDirVolumeSource(
+                                    size_limit=os.environ.get("DEEPWIKI_JOB_EMPTY_DIR_SIZE_LIMIT") or None
+                                )
                             ) if uses_platform else
                             client.V1Volume(
                                 name="data",
