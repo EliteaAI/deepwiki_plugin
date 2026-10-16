@@ -965,7 +965,17 @@ class UnifiedWikiDB:
         ).fetchall()
 
         total = 0
+        # Large repos embed hundreds of thousands of nodes here; without
+        # periodic progress the phase is indistinguishable from a hang.
+        progress_every = max(batch_size, 20_000)
+        t0 = time.monotonic()
+        logger.info("populate_embeddings: embedding %d nodes (batch=%d)", len(rows), batch_size)
         for i in range(0, len(rows), batch_size):
+            if i and i % progress_every < batch_size:
+                logger.info(
+                    "populate_embeddings: %d/%d nodes processed (%.0fs)",
+                    i, len(rows), time.monotonic() - t0,
+                )
             batch = rows[i : i + batch_size]
             texts = [r["source_text"] for r in batch]
             node_ids = [r["node_id"] for r in batch]
