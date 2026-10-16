@@ -130,6 +130,7 @@ class DeepResearchEngine:
             model=model_name,
             api_key=api_key,
             base_url=api_base,
+            default_headers=self.llm_settings.get('default_headers') or None,
             temperature=0.0,
             max_tokens=max_tokens,
         )

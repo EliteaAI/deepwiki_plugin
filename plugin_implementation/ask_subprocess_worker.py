@@ -152,6 +152,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
             api_key=api_key,
             base_url=api_base,
             organization=organization,
+            default_headers=default_headers or None,
             max_retries=max_retries,
             streaming=False,
             max_tokens=max_tokens,
@@ -168,6 +169,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
         openai_api_key=api_key,
         openai_api_base=embeddings_base_url,
         openai_organization=organization,
+        default_headers=default_headers or None,
     )
 
     return llm, embeddings

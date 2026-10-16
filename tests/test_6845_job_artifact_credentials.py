@@ -94,7 +94,7 @@ def test_worker_downloads_input_with_upload_credentials(
     assert pod.volumes[0].empty_dir is not None
 
     for name in ARTIFACT_ENV_VARS:
-        monkeypatch.delenv(name)
+        monkeypatch.delenv(name, raising=False)
     for entry in worker_env:
         monkeypatch.setenv(entry.name, entry.value)
     # Simulate the worker's emptyDir, separate from the controller's local input.
@@ -117,3 +117,66 @@ def test_failed_input_upload_does_not_start_worker(job_manager, monkeypatch):
 
     assert result["error_category"] == "platform_upload_failed"
     batch_api.create_namespaced_job.assert_not_called()
+
+
+def test_session_auth_settings_reach_worker_with_cookie(job_manager, tmp_path, monkeypatch):
+    # Session-auth runtime: api_key is only a placeholder; the user's session
+    # cookie in default_headers is the credential (provider_worker forwards it).
+    manager, batch_api = job_manager
+    llm_settings = {
+        "provider": "openai",
+        "api_key": "session",
+        "api_base": "http://main.svc:8080/llm/v1",
+        "organization": "96",
+        "default_headers": {"Cookie": "elitea_session=abc"},
+    }
+    payload = {"llm_settings": llm_settings, "query": "GO"}
+    stored = {}
+
+    def upload(url, **kwargs):
+        stored["headers"] = kwargs["headers"]
+        stored["body"] = kwargs["files"]["file"][1]
+        return SimpleNamespace(status_code=201, json=lambda: {"status": "ok"})
+
+    def download(url, **kwargs):
+        if kwargs["headers"].get("Cookie") != "elitea_session=abc":
+            return SimpleNamespace(status_code=403, text="no session")
+        return SimpleNamespace(status_code=200, content=stored["body"])
+
+    monkeypatch.setattr(requests, "post", upload)
+    monkeypatch.setattr(requests, "get", download)
+    assert manager.create_job("test-job", payload)["success"]
+
+    assert stored["headers"]["Cookie"] == "elitea_session=abc"
+    assert "Authorization" not in stored["headers"]
+
+    worker_env = batch_api.create_namespaced_job.call_args.kwargs["body"].spec.template.spec.containers[0].env
+    for name in ARTIFACT_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    for entry in worker_env:
+        monkeypatch.setenv(entry.name, entry.value)
+    monkeypatch.setenv("DEEPWIKI_BASE_PATH", str(tmp_path / "worker"))
+    assert load_input("test-job") == payload
+
+
+def test_token_auth_keeps_bearer_header():
+    from plugin_implementation.artifacts_platform_client import artifact_auth_headers
+
+    assert artifact_auth_headers("real-token", "s") == {"X-SECRET": "s", "Authorization": "Bearer real-token"}
+    assert artifact_auth_headers("session", "s", "c=1") == {"X-SECRET": "s", "Cookie": "c=1"}
+
+
+def test_openai_llm_and_embeddings_carry_session_cookie():
+    pytest.importorskip("langchain_openai")
+    from plugin_implementation.wiki_subprocess_worker import _build_llm_and_embeddings
+
+    llm, embeddings, _ = _build_llm_and_embeddings({
+        "provider": "openai",
+        "api_key": "session",
+        "api_base": "http://main.svc:8080/llm/v1",
+        "organization": "96",
+        "default_headers": {"Cookie": "elitea_session=abc"},
+    }, None)
+
+    assert llm.default_headers["Cookie"] == "elitea_session=abc"
+    assert embeddings.default_headers["Cookie"] == "elitea_session=abc"
