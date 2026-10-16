@@ -56,6 +56,11 @@ ARTIFACT_API_KEY_ENV = "DEEPWIKI_ARTIFACT_API_KEY"
 ARTIFACT_PROJECT_ID_ENV = "DEEPWIKI_ARTIFACT_PROJECT_ID"
 ARTIFACT_BUCKET_ENV = "DEEPWIKI_ARTIFACT_BUCKET"
 ARTIFACT_X_SECRET_ENV = "DEEPWIKI_ARTIFACT_X_SECRET"
+ARTIFACT_COOKIE_ENV = "DEEPWIKI_ARTIFACT_COOKIE"
+
+# api_key value the runtime sends when it authenticates with the user's
+# session cookie instead of a token (the cookie rides in default_headers).
+SESSION_API_KEY_PLACEHOLDER = "session"
 
 # All env var names that should be passed to worker Job pods
 ARTIFACT_ENV_VARS = [
@@ -64,6 +69,7 @@ ARTIFACT_ENV_VARS = [
     ARTIFACT_PROJECT_ID_ENV,
     ARTIFACT_BUCKET_ENV,
     ARTIFACT_X_SECRET_ENV,
+    ARTIFACT_COOKIE_ENV,
 ]
 
 DEFAULT_BUCKET = "wiki-artifacts"
@@ -191,7 +197,19 @@ def extract_artifact_settings(llm_settings: Dict[str, Any]) -> Dict[str, Any]:
         "project_id": str(project_id),
         "api_path": DEFAULT_API_PATH,
         "x_secret": llm_settings.get("x_secret", "secret"),
+        "cookie": _session_cookie(llm_settings),
     }
+
+
+def _session_cookie(llm_settings: Dict[str, Any]) -> str:
+    """Return the session ``Cookie`` header the runtime sends to the platform."""
+    headers = llm_settings.get("default_headers")
+    if not isinstance(headers, dict):
+        return ""
+    for name, value in headers.items():
+        if str(name).lower() == "cookie" and value:
+            return str(value)
+    return ""
 
 
 def extract_artifact_settings_from_env() -> Optional[Dict[str, Any]]:
@@ -216,6 +234,7 @@ def extract_artifact_settings_from_env() -> Optional[Dict[str, Any]]:
         "project_id": project_id,
         "api_path": DEFAULT_API_PATH,
         "x_secret": os.environ.get(ARTIFACT_X_SECRET_ENV, "secret"),
+        "cookie": os.environ.get(ARTIFACT_COOKIE_ENV, "").strip(),
     }
 
 
@@ -235,6 +254,7 @@ def inject_artifact_env_vars(
         ARTIFACT_PROJECT_ID_ENV: artifact_settings.get("project_id", ""),
         ARTIFACT_BUCKET_ENV: bucket,
         ARTIFACT_X_SECRET_ENV: artifact_settings.get("x_secret", "secret"),
+        ARTIFACT_COOKIE_ENV: artifact_settings.get("cookie", ""),
     }
 
 
@@ -258,6 +278,21 @@ def get_artifact_bucket() -> str:
 # Platform Artifact Client
 # ---------------------------------------------------------------------------
 
+def artifact_auth_headers(api_key: str, x_secret: str, cookie: str = "") -> Dict[str, str]:
+    """
+    Auth headers for platform artifact calls.
+
+    Session-auth runtimes pass a placeholder api_key and the user's session
+    cookie; the placeholder is not a token, so it is not sent as one.
+    """
+    headers = {"X-SECRET": x_secret}
+    if api_key and api_key != SESSION_API_KEY_PLACEHOLDER:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
 class PlatformArtifactClient:
     """
     HTTP client for the ELITEA platform artifact API.
@@ -280,6 +315,7 @@ class PlatformArtifactClient:
         self.project_id = artifact_settings.get("project_id", "")
         self.api_path = artifact_settings.get("api_path", DEFAULT_API_PATH)
         self.x_secret = artifact_settings.get("x_secret", "secret")
+        self.cookie = artifact_settings.get("cookie", "")
         self.part_size = get_artifact_part_size()
 
         if not self.base_url:
@@ -288,10 +324,7 @@ class PlatformArtifactClient:
             raise ValueError("artifact_settings.api_key is required")
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "X-SECRET": self.x_secret,
-        }
+        return artifact_auth_headers(self.api_key, self.x_secret, self.cookie)
 
     def _artifact_url(self, bucket: str) -> str:
         """URL base for artifact operations (upload / list)."""

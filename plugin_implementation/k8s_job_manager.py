@@ -561,6 +561,7 @@ echo "[init] Bootstrap finished successfully"
                 "api_key": platform_client.api_key,
                 "project_id": platform_client.project_id,
                 "x_secret": platform_client.x_secret,
+                "cookie": platform_client.cookie,
             }
             art_env = inject_artifact_env_vars(art_settings, get_artifact_bucket())
             for var_name, var_value in art_env.items():
