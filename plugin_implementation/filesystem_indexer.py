@@ -587,6 +587,19 @@ class FilesystemRepositoryIndexer:
                         from .feature_flags import get_feature_flags
 
                         _flags = get_feature_flags()
+                        # A long Phase 1c run with no progress output looks
+                        # identical to a hang (see the K8s "opened then
+                        # nothing for hours" stall this phase was logged
+                        # against) — log which sub-phases are enabled so
+                        # the log line itself tells you what's running.
+                        logger.info(
+                            "Phase 1c: starting enrichment (api_surface=%s, "
+                            "cross_language=%s, test_linker=%s, markdown=%s)",
+                            _flags.api_surface_extraction,
+                            _flags.cross_language_linking,
+                            _flags.test_linker,
+                            _flags.markdown_structure,
+                        )
                         surfaces_by_node: dict = {}
                         if _flags.api_surface_extraction:
                             from .code_graph.api_surface_extractor import (
