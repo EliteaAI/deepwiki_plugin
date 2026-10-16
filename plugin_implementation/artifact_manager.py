@@ -348,14 +348,21 @@ class ArtifactManager:
 
             bucket_path = f"{wiki_id}/indexes/{filename}"
             try:
-                data = local_path.read_bytes()
-                total_bytes += len(data)
-                self.client.upload_artifact(
-                    self.bucket,
-                    bucket_path,
-                    data,
-                )
-                logger.debug(f"Uploaded {filename} ({len(data):,} bytes) → {bucket_path}")
+                if hasattr(self.client, "upload_file"):
+                    # Streams the file in bounded-memory parts when it's
+                    # large enough to need chunked transport (#6991).
+                    self.client.upload_file(self.bucket, bucket_path, local_path)
+                    total_bytes += local_path.stat().st_size
+                else:
+                    # Test fakes / other clients that only implement upload_artifact.
+                    data = local_path.read_bytes()
+                    total_bytes += len(data)
+                    self.client.upload_artifact(
+                        self.bucket,
+                        bucket_path,
+                        data,
+                    )
+                logger.debug(f"Uploaded {filename} → {bucket_path}")
             except Exception as e:
                 logger.error(f"Failed to upload {filename}: {e}")
                 ok = False
@@ -476,13 +483,19 @@ class ArtifactManager:
             f"{wiki_id}/{filename}",
         ]:
             try:
-                data = self.client.download_artifact(self.bucket, bucket_path)
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
-                if isinstance(data, str):
-                    local_path.write_text(data, encoding="utf-8")
+                if hasattr(self.client, "download_artifact_to_file"):
+                    # Streams straight to disk in bounded memory, with
+                    # transparent chunk-fallback for large files (#6991).
+                    self.client.download_artifact_to_file(self.bucket, bucket_path, local_path)
                 else:
-                    local_path.write_bytes(data)
+                    # Test fakes / other clients that only implement download_artifact.
+                    data = self.client.download_artifact(self.bucket, bucket_path)
+                    if isinstance(data, str):
+                        local_path.write_text(data, encoding="utf-8")
+                    else:
+                        local_path.write_bytes(data)
 
                 logger.debug(f"Downloaded {bucket_path} → {local_path} ({local_path.stat().st_size:,} bytes)")
                 return True
@@ -671,6 +684,8 @@ class ArtifactManager:
         index_arts = parts["indexes"]
         stats["indexes_in_bucket"] = len(index_arts)
 
+        from .artifacts_platform_client import logical_artifact_name
+
         # Build the set of index basenames for the current generation
         current_basenames: Set[str] = set()
         for fn in manifest_index_files(current_manifest):
@@ -689,6 +704,11 @@ class ArtifactManager:
         for ia in index_arts:
             ia_name = ia.get("name", "") if isinstance(ia, dict) else str(ia)
             basename = ia_name.split("/")[-1] if "/" in ia_name else ia_name
+            # Chunk parts/manifests of a current index carry a
+            # ".chunk-<gen>-<idx>" / ".chunks.json" suffix on top of the
+            # logical filename — resolve that before comparing, otherwise
+            # the worker deletes the parts it just uploaded (#6991).
+            basename = logical_artifact_name(basename)
             if basename in current_basenames:
                 matched += 1
             else:
