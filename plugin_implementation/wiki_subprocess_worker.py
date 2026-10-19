@@ -147,6 +147,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
             api_key=api_key,
             base_url=api_base,
             organization=organization,
+            default_headers=default_headers or None,
             max_retries=max_retries,
             streaming=streaming,
             max_tokens=max_tokens,
@@ -159,6 +160,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
         api_key=api_key,
         base_url=embeddings_base_url,
         organization=organization,
+        default_headers=default_headers or None,
         max_retries=max_retries,
     )
 

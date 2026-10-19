@@ -20,6 +20,17 @@ except ImportError:  # Standalone test/subprocess import mode
         budget_exceeded_from,
     )
 
+try:
+    from ..plugin_implementation.artifacts_platform_client import (
+        _session_cookie,
+        artifact_auth_headers,
+    )
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.artifacts_platform_client import (
+        _session_cookie,
+        artifact_auth_headers,
+    )
+
 default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
@@ -171,6 +182,7 @@ def create_llm(
             api_key=api_key,
             base_url=openai_base_url,
             organization=organization,
+            default_headers=default_headers or None,
             max_retries=max_retries,
             streaming=streaming,
             max_tokens=max_tokens,
@@ -218,6 +230,7 @@ def extract_artifact_settings(llm_settings: Dict[str, Any]) -> Dict[str, Any]:
         "project_id": str(project_id),
         "api_path": "/api/v2",
         "x_secret": llm_settings.get("x_secret", "secret"),
+        "cookie": _session_cookie(llm_settings),
     }
 
 
@@ -234,10 +247,9 @@ def download_artifact(artifact_settings: Dict, bucket_name: str, artifact_name: 
     name_segment = quote(str(artifact_name), safe="")
     url = f"{artifact_url}/{bucket_segment}/{name_segment}"
     #
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-SECRET": artifact_settings.get("x_secret", "secret"),
-    }
+    headers = artifact_auth_headers(
+        api_key, artifact_settings.get("x_secret", "secret"), artifact_settings.get("cookie", ""),
+    )
     #
     log.info("Downloading artifact: %s", url)
     #
@@ -267,10 +279,9 @@ def upload_artifact(artifact_settings: Dict, bucket_name: str, artifact_name: st
     artifacts_url = f"{base_url}{api_path}/artifacts/artifacts/default/{project_id}"
     url = f"{artifacts_url}/{bucket_name.lower()}"
     #
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-SECRET": artifact_settings.get("x_secret", "secret"),
-    }
+    headers = artifact_auth_headers(
+        api_key, artifact_settings.get("x_secret", "secret"), artifact_settings.get("cookie", ""),
+    )
     #
     log.info("Uploading artifact: %s to bucket %s", artifact_name, bucket_name)
     #
@@ -1439,7 +1450,6 @@ Do not include any explanation or other text."""
                 self.invocation_stop_checkpoint()
 
                 llm_settings = params.get('llm_settings') or {}
-                log.info(f"Generating Wiki artifacts !!!!!! with {llm_settings}")
                 model_name = None
                 if isinstance(llm_settings, dict):
                     model_name = llm_settings.get('model_name')

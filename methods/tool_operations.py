@@ -674,6 +674,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
             openai_token = llm_settings.get('openai_api_key')
             openai_model = llm_settings.get('model_name', 'gpt-4o-mini')
             organization = llm_settings.get('organization')
+            default_headers = llm_settings.get('default_headers') or None
             max_retries = llm_settings.get('max_retries', 2)
             max_tokens = llm_settings.get('max_tokens', 64000)
             streaming = llm_settings.get('streaming', False)
@@ -692,6 +693,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                 api_key=openai_token,
                 base_url=openai_url,
                 organization=organization,
+                default_headers=default_headers,
                 max_retries=max_retries,
                 streaming=streaming,
                 max_tokens=max_tokens,
@@ -703,6 +705,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                 api_key=openai_token,
                 base_url=openai_url,
                 organization=organization,
+                default_headers=default_headers,
                 max_retries=max_retries,
             )
             log.info(
