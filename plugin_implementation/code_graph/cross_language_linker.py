@@ -24,6 +24,7 @@ heuristic can outweigh a real AST-derived structural edge.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -33,6 +34,8 @@ import networkx as nx
 from .api_surface_extractor import APISurface
 from ..feature_flags import FeatureFlags, get_feature_flags
 from ..graph_orphan_hybrid import rrf_fuse
+
+logger = logging.getLogger(__name__)
 
 
 # DEPRECATION CANDIDATE — see _graph_audit/GAP_ANALYSIS_AND_ROADMAP.md §A14
@@ -47,6 +50,15 @@ from ..graph_orphan_hybrid import rrf_fuse
 # replacement in Phase D (contract-node abstraction).
 _WEIGHT_FLOOR = 0.3
 _WEIGHT_CEIL = 0.8
+
+# A surface implemented/consumed by more than this many nodes is
+# ubiquitous — its specificity factor (``1 / log(1 + N)``) is already near
+# the floor at this fan-out, so the edges it would produce carry almost no
+# signal — while pairing every participant (O(k^2)) is exactly the
+# superlinear blowup that stalled Phase 1c on a repo with a minified JS
+# bundle (thousands of near-identical slice-fallback nodes sharing one
+# surface). Skip the surface's pairing pass above this threshold instead.
+MAX_L1_SURFACE_FANOUT = 64
 
 
 def _clamp(w: float) -> float:
@@ -144,6 +156,8 @@ def _link_l1_via_contract_nodes(
 ) -> List[Tuple[str, str, dict]]:
     """L1 linking through materialized contract nodes."""
     out: List[Tuple[str, str, dict]] = []
+    skipped_surfaces = 0
+    largest_skipped_fanout = 0
 
     for contract_id, cdata in contract_nodes:
         kind = cdata.get("signature", "")
@@ -163,13 +177,23 @@ def _link_l1_via_contract_nodes(
         ]
         if len(predecessors) < 2:
             continue
+        # A surface this ubiquitous would cost O(k^2) pairs for a
+        # specificity factor that's already near the floor — see
+        # MAX_L1_SURFACE_FANOUT.
+        if len(predecessors) > MAX_L1_SURFACE_FANOUT:
+            skipped_surfaces += 1
+            largest_skipped_fanout = max(largest_skipped_fanout, len(predecessors))
+            continue
         specificity = 1.0 / math.log(1.0 + len(predecessors))
+        # Pre-compute each predecessor's language once instead of
+        # re-resolving it on every pair inside the double loop below.
+        pred_langs = [_node_language(g, src) for src in predecessors]
 
         for i in range(len(predecessors)):
             for j in range(i + 1, len(predecessors)):
-                src, tgt = predecessors[i], predecessors[j]
-                if _node_language(g, src) == _node_language(g, tgt):
+                if pred_langs[i] == pred_langs[j]:
                     continue
+                src, tgt = predecessors[i], predecessors[j]
                 weight = _clamp(0.7 * _locality_factor(g, src, tgt) * specificity)
                 attrs = {
                     "relationship_type": "cross_language_L1",
@@ -186,6 +210,12 @@ def _link_l1_via_contract_nodes(
                     },
                 }
                 out.append((src, tgt, attrs))
+    if skipped_surfaces:
+        logger.info(
+            "L1 (contract nodes): skipped %d ubiquitous surface(s) over "
+            "the %d-node fan-out cap (largest=%d)",
+            skipped_surfaces, MAX_L1_SURFACE_FANOUT, largest_skipped_fanout,
+        )
     return out
 
 
@@ -202,8 +232,14 @@ def _link_l1_legacy(
             by_surface[(s["kind"], s["surface"])].append((node_id, s))
 
     out: List[Tuple[str, str, dict]] = []
+    skipped_surfaces = 0
+    largest_skipped_fanout = 0
     for (kind, surface), nodes in by_surface.items():
         if len(nodes) < 2:
+            continue
+        if len(nodes) > MAX_L1_SURFACE_FANOUT:
+            skipped_surfaces += 1
+            largest_skipped_fanout = max(largest_skipped_fanout, len(nodes))
             continue
         specificity = 1.0 / math.log(1.0 + len(nodes))
         for i in range(len(nodes)):
@@ -226,6 +262,12 @@ def _link_l1_legacy(
                     },
                 }
                 out.append((src, tgt, attrs))
+    if skipped_surfaces:
+        logger.info(
+            "L1 (legacy): skipped %d ubiquitous surface(s) over the "
+            "%d-node fan-out cap (largest=%d)",
+            skipped_surfaces, MAX_L1_SURFACE_FANOUT, largest_skipped_fanout,
+        )
     return out
 
 
@@ -255,8 +297,14 @@ def link_api_surface_any_language(
             by_surface[(s["kind"], s["surface"])].append((node_id, s))
 
     out: List[Tuple[str, str, dict]] = []
+    skipped_surfaces = 0
+    largest_skipped_fanout = 0
     for (kind, surface), nodes in by_surface.items():
         if len(nodes) < 2:
+            continue
+        if len(nodes) > MAX_L1_SURFACE_FANOUT:
+            skipped_surfaces += 1
+            largest_skipped_fanout = max(largest_skipped_fanout, len(nodes))
             continue
         specificity = 1.0 / math.log(1.0 + len(nodes))
         for i in range(len(nodes)):
@@ -277,6 +325,12 @@ def link_api_surface_any_language(
                     },
                 }
                 out.append((src, tgt, attrs))
+    if skipped_surfaces:
+        logger.info(
+            "link_api_surface_any_language: skipped %d ubiquitous "
+            "surface(s) over the %d-node fan-out cap (largest=%d)",
+            skipped_surfaces, MAX_L1_SURFACE_FANOUT, largest_skipped_fanout,
+        )
     return out
 
 

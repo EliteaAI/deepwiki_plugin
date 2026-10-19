@@ -32,8 +32,46 @@ with both ``@router.get("/")`` and ``@router.head("/")``).
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
+
+logger = logging.getLogger(__name__)
+
+# Phase 1c scaling guards (see _graph_audit — the "silent stall" on a
+# 589K-node repo containing a minified JS bundle). Both bound the amount of
+# text handed to the regex matchers per node so a single pathological
+# symbol (e.g. 33K minified-JS nodes all slicing the same ~200KB line)
+# can't make the whole phase run for hours.
+#
+# MAX_SURFACE_SCAN_CHARS: the text handed to the per-node matchers
+# (``extract_api_surfaces``) is truncated to this length. Real decorators/
+# routes/structs are always near the top of a symbol's body, so truncating
+# a huge body changes nothing for normal code and only drops noise for
+# generated/minified blobs.
+MAX_SURFACE_SCAN_CHARS = 100_000
+# MAX_SLICE_CHARS: the disk-slice fallback in ``_file_slice`` (used when the
+# parser left ``source_text`` empty) returns "" when the requested
+# [start_line..end_line] slice is longer than this. A slice this long for a
+# single symbol is minified/generated code where ``start_line == end_line``
+# for every symbol on the file — scanning it once per symbol is what caused
+# the O(symbols * line_length) blowup.
+MAX_SLICE_CHARS = 20_000
+# _FILE_SCAN_CAP_CHARS: the whole-file scans in extract_api_surfaces_for_graph
+# (_python_router_prefix, _python_ctypes_lib_vars, _grpc_stub_bindings) read
+# an entire file rather than a per-symbol slice, so this caps their input to
+# 10x the per-node cap — generous for real source files, bounded for an
+# accidentally-huge generated/vendored one.
+_FILE_SCAN_CAP_CHARS = MAX_SURFACE_SCAN_CHARS * 10
+
+# Doc/XML chunk nodes (``analysis_level == "documentation"``) make up the
+# bulk of node count on a doc-heavy repo (553K of 589K nodes in the repo
+# that motivated this fix) but only ever produce a surface via a handful
+# of matchers. Skip the full matcher pass for them UNLESS the node is a
+# proto/IDL schema (``_match_grpc`` needs it) or lives in one of these
+# doc-with-surfaces file types (BDD .feature/.story, GraphQL SDL).
+_DOC_SURFACE_FILE_SUFFIXES = (".feature", ".story", ".graphql", ".gql")
 
 
 class APISurface(TypedDict):
@@ -345,9 +383,13 @@ _GO_GRPC_SERVER = re.compile(
 _GO_GRPC_METHOD = re.compile(
     r"^\s+(?P<rpc>[A-Z]\w*)\s*\(", re.MULTILINE
 )
-# Go: ``<Svc>_<Rpc>_FullMethodName = "/<pkg>.<Svc>/<Rpc>"``
+# Go: ``<Svc>_<Rpc>_FullMethodName = "/<pkg>.<Svc>/<Rpc>"``. Anchored with
+# ``\b`` and restricted to the alphanumeric-only identifier shape protoc
+# actually generates (no leading ``\w+`` backtrack) so this can't go
+# quadratic/cubic on a long non-matching identifier (see Phase 1c perf
+# note: this pattern measured ~cubic on a synthetic ``a_a_a_...`` blob).
 _GO_GRPC_FULLMETHOD = re.compile(
-    r'(?P<svc>\w+)_(?P<rpc>\w+)_FullMethodName\s*=\s*"[^"]*"'
+    r'\b(?P<svc>[A-Za-z0-9]+)_(?P<rpc>[A-Za-z0-9]+)_FullMethodName\s*=\s*"[^"]*"'
 )
 
 # Java: ``extends <Svc>Grpc.<Svc>ImplBase``
@@ -378,7 +420,7 @@ _JS_GRPC_ADDSERVICE = re.compile(
 _JS_GRPC_HANDLER_MAP = re.compile(
     r"{\s*(?P<methods>[^}]+)}\s*\)"
 )
-_JS_GRPC_METHOD_KEY = re.compile(r"(?P<rpc>\w+)\s*:")
+_JS_GRPC_METHOD_KEY = re.compile(r"\b(?P<rpc>\w+)\s*:")
 
 # C++: ``class <Svc>::Service`` / ``Status <Rpc>(ServerContext*``
 _CPP_GRPC_SERVICE = re.compile(
@@ -463,7 +505,10 @@ def _match_grpc(text: str, language: str) -> List[APISurface]:
                     weight_hint=0.7,
                     metadata={"service": svc, "method": rpc},
                 ))
-        for fm in _GO_GRPC_FULLMETHOD.finditer(text):
+        # Cheap substring prefilter: skip the finditer pass entirely when
+        # the marker token isn't present (avoids running the regex over
+        # every Go file/node for a pattern that almost never matches).
+        for fm in (_GO_GRPC_FULLMETHOD.finditer(text) if "_FullMethodName" in text else ()):
             svc = fm.group("svc")
             rpc = fm.group("rpc")
             out.append(APISurface(
@@ -600,52 +645,58 @@ _GO_GRPC_CLIENT_CHAIN = re.compile(
     r"New(?P<svc>[A-Z]\w*?)Client\s*\([^()]*\)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(",
 )
 # Go: stored client ``cs := pb.NewCartServiceClient(conn)`` → var→service.
+# ``\b`` anchors on the leading unanchored ``\w+`` groups below (Phase 1c
+# perf hardening) so a long non-matching identifier can't be re-scanned
+# from every offset — see the module docstring in cause 4 of the audit.
 _GO_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*:?=\s*[\w.]*New(?P<svc>[A-Z]\w*?)Client\s*\(",
+    r"\b(?P<var>\w+)\s*:?=\s*[\w.]*New(?P<svc>[A-Z]\w*?)Client\s*\(",
 )
 
 # Python: chained ``ProductCatalogServiceStub(channel).ListProducts(...)``.
 _PY_GRPC_CLIENT_CHAIN = re.compile(
-    r"(?P<svc>[A-Z]\w*?)Stub\s*\([^()]*\)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(",
+    r"\b(?P<svc>[A-Z]\w*?)Stub\s*\([^()]*\)\s*\.\s*(?P<rpc>[A-Z]\w*)\s*\(",
 )
 # Python: ``stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)``.
 _PY_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*[\w.]*?(?P<svc>[A-Z]\w*?)Stub\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*[\w.]*?(?P<svc>[A-Z]\w*?)Stub\s*\(",
 )
 
 # Java: ``blockingStub = AdServiceGrpc.newBlockingStub(channel)`` plus the
 # type declaration ``AdServiceGrpc.AdServiceBlockingStub blockingStub;``.
 _JAVA_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*(?:\w+\.)*(?P<svc>[A-Z]\w*?)Grpc\.new\w*Stub\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*(?:\w+\.)*(?P<svc>[A-Z]\w*?)Grpc\.new\w*Stub\s*\(",
 )
 _JAVA_GRPC_CLIENT_TYPE = re.compile(
-    r"(?:\w+\.)*(?P<svc>[A-Z]\w*?)Grpc\.\w*Stub\s+(?P<var>\w+)\b",
+    # No ``(?:\w+\.)*`` package-qualifier prefix: only the groups are used,
+    # the scan still finds ``<Svc>Grpc`` after any ``pkg.`` qualifier, and
+    # the prefix backtracked quadratically on long dotted runs (minified JS).
+    r"\b(?P<svc>[A-Z]\w*?)Grpc\.\w*Stub\s+(?P<var>\w+)\b",
 )
 
 # C#: ``var client = new CartServiceClient(channel)``.
 _CS_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
 )
 
 # JavaScript / TypeScript (grpc-js): ``const c = new pkg.<Svc>Client(addr, creds)``
 # — same generated-name convention as C#. Method calls are lowerCamel.
 _JS_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*new\s+(?:\w+\.)*(?P<svc>[A-Z]\w*?)Client\s*\(",
 )
 
 # C++ (gRPC): ``auto stub = <Svc>::NewStub(channel)`` plus the unique_ptr
 # type declaration ``std::unique_ptr<<Svc>::Stub> stub``. Calls use ``->``.
 _CPP_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*(?:[\w:]+::)?(?P<svc>[A-Z]\w*?)::NewStub\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*(?:[\w:]+::)?(?P<svc>[A-Z]\w*?)::NewStub\s*\(",
 )
 _CPP_GRPC_CLIENT_TYPE = re.compile(
-    r"(?:\w+::)*(?P<svc>[A-Z]\w*?)::Stub\s*>\s*(?P<var>\w+)\b",
+    r"\b(?:\w+::)*(?P<svc>[A-Z]\w*?)::Stub\s*>\s*(?P<var>\w+)\b",
 )
 
 # Rust (tonic): ``let mut c = <Svc>Client::connect(addr)`` / ``::new(channel)``.
 # Method calls are snake_case → PascalCase.
 _RUST_GRPC_CLIENT_BIND = re.compile(
-    r"(?P<var>\w+)\s*=\s*(?:\w+::)*(?P<svc>[A-Z]\w*?)Client::(?:connect|new|with_\w+)\s*\(",
+    r"\b(?P<var>\w+)\s*=\s*(?:\w+::)*(?P<svc>[A-Z]\w*?)Client::(?:connect|new|with_\w+)\s*\(",
 )
 
 # Generic ``<var>.<Rpc>(`` call site (PascalCase rpc — Go/Python/C#).
@@ -668,32 +719,44 @@ def extract_grpc_stub_bindings(text: str, language: str) -> Dict[str, str]:
     this map a ``stub.ListProducts(...)`` invocation can't be attributed
     to ``ProductCatalogService``.
     """
+    # Cheap substring prefilters per language: every binding regex below
+    # requires one of these literal tokens, so skip the (possibly costly)
+    # finditer pass entirely for files/symbols that can't possibly match
+    # (e.g. the 553K doc/XML nodes and the minified JS bundle that
+    # motivated this guard).
     bindings: Dict[str, str] = {}
     if language == "go":
-        for m in _GO_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
+        if "Client" in text:
+            for m in _GO_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
     elif language == "python":
-        for m in _PY_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
+        if "Stub" in text:
+            for m in _PY_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
     elif language == "java":
-        for m in _JAVA_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
-        for m in _JAVA_GRPC_CLIENT_TYPE.finditer(text):
-            bindings.setdefault(m.group("var"), m.group("svc"))
+        if "Grpc" in text:
+            for m in _JAVA_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
+            for m in _JAVA_GRPC_CLIENT_TYPE.finditer(text):
+                bindings.setdefault(m.group("var"), m.group("svc"))
     elif language == "csharp":
-        for m in _CS_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
+        if "Client" in text:
+            for m in _CS_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
     elif language in ("javascript", "typescript"):
-        for m in _JS_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
+        if "Client" in text:
+            for m in _JS_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
     elif language in ("cpp", "c++"):
-        for m in _CPP_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
-        for m in _CPP_GRPC_CLIENT_TYPE.finditer(text):
-            bindings.setdefault(m.group("var"), m.group("svc"))
+        if "Stub" in text:
+            for m in _CPP_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
+            for m in _CPP_GRPC_CLIENT_TYPE.finditer(text):
+                bindings.setdefault(m.group("var"), m.group("svc"))
     elif language == "rust":
-        for m in _RUST_GRPC_CLIENT_BIND.finditer(text):
-            bindings[m.group("var")] = m.group("svc")
+        if "Client::" in text:
+            for m in _RUST_GRPC_CLIENT_BIND.finditer(text):
+                bindings[m.group("var")] = m.group("svc")
     return bindings
 
 
@@ -932,7 +995,7 @@ _OBJ_RUST_STRUCT = re.compile(
 )
 _OBJ_RUST_FIELD = re.compile(
     r"(?:#\[serde\([^)]*?rename\s*=\s*\"(?P<rename>[^\"]+)\"[^)]*\)\]\s*)?"
-    r"(?:pub\s+)?(?P<name>[a-zA-Z_]\w*)\s*:\s*[^,\n]+,?",
+    r"(?:pub\s+)?\b(?P<name>[a-zA-Z_]\w*)\s*:\s*[^,\n]+,?",
 )
 
 # C# class / record. Body uses nested-brace-aware matching: scan whole
@@ -1499,6 +1562,12 @@ def extract_api_surfaces(
         text = getattr(symbol, "source_text", "") if symbol is not None else ""
     if not text:
         return []
+    # Cap what the matchers scan per node. Real decorators/routes/structs
+    # sit near the top of a symbol's body, so this is a no-op for normal
+    # code and only drops noise on pathologically large bodies (e.g. a
+    # minified-JS slice that re-scanned a ~200KB line per symbol).
+    if len(text) > MAX_SURFACE_SCAN_CHARS:
+        text = text[:MAX_SURFACE_SCAN_CHARS]
     language = (node_data.get("language") or "").lower()
     symbol_name = node_data.get("symbol_name") or ""
 
@@ -1520,8 +1589,13 @@ def extract_api_surfaces(
     # Pylon-style class-API producer (no decorators; route inferred
     # from rel_path; HTTP verb from method names of an APIBase /
     # MethodView / Resource subclass). Skips silently for any class
-    # that doesn't match the inheritance pattern.
-    surfaces.extend(_match_pylon_api(node_data, plugin_name=plugin_name))
+    # that doesn't match the inheritance pattern. ``_match_pylon_api``
+    # reads ``source_text`` directly from the node dict rather than the
+    # local ``text``, so give it a shallow copy carrying the same
+    # truncated text instead of mutating the caller's node_data.
+    surfaces.extend(_match_pylon_api(
+        dict(node_data, source_text=text), plugin_name=plugin_name,
+    ))
 
     # De-duplicate while preserving order; tag the first occurrence wins.
     seen = set()
@@ -1583,6 +1657,18 @@ def extract_api_surfaces_for_graph(
     # resolves outbound call sites in another (cross-slice consumers).
     file_grpc_bindings: Dict[str, Dict[str, str]] = {}
 
+    # Phase 1c run-level counters, surfaced in the summary log at the end
+    # of the loop below (see cause 6 of the audit: a long run with no
+    # progress output looks like a deadlock).
+    stats = {
+        "nodes_visited": 0,
+        "nodes_scanned": 0,
+        "doc_nodes_skipped": 0,
+        "slices_skipped": 0,
+        "texts_truncated": 0,
+        "surfaces_found": 0,
+    }
+
     def _file_slice(rel_path: str, start_line: int, end_line: int) -> str:
         """Return source ``[start_line..end_line]`` (1-based, inclusive)
         from disk. Used when the parser left ``source_text`` empty for
@@ -1590,6 +1676,12 @@ def extract_api_surfaces_for_graph(
         nodes, Go ``const`` group members. Without this, the obj/rest/
         grpc/etc. matchers have nothing to scan and these symbols never
         produce surfaces — even though their full body is on disk.
+
+        Returns ``""`` (and counts a skip) when the slice is longer than
+        ``MAX_SLICE_CHARS``: a slice that long for a single symbol is
+        minified/generated code where every symbol on the file shares the
+        same ``start_line == end_line``, so re-scanning it once per symbol
+        is the O(symbols * line_length) blowup this guard exists for.
         """
         if not rel_path or not repo_root or start_line <= 0 or end_line < start_line:
             return ""
@@ -1611,6 +1703,12 @@ def extract_api_surfaces_for_graph(
         e = min(len(lines), end_line)
         if e <= s:
             return ""
+        # Sum line lengths before joining so we never materialise (or
+        # regex-scan) a giant string just to discover it's too big.
+        total_len = sum(len(ln) for ln in lines[s:e]) + max(0, e - s - 1)
+        if total_len > MAX_SLICE_CHARS:
+            stats["slices_skipped"] += 1
+            return ""
         return "\n".join(lines[s:e])
 
     def _python_router_prefix(rel_path: str) -> str:
@@ -1624,11 +1722,17 @@ def extract_api_surfaces_for_graph(
             if not full.is_file():
                 file_prefix_cache[rel_path] = ""
                 return ""
-            content = full.read_text(encoding="utf-8", errors="ignore")
+            # Cap the whole-file scan — these helpers read the entire file
+            # (not a per-symbol slice), so an unbounded read on a huge
+            # generated file is the same O(file_size) cost repeated per
+            # Python file in the repo.
+            content = full.read_text(encoding="utf-8", errors="ignore")[:_FILE_SCAN_CAP_CHARS]
         except Exception:
             file_prefix_cache[rel_path] = ""
             return ""
-        m = _PY_ROUTER_PREFIX.search(content)
+        # Cheap substring prefilter: _PY_ROUTER_PREFIX always matches on
+        # the literal "prefix" keyword argument.
+        m = _PY_ROUTER_PREFIX.search(content) if "prefix" in content else None
         prefix = m.group(1) if m else ""
         file_prefix_cache[rel_path] = prefix
         return prefix
@@ -1644,11 +1748,16 @@ def extract_api_surfaces_for_graph(
             if not full.is_file():
                 file_ctypes_libs[rel_path] = set()
                 return set()
-            content = full.read_text(encoding="utf-8", errors="ignore")
+            content = full.read_text(encoding="utf-8", errors="ignore")[:_FILE_SCAN_CAP_CHARS]
         except Exception:
             file_ctypes_libs[rel_path] = set()
             return set()
-        names = {m.group("var") for m in _PY_CTYPES_LIB.finditer(content)}
+        # Cheap substring prefilter: skip the regex pass on files that
+        # can't possibly declare a ctypes binding.
+        names = (
+            {m.group("var") for m in _PY_CTYPES_LIB.finditer(content)}
+            if "ctypes" in content else set()
+        )
         file_ctypes_libs[rel_path] = names
         return names
 
@@ -1676,10 +1785,12 @@ def extract_api_surfaces_for_graph(
             if not full.is_file():
                 file_grpc_bindings[rel_path] = {}
                 return {}
-            content = full.read_text(encoding="utf-8", errors="ignore")
+            content = full.read_text(encoding="utf-8", errors="ignore")[:_FILE_SCAN_CAP_CHARS]
         except Exception:
             file_grpc_bindings[rel_path] = {}
             return {}
+        # extract_grpc_stub_bindings already applies its own per-language
+        # substring prefilter before running any regex.
         bindings = extract_grpc_stub_bindings(content, language)
         file_grpc_bindings[rel_path] = bindings
         return bindings
@@ -1724,15 +1835,43 @@ def extract_api_surfaces_for_graph(
             plugin_name = _name
             break
 
+    total_nodes = g.number_of_nodes()
+    logger.info("Phase 1c: scanning API surfaces over %d nodes", total_nodes)
+    start_time = time.monotonic()
+
     out: Dict[str, List[APISurface]] = {}
     for node_id, data in g.nodes(data=True):
+        stats["nodes_visited"] += 1
+        if stats["nodes_visited"] % 50_000 == 0:
+            logger.info(
+                "Phase 1c: visited %d/%d nodes (%.1fs elapsed, %d surfaces so far)",
+                stats["nodes_visited"], total_nodes,
+                time.monotonic() - start_time, stats["surfaces_found"],
+            )
+
+        # Doc/XML chunk nodes dominate node count on doc-heavy repos but
+        # almost never carry a code-level API surface. Skip the whole
+        # matcher pass for them unless they're a proto/IDL schema (which
+        # ``_match_grpc`` relies on) or one of the doc file types that DO
+        # carry real surfaces (BDD feature files, GraphQL SDL).
+        language = (data.get("language") or "").lower()
+        rel_path_lower = (data.get("rel_path") or "").lower()
+        if (
+            data.get("analysis_level") == "documentation"
+            and language != "schema"
+            and not rel_path_lower.endswith(_DOC_SURFACE_FILE_SUFFIXES)
+        ):
+            stats["doc_nodes_skipped"] += 1
+            continue
+
+        stats["nodes_scanned"] += 1
+
         # For Python nodes, splice the file-level router-prefix line into
         # the symbol's source_text so _match_rest_python's regex can find
         # it. Cheap one-line synthetic prepend; original text preserved.
         scratch_text: Optional[str] = None
         slice_filled = False
         original_source_text = data.get("source_text")
-        language = (data.get("language") or "").lower()
 
         # Step 0: source-text slice fallback. Some parsers (notably the
         # TypeScript parser for ``type_alias`` symbols and certain Go
@@ -1760,6 +1899,10 @@ def extract_api_surfaces_for_graph(
                 base = data.get("source_text") or ""
                 scratch_text = f'router = APIRouter(prefix="{prefix}")\n' + base
                 data["source_text"] = scratch_text
+
+        if len(data.get("source_text") or "") > MAX_SURFACE_SCAN_CHARS:
+            stats["texts_truncated"] += 1
+
         try:
             surfaces = extract_api_surfaces(
                 data,
@@ -1814,6 +1957,17 @@ def extract_api_surfaces_for_graph(
         # column.
         data["api_surface"] = surfaces
         out[str(node_id)] = surfaces
+        stats["surfaces_found"] += len(surfaces)
+
+    logger.info(
+        "Phase 1c: API surface scan done — visited=%d scanned=%d "
+        "doc_skipped=%d slices_skipped=%d truncated=%d surfaces=%d "
+        "elapsed=%.1fs",
+        stats["nodes_visited"], stats["nodes_scanned"],
+        stats["doc_nodes_skipped"], stats["slices_skipped"],
+        stats["texts_truncated"], stats["surfaces_found"],
+        time.monotonic() - start_time,
+    )
     return out
 
 
