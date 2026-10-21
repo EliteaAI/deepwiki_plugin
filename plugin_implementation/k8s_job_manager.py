@@ -49,6 +49,10 @@ class K8sJobManager:
         self.base_path = base_path or os.environ.get(
             "DEEPWIKI_BASE_PATH", "/data/wiki_builder"
         )
+        save_to_evict = os.environ.get("SAVE_TO_EVICT", "true").strip().lower()
+        self.safe_to_evict_label = (
+            save_to_evict if save_to_evict in ("true", "false") else "true"
+        )
         self.jobs_dir = Path(self.base_path) / "jobs"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         
@@ -583,7 +587,8 @@ echo "[init] Bootstrap finished successfully"
                 labels={
                     "app": "deepwiki-worker",
                     "job-id": job_id,
-                    "created-by": "deepwiki-controller"
+                    "created-by": "deepwiki-controller",
+                    "cluster-autoscaler.kubernetes.io/safe-to-evict": self.safe_to_evict_label,
                 }
             ),
             spec=client.V1JobSpec(
@@ -594,7 +599,8 @@ echo "[init] Bootstrap finished successfully"
                     metadata=client.V1ObjectMeta(
                         labels={
                             "app": "deepwiki-worker",
-                            "job-id": job_id
+                            "job-id": job_id,
+                            "cluster-autoscaler.kubernetes.io/safe-to-evict": self.safe_to_evict_label,
                         }
                     ),
                     spec=client.V1PodSpec(
