@@ -2,7 +2,57 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+
+def normalize_repositories(value: Any) -> List[str]:
+    """Coerce a toolkit repository setting into a de-duplicated list of names.
+
+    Mirrors elitea_sdk ADO Repos ``normalize_repositories``: legacy toolkits
+    store a single string, multi-repo toolkits (EL-6610) store a list that may
+    be empty.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    elif not isinstance(value, (list, tuple)):
+        value = [value]
+    repositories: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        item = str(item).strip()
+        if item and item not in repositories:
+            repositories.append(item)
+    return repositories
+
+
+def select_single_repository(value: Any) -> Optional[str]:
+    """Pick the one repository DeepWiki works on from a toolkit setting.
+
+    DeepWiki indexes exactly one repository. With several configured, the
+    first one is used — the same default the ADO Repos toolkit binds per call.
+    Returns None when nothing is configured.
+    """
+    repositories = normalize_repositories(value)
+    return repositories[0] if repositories else None
+
+
+def repository_from_identifier(repo_identifier: Any, provider_type: Optional[str] = None) -> Optional[str]:
+    """Recover the toolkit-level repository from a canonical ``repo:branch[:commit]`` id.
+
+    ADO canonical ids are ``org/project/repo`` while the toolkit field holds the
+    repository name only.
+    """
+    if not isinstance(repo_identifier, str):
+        return None
+    path = repo_identifier.strip().split(":", 1)[0].strip("/")
+    if not path:
+        return None
+    if provider_type in ("ado_repos", "ado", "azure_devops"):
+        return path.rsplit("/", 1)[-1] or None
+    return path
 
 
 def canonical_repository_path(repository: str, clone_config: Optional[Any] = None) -> str:
