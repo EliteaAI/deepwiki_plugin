@@ -360,8 +360,10 @@ def create_clone_config_from_expanded_toolkit(
         
     elif ptype == ProviderType.AZURE_DEVOPS:
         provider_config = toolkit_settings.get('ado_configuration', {})
-        # ADO uses repository_id field
-        repository = toolkit_settings.get('repository_id', '')
+        # ADO uses repository_id field: a legacy string or, since multi-repo
+        # support, a possibly empty list. DeepWiki works on exactly one.
+        from ..repository_identity import select_single_repository
+        repository = select_single_repository(toolkit_settings.get('repository_id')) or ''
         branch = toolkit_settings.get('active_branch') or toolkit_settings.get('base_branch', 'main')
         # Project comes from ado_configuration
         project = provider_config.get('project', '')

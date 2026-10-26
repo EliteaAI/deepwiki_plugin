@@ -58,11 +58,25 @@ function mergeToolkitIdentitySettings(settings, toolkitConfig) {
   return merged;
 }
 
+// Code toolkits store the repository as a legacy string or, since multi-repo
+// support (ADO Repos), as a possibly empty list. DeepWiki works on one: the first.
+function firstConfiguredRepository(value) {
+  const values = Array.isArray(value) ? value : [value];
+  for (const item of values) {
+    if (typeof item === 'string' && item.trim()) return item.trim();
+  }
+  return null;
+}
+
 function buildAdoRepositoryIdentifier(settings) {
   if (!settings || typeof settings !== 'object') return null;
 
   const adoConfig = getAdoConfig(settings);
-  const repository = settings.toolkit_configuration_repository_id || settings.repository_id || settings.repository || settings.repo;
+  const repository =
+    firstConfiguredRepository(settings.toolkit_configuration_repository_id) ||
+    firstConfiguredRepository(settings.repository_id) ||
+    firstConfiguredRepository(settings.repository) ||
+    firstConfiguredRepository(settings.repo);
   const project = adoConfig.project || settings.toolkit_configuration_project || settings.project;
   const organization = adoConfig.organization || settings.organization || extractAdoOrganization(adoConfig);
 
@@ -787,6 +801,48 @@ tests.push({
 
     if (identity.repository !== 'epameliteatest/TestProject/TestRepo') {
       throw new Error(`Expected visualstudio repo path with org, got '${identity.repository}'`);
+    }
+  }
+});
+
+tests.push({
+  name: 'Builds ADO repository identifier from list-type repository_id (#7186)',
+  fn: () => {
+    const settings = {
+      ado_configuration: { organization_url: 'https://dev.azure.com/epameliteatest/', project: 'TestProject' },
+      repository_id: ['mb-java']
+    };
+    const result = getConfiguredRepo({}, settings, null);
+    if (result !== 'epameliteatest/TestProject/mb-java') {
+      throw new Error(`Expected 'epameliteatest/TestProject/mb-java', got '${result}'`);
+    }
+  }
+});
+
+tests.push({
+  name: 'Uses the first repository when ADO toolkit lists several (#7186)',
+  fn: () => {
+    const settings = {
+      toolkit_configuration_ado_configuration: { organization_url: 'https://dev.azure.com/epameliteatest/', project: 'TestProject' },
+      toolkit_configuration_repository_id: [' ', 'mb-java', 'other-repo']
+    };
+    const result = getConfiguredRepo({}, settings, null);
+    if (result !== 'epameliteatest/TestProject/mb-java') {
+      throw new Error(`Expected 'epameliteatest/TestProject/mb-java', got '${result}'`);
+    }
+  }
+});
+
+tests.push({
+  name: 'Empty ADO repository list yields no configured repository (#7186)',
+  fn: () => {
+    const settings = {
+      ado_configuration: { organization_url: 'https://dev.azure.com/epameliteatest/', project: 'TestProject' },
+      repository_id: []
+    };
+    const result = getConfiguredRepo({}, settings, null);
+    if (result !== null) {
+      throw new Error(`Expected null, got '${result}'`);
     }
   }
 });

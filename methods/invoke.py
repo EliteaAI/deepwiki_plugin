@@ -31,6 +31,17 @@ except ImportError:  # Standalone test/subprocess import mode
         artifact_auth_headers,
     )
 
+try:
+    from ..plugin_implementation.repository_identity import (
+        normalize_repositories,
+        repository_from_identifier,
+    )
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.repository_identity import (
+        normalize_repositories,
+        repository_from_identifier,
+    )
+
 default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
@@ -443,6 +454,20 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         repo_config['repository'] = params.get('github_repository')
         repo_config['branch'] = params.get('github_base_branch') or params.get('github_branch', 'main')
 
+    # Code toolkits may store the repository as a legacy string or, since
+    # multi-repo support (EL-6610, ADO Repos), as a possibly empty list.
+    # DeepWiki indexes exactly one repository: use the first configured one,
+    # the same default the ADO Repos toolkit binds per call.
+    repositories = normalize_repositories(repo_config.get('repository'))
+    if len(repositories) > 1:
+        log.warning(
+            'Code toolkit has %d repositories configured (%s); DeepWiki uses the first one: %s',
+            len(repositories),
+            ', '.join(repositories),
+            repositories[0],
+        )
+    repo_config['repository'] = repositories[0] if repositories else None
+
     if _payload_contains_provider_key(params, 'ado_configuration') and (
         repo_config.get('provider_type') != 'ado_repos' or not repo_config.get('repository')
     ):
@@ -455,6 +480,40 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return repo_config
+
+
+_PROVIDER_TOOLKIT_LABELS = {
+    'github': 'GitHub',
+    'gitlab': 'GitLab',
+    'bitbucket': 'Bitbucket',
+    'ado_repos': 'ADO Repos',
+}
+
+
+def _missing_repository_error(
+    repo_config: Dict[str, Any],
+    repo_identifier_override: Any = None,
+    allow_override: bool = True,
+) -> Optional[ValueError]:
+    """Fail fast when no single repository can be determined for a DeepWiki tool.
+
+    Fills ``repo_config['repository']`` from ``repo_identifier_override`` when the
+    toolkit has none configured. Returns the user-facing error, or None.
+    """
+    if repo_config.get('repository'):
+        return None
+    provider_type = repo_config.get('provider_type')
+    if allow_override:
+        repository = repository_from_identifier(repo_identifier_override, provider_type)
+        if repository:
+            repo_config['repository'] = repository
+            return None
+    label = _PROVIDER_TOOLKIT_LABELS.get(provider_type, 'code')
+    message = f"The selected {label} toolkit has no repository configured. Specify a repository in the toolkit"
+    if allow_override:
+        message += " or pass `repo_identifier_override`"
+    return ValueError(message + ".")
+
 
 class Method:  # pylint: disable=E1101,R0903,W0201
     """
@@ -1456,6 +1515,15 @@ Do not include any explanation or other text."""
 
                 # Extract repository configuration from expanded code_toolkit
                 repo_config = _extract_repo_config_from_toolkit(params)
+                missing_repository = _missing_repository_error(repo_config, allow_override=False)
+                if missing_repository is not None:
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=model_name,
+                        exception=missing_repository,
+                        include_traceback=False,
+                    )
 
                 result = self.generate_wiki(
                     query=params["query"],
@@ -1480,6 +1548,18 @@ Do not include any explanation or other text."""
                 # Extract repository configuration from expanded code_toolkit
                 repo_config = _extract_repo_config_from_toolkit(params)
 
+                missing_repository = _missing_repository_error(
+                    repo_config, params.get('repo_identifier_override')
+                )
+                if missing_repository is not None:
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=None,
+                        exception=missing_repository,
+                        include_traceback=False,
+                    )
+
                 # Get question from tool_params
                 question = params.get('question', '')
                 chat_history = params.get('chat_history', [])
@@ -1503,6 +1583,18 @@ Do not include any explanation or other text."""
 
                 # Extract repository configuration from expanded code_toolkit
                 repo_config = _extract_repo_config_from_toolkit(params)
+
+                missing_repository = _missing_repository_error(
+                    repo_config, params.get('repo_identifier_override')
+                )
+                if missing_repository is not None:
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=None,
+                        exception=missing_repository,
+                        include_traceback=False,
+                    )
 
                 # Get question and research params from tool_params
                 question = params.get('question', '')

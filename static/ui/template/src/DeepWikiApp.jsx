@@ -325,11 +325,25 @@ function extractAdoOrganization(adoConfig) {
   return null;
 }
 
+// Code toolkits store the repository as a legacy string or, since multi-repo
+// support (ADO Repos), as a possibly empty list. DeepWiki works on one: the first.
+function firstConfiguredRepository(value) {
+  const values = Array.isArray(value) ? value : [value];
+  for (const item of values) {
+    if (typeof item === 'string' && item.trim()) return item.trim();
+  }
+  return null;
+}
+
 function buildAdoRepositoryIdentifier(settings) {
   if (!settings || typeof settings !== 'object') return null;
 
   const adoConfig = getAdoConfig(settings);
-  const repository = settings.toolkit_configuration_repository_id || settings.repository_id || settings.repository || settings.repo;
+  const repository =
+    firstConfiguredRepository(settings.toolkit_configuration_repository_id) ||
+    firstConfiguredRepository(settings.repository_id) ||
+    firstConfiguredRepository(settings.repository) ||
+    firstConfiguredRepository(settings.repo);
   const project = adoConfig.project || settings.toolkit_configuration_project || settings.project;
   const organization = adoConfig.organization || settings.organization || extractAdoOrganization(adoConfig);
 
