@@ -594,7 +594,7 @@ echo "[init] Bootstrap finished successfully"
             spec=client.V1JobSpec(
                 ttl_seconds_after_finished=self.ttl_seconds,
                 backoff_limit=0,  # No retries - fail fast
-                # active_deadline_seconds=3600,  # no need since there might be the runs for the big repos which need way more than 1 hour.
+                active_deadline_seconds=os.environ.get("ACTIVE_DEADLINE_SECONDS", "86400"), # default is 1 day deadline since there might be a huge repos to process
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(
                         labels={
