@@ -78,7 +78,9 @@ class GitCloneConfig:
     """
     clone_url: str
     repo_identifier: str
-    branch: str = "main"
+    # None means "unresolved at clone time" (#7273): callers must resolve the
+    # repository's real default branch, never default this to 'main'.
+    branch: Optional[str] = "main"
     provider: ProviderType = ProviderType.GITHUB
     host: str = ""
     api_url: str = ""
@@ -170,7 +172,8 @@ class ProviderConfig:
     
     # Repository identification
     repository: str  # Repository path/identifier
-    branch: str = "main"
+    # None means "unresolved" (#7273) — never defaulted to 'main' here.
+    branch: Optional[str] = "main"
     
     # Authentication (various methods supported)
     token: Optional[str] = None  # Access token / PAT

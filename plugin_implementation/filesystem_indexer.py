@@ -142,7 +142,7 @@ class FilesystemRepositoryIndexer:
         
     def index_repository(self,
                         repository_url: str,
-                        branch: str = "main",
+                        branch: Optional[str] = "main",
                         force_rebuild: bool = False,
                         force_reclone: bool = False,
                         max_files: Optional[int] = None) -> Dict[str, Any]:
@@ -178,9 +178,11 @@ class FilesystemRepositoryIndexer:
             if self.current_repo_info:
                 self._last_commit_hash = self.current_repo_info.get('commit_hash')
             
-            # Use actual branch from cloned repo (handles cases like 'master' vs 'main')
-            actual_branch = (self.current_repo_info.get('branch') if self.current_repo_info else None) or branch
-            
+            # Use actual branch from cloned repo (handles cases like 'master' vs 'main').
+            # Never let a falsy branch/None leak into the identifier (#7273) —
+            # fall back to the HEAD label used by the no-branch clone path.
+            actual_branch = (self.current_repo_info.get('branch') if self.current_repo_info else None) or branch or "HEAD"
+
             # Create repository identifier for caching (includes commit hash for isolation)
             repo_name = self.repo_manager._normalize_repository_name(repository_url)
             commit_short = self._last_commit_hash[:8] if self._last_commit_hash else "unknown"

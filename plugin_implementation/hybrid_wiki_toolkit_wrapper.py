@@ -39,7 +39,7 @@ class HybridWikiToolkitWrapper:
         github_repository: Optional[str] = None,
         github_access_token: Optional[str] = None,
         github_username: Optional[str] = None,
-        github_base_branch: str = "main",
+        github_base_branch: Optional[str] = "main",
         active_branch: Optional[str] = None,
         github_base_url: str = "https://api.github.com",
         # Common configuration

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import traceback
 from typing import List, Optional, Dict, Any
@@ -33,14 +34,34 @@ except ImportError:  # Standalone test/subprocess import mode
 
 try:
     from ..plugin_implementation.repository_identity import (
+        clone_config_from_repo_config,
         normalize_repositories,
         repository_from_identifier,
     )
 except ImportError:  # Standalone test/subprocess import mode
     from plugin_implementation.repository_identity import (
+        clone_config_from_repo_config,
         normalize_repositories,
         repository_from_identifier,
     )
+
+try:
+    from ..plugin_implementation.branch_resolution import (
+        indexed_branches,
+        resolve_remote_default_branch,
+        select_configured_branch,
+    )
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.branch_resolution import (
+        indexed_branches,
+        resolve_remote_default_branch,
+        select_configured_branch,
+    )
+
+try:
+    from ..plugin_implementation.repo_resolution import split_repo_identifier
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.repo_resolution import split_repo_identifier
 
 default_bucket = 'wiki-artifacts'
 
@@ -354,12 +375,16 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
         or {}
     )
     
-    # Initialize with defaults
+    # Initialize with defaults. ``branch`` is intentionally None, not 'main':
+    # since EL-6610 the ADO Repos toolkit can hold several repositories and
+    # users commonly leave the branch empty. An unconfigured branch must be
+    # resolved to the repository's real default branch later (#7273), never
+    # guessed here.
     repo_config = {
         'provider_type': 'github',
         'provider_config': {},
         'repository': None,
-        'branch': 'main',
+        'branch': None,
         'project': None,
         'is_cloud': None,
     }
@@ -388,38 +413,38 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
                 or repo_settings.get('github_repository')
                 or repo_settings.get('toolkit_configuration_github_repository')
             )
-            repo_config['branch'] = (
-                repo_settings.get('active_branch')
-                or repo_settings.get('toolkit_configuration_active_branch')
-                or repo_settings.get('base_branch')
-                or repo_settings.get('toolkit_configuration_base_branch')
-                or repo_settings.get('branch', 'main')
+            repo_config['branch'] = select_configured_branch(
+                repo_settings.get('active_branch'),
+                repo_settings.get('toolkit_configuration_active_branch'),
+                repo_settings.get('base_branch'),
+                repo_settings.get('toolkit_configuration_base_branch'),
+                repo_settings.get('branch'),
             )
         elif 'gitlab_configuration' in repo_settings or 'toolkit_configuration_gitlab_configuration' in repo_settings:
             gitlab_config = repo_settings.get('gitlab_configuration') or repo_settings.get('toolkit_configuration_gitlab_configuration') or {}
             repo_config['provider_type'] = 'gitlab'
             repo_config['provider_config'] = gitlab_config
             repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('toolkit_configuration_repository')
-            repo_config['branch'] = (
-                repo_settings.get('branch')
-                or repo_settings.get('toolkit_configuration_branch')
-                or repo_settings.get('active_branch')
-                or repo_settings.get('toolkit_configuration_active_branch')
-                or repo_settings.get('base_branch')
-                or repo_settings.get('toolkit_configuration_base_branch', 'main')
+            repo_config['branch'] = select_configured_branch(
+                repo_settings.get('branch'),
+                repo_settings.get('toolkit_configuration_branch'),
+                repo_settings.get('active_branch'),
+                repo_settings.get('toolkit_configuration_active_branch'),
+                repo_settings.get('base_branch'),
+                repo_settings.get('toolkit_configuration_base_branch'),
             )
         elif 'bitbucket_configuration' in repo_settings or 'toolkit_configuration_bitbucket_configuration' in repo_settings:
             bitbucket_config = repo_settings.get('bitbucket_configuration') or repo_settings.get('toolkit_configuration_bitbucket_configuration') or {}
             repo_config['provider_type'] = 'bitbucket'
             repo_config['provider_config'] = bitbucket_config
             repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('toolkit_configuration_repository')
-            repo_config['branch'] = (
-                repo_settings.get('branch')
-                or repo_settings.get('toolkit_configuration_branch')
-                or repo_settings.get('active_branch')
-                or repo_settings.get('toolkit_configuration_active_branch')
-                or repo_settings.get('base_branch')
-                or repo_settings.get('toolkit_configuration_base_branch', 'main')
+            repo_config['branch'] = select_configured_branch(
+                repo_settings.get('branch'),
+                repo_settings.get('toolkit_configuration_branch'),
+                repo_settings.get('active_branch'),
+                repo_settings.get('toolkit_configuration_active_branch'),
+                repo_settings.get('base_branch'),
+                repo_settings.get('toolkit_configuration_base_branch'),
             )
             repo_config['project'] = repo_settings.get('project') or repo_settings.get('toolkit_configuration_project')
             repo_config['is_cloud'] = repo_settings.get('cloud') or repo_settings.get('toolkit_configuration_cloud')
@@ -433,12 +458,12 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
                 or repo_settings.get('repository')
                 or repo_settings.get('toolkit_configuration_repository')
             )
-            repo_config['branch'] = (
-                repo_settings.get('active_branch')
-                or repo_settings.get('toolkit_configuration_active_branch')
-                or repo_settings.get('base_branch')
-                or repo_settings.get('toolkit_configuration_base_branch')
-                or repo_settings.get('branch', 'main')
+            repo_config['branch'] = select_configured_branch(
+                repo_settings.get('active_branch'),
+                repo_settings.get('toolkit_configuration_active_branch'),
+                repo_settings.get('base_branch'),
+                repo_settings.get('toolkit_configuration_base_branch'),
+                repo_settings.get('branch'),
             )
             repo_config['project'] = ado_config.get('project') or repo_settings.get('project') or repo_settings.get('toolkit_configuration_project')
         else:
@@ -446,13 +471,19 @@ def _extract_repo_config_from_toolkit(params: Dict[str, Any]) -> Dict[str, Any]:
             repo_config['provider_type'] = 'github'
             repo_config['provider_config'] = repo_settings.get('github_configuration', {})
             repo_config['repository'] = repo_settings.get('repository') or repo_settings.get('github_repository')
-            repo_config['branch'] = repo_settings.get('base_branch') or repo_settings.get('active_branch', 'main')
+            repo_config['branch'] = select_configured_branch(
+                repo_settings.get('base_branch'),
+                repo_settings.get('active_branch'),
+            )
     else:
         # Legacy fallback - direct parameters
         repo_config['provider_type'] = 'github'
         repo_config['provider_config'] = params.get('github_configuration', {})
         repo_config['repository'] = params.get('github_repository')
-        repo_config['branch'] = params.get('github_base_branch') or params.get('github_branch', 'main')
+        repo_config['branch'] = select_configured_branch(
+            params.get('github_base_branch'),
+            params.get('github_branch'),
+        )
 
     # Code toolkits may store the repository as a legacy string or, since
     # multi-repo support (EL-6610, ADO Repos), as a possibly empty list.
@@ -513,6 +544,59 @@ def _missing_repository_error(
     if allow_override:
         message += " or pass `repo_identifier_override`"
     return ValueError(message + ".")
+
+
+def _resolve_branch(
+    repo_config: Dict[str, Any],
+    repo_identifier_override: Any = None,
+    cache_dir: Optional[str] = None,
+) -> None:
+    """Resolve ``repo_config['branch']`` when the toolkit left it unconfigured.
+
+    Priority: configured branch (already set by ``_extract_repo_config_from_toolkit``)
+    -> branch embedded in ``repo_identifier_override`` -> remote HEAD via
+    ``git ls-remote --symref`` -> the single branch already indexed locally
+    for this repository. Leaves ``branch`` as ``None`` when nothing resolves
+    (callers decide whether that is fatal). Mutates ``repo_config`` in place.
+    """
+    configured = select_configured_branch(repo_config.get('branch'))
+    if configured:
+        repo_config['branch'] = configured
+        log.info('Branch resolved from toolkit configuration: %s', configured)
+        return
+
+    repository = repo_config.get('repository')
+
+    if isinstance(repo_identifier_override, str) and repo_identifier_override.strip():
+        _, override_branch, _ = split_repo_identifier(repo_identifier_override.strip())
+        override_branch = select_configured_branch(override_branch)
+        if override_branch:
+            repo_config['branch'] = override_branch
+            log.info('Branch resolved from repo_identifier_override: %s', override_branch)
+            return
+
+    if not repository:
+        repo_config['branch'] = None
+        return
+
+    # Placeholder branch: the clone config factory requires one, but the
+    # clone URL it builds does not depend on it.
+    clone_config = clone_config_from_repo_config(repo_config, repository, 'HEAD')
+    if clone_config is not None:
+        remote_branch = resolve_remote_default_branch(clone_config.clone_url)
+        if remote_branch:
+            repo_config['branch'] = remote_branch
+            log.info('Branch resolved from remote default (ls-remote HEAD): %s', remote_branch)
+            return
+
+    if clone_config is not None and cache_dir:
+        candidates = indexed_branches(cache_dir, clone_config.repo_identifier)
+        if len(candidates) == 1:
+            repo_config['branch'] = candidates[0]
+            log.info('Branch resolved from single indexed branch in local cache: %s', candidates[0])
+            return
+
+    repo_config['branch'] = None
 
 
 class Method:  # pylint: disable=E1101,R0903,W0201
@@ -1525,12 +1609,22 @@ Do not include any explanation or other text."""
                         include_traceback=False,
                     )
 
+                # Resolve an unconfigured branch to the repository's real
+                # default branch (#7273). Leave it None on failure — the
+                # clone-time fallback (local_repository_manager) still
+                # handles a None branch for generate_wiki. Skip the
+                # runtime_config()/ls-remote work entirely when a branch is
+                # already configured.
+                if not repo_config.get('branch'):
+                    _cache_dir = os.path.join(self.runtime_config()["base_path"], "cache")
+                    _resolve_branch(repo_config, cache_dir=_cache_dir)
+
                 result = self.generate_wiki(
                     query=params["query"],
                     llm_settings=params.get('llm_settings') or {},
                     embedding_model=params.get('embedding_model'),
                     repo_config=repo_config,
-                    active_branch=params.get('active_branch', 'main'),
+                    active_branch=params.get('active_branch') or repo_config.get('branch'),
                     force_rebuild_index=params.get('force_rebuild_index', True),
                     indexing_method=params.get('indexing_method', 'filesystem'),
                     # Optional user-facing knobs surfaced from the UI/tool params.
@@ -1557,6 +1651,31 @@ Do not include any explanation or other text."""
                         operation=tool_name,
                         model_name=None,
                         exception=missing_repository,
+                        include_traceback=False,
+                    )
+
+                # Resolve an unconfigured branch (#7273); ask cannot proceed
+                # without one — it must look up a specific repo:branch cache.
+                # Skip the runtime_config()/ls-remote work entirely when a
+                # branch is already configured.
+                if not repo_config.get('branch'):
+                    _cache_dir = os.path.join(self.runtime_config()["base_path"], "cache")
+                    _resolve_branch(
+                        repo_config,
+                        repo_identifier_override=params.get('repo_identifier_override'),
+                        cache_dir=_cache_dir,
+                    )
+                if not repo_config.get('branch'):
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=None,
+                        exception=ValueError(
+                            "Could not determine the branch of repository "
+                            f"'{repo_config.get('repository')}': the toolkit has no branch "
+                            "configured and the repository's default branch could not be read. "
+                            "Specify a branch in the toolkit."
+                        ),
                         include_traceback=False,
                     )
 
@@ -1593,6 +1712,31 @@ Do not include any explanation or other text."""
                         operation=tool_name,
                         model_name=None,
                         exception=missing_repository,
+                        include_traceback=False,
+                    )
+
+                # Resolve an unconfigured branch (#7273); deep_research cannot
+                # proceed without one — it must look up a specific repo:branch cache.
+                # Skip the runtime_config()/ls-remote work entirely when a
+                # branch is already configured.
+                if not repo_config.get('branch'):
+                    _cache_dir = os.path.join(self.runtime_config()["base_path"], "cache")
+                    _resolve_branch(
+                        repo_config,
+                        repo_identifier_override=params.get('repo_identifier_override'),
+                        cache_dir=_cache_dir,
+                    )
+                if not repo_config.get('branch'):
+                    return self._create_error_response(
+                        invocation_id=invocation_id,
+                        operation=tool_name,
+                        model_name=None,
+                        exception=ValueError(
+                            "Could not determine the branch of repository "
+                            f"'{repo_config.get('repository')}': the toolkit has no branch "
+                            "configured and the repository's default branch could not be read. "
+                            "Specify a branch in the toolkit."
+                        ),
                         include_traceback=False,
                     )
 

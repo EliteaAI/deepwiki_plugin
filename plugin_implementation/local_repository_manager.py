@@ -5,6 +5,7 @@ Handles cloning and managing temporary local repositories for wiki generation.
 Supports multi-provider Git operations (GitHub, GitLab, Bitbucket, Azure DevOps).
 """
 
+import dataclasses
 import os
 import shutil
 import tempfile
@@ -19,6 +20,11 @@ try:
     from .repo_providers import RepoProviderFactory, GitCloneConfig, ProviderType
 except ImportError:
     from repo_providers import RepoProviderFactory, GitCloneConfig, ProviderType
+
+try:
+    from .branch_resolution import read_checked_out_branch, resolve_remote_default_branch
+except ImportError:
+    from branch_resolution import read_checked_out_branch, resolve_remote_default_branch
 
 logger = logging.getLogger(__name__)
 
@@ -94,72 +100,91 @@ class LocalRepositoryManager:
         # Ensure cache directory exists
         os.makedirs(self.cache_dir, exist_ok=True)
         
-    def get_repository_local_path(self, 
-                                 repository_url: str, 
-                                 branch: str = "main",
+    def get_repository_local_path(self,
+                                 repository_url: str,
+                                 branch: Optional[str] = "main",
                                  force_reclone: bool = False,
                                  project: Optional[str] = None) -> str:
         """
         Get local path for repository, cloning if necessary.
-        
+
         Clone paths include commit hash for isolation:
         - Different commits = different paths = no conflicts
         - Same commit = reuse existing clone = efficient
-        
+
         Args:
             repository_url: Repository URL or owner/repo format
-            branch: Branch to clone
+            branch: Branch to clone. When falsy (#7273 — toolkit has no
+                branch configured), the repository's remote default branch
+                is resolved before cloning, never guessed as 'main'.
             force_reclone: Whether to force reclone even if exists
             project: Project name (required for ADO, optional for others)
-            
+
         Returns:
             Local path to repository root
         """
         # Build clone configuration using provider factory
         clone_config = self._get_clone_config(repository_url, branch, project)
-        
+
+        # No branch configured: resolve the repository's real default branch
+        # via the remote (never guess 'main'). A placeholder branch value is
+        # needed just to build the clone config above; the clone URL itself
+        # does not depend on the branch.
+        if not clone_config.branch:
+            resolved_default = resolve_remote_default_branch(clone_config.clone_url)
+            if resolved_default:
+                logger.info(
+                    f"No branch configured for {clone_config.repo_identifier}; "
+                    f"resolved remote default branch: {resolved_default}"
+                )
+                clone_config = dataclasses.replace(clone_config, branch=resolved_default)
+
         # Normalize repository identifier
         repo_name = clone_config.repo_identifier
-        
+        branch = clone_config.branch  # May still be falsy — resolved post-clone via HEAD.
+
         # Get remote HEAD commit hash to determine clone path
         # This ensures each commit version has its own isolated clone
         remote_commit = self._get_remote_head_commit(clone_config)
         commit_short = remote_commit[:8] if remote_commit else "latest"
-        
+
         # Create path with commit hash for isolation: owner_repo_branch_abc12345/
+        # When the branch is still unknown, name the path "HEAD" instead of
+        # cloning a specific branch — never let "None" leak into the path.
+        branch_label = branch or "HEAD"
         safe_name = repo_name.replace("/", "_")
-        local_path = os.path.join(self.cache_dir, f"{safe_name}_{branch}_{commit_short}")
-        
+        local_path = os.path.join(self.cache_dir, f"{safe_name}_{branch_label}_{commit_short}")
+
         # Build identifier with commit for caching
-        repo_identifier = f"{repo_name}:{branch}:{commit_short}"
-        
+        repo_identifier = f"{repo_name}:{branch_label}:{commit_short}"
+
         # Check if already cloned and cached
         if not force_reclone and repo_identifier in self.active_repos:
             cached_path = self.active_repos[repo_identifier]
             if os.path.exists(cached_path):
                 logger.info(f"Using cached repository: {cached_path}")
                 return cached_path
-        
+
         # Check if path already exists (from previous run)
         if not force_reclone and os.path.exists(local_path):
             logger.info(f"Using existing clone at: {local_path}")
             self.active_repos[repo_identifier] = local_path
             return local_path
-        
+
         # Remove existing if force reclone
         if force_reclone and os.path.exists(local_path):
             logger.info(f"Removing existing repository for reclone: {local_path}")
             shutil.rmtree(local_path)
-        
+
         # Clone fresh
         self._clone_repository(clone_config, local_path)
-        
+
         # Cache the path
         self.active_repos[repo_identifier] = local_path
-        
+
         return local_path
     
-    def _get_clone_config(self, repository_url: str, branch: str, project: Optional[str] = None) -> GitCloneConfig:
+    def _get_clone_config(self, repository_url: str, branch: Optional[str], project: Optional[str] = None) -> GitCloneConfig:
         """
         Build GitCloneConfig from repository URL and toolkit configuration.
         
@@ -195,14 +220,16 @@ class LocalRepositoryManager:
     def _get_remote_head_commit(self, clone_config: GitCloneConfig) -> Optional[str]:
         """
         Get the HEAD commit hash from remote repository without cloning.
-        
+
         This allows us to determine the clone path before cloning,
-        ensuring commit-based isolation.
+        ensuring commit-based isolation. When no branch is known (#7273),
+        resolve the commit at the remote's HEAD symref instead.
         """
         try:
             # Use git ls-remote to get remote HEAD commit
-            cmd = ['git', 'ls-remote', clone_config.clone_url, f'refs/heads/{clone_config.branch}']
-            
+            ref = f'refs/heads/{clone_config.branch}' if clone_config.branch else 'HEAD'
+            cmd = ['git', 'ls-remote', clone_config.clone_url, ref]
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -250,25 +277,32 @@ class LocalRepositoryManager:
             return repository_url
     
     def _clone_repository(self, clone_config: GitCloneConfig, local_path: str) -> None:
-        """Clone repository to local path using provider-aware configuration."""
-        logger.info(f"Cloning repository {clone_config.repo_identifier} (branch: {clone_config.branch}) to {local_path}")
-        
+        """Clone repository to local path using provider-aware configuration.
+
+        When ``clone_config.branch`` is falsy (#7273 — still unresolved at
+        clone time), clone WITHOUT ``--branch`` so git checks out the
+        remote's actual default branch, keeping ``--depth 1 --single-branch``.
+        """
+        logger.info(f"Cloning repository {clone_config.repo_identifier} (branch: {clone_config.branch or '(default)'}) to {local_path}")
+
         try:
             # Ensure parent directory exists
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            
+
             # Clone with depth=1 for faster cloning (latest commit only)
-            cmd = [
-                'git', 'clone', 
-                '--branch', clone_config.branch,
+            cmd = ['git', 'clone']
+            if clone_config.branch:
+                cmd += ['--branch', clone_config.branch]
+            cmd += [
                 '--depth', '1',
                 '--single-branch',
                 clone_config.clone_url,
                 local_path
             ]
-            
+
             # Log command without exposing token
-            logger.debug(f"Executing: git clone --branch {clone_config.branch} --depth 1 --single-branch {clone_config.safe_url} {local_path}")
+            branch_flag = f"--branch {clone_config.branch} " if clone_config.branch else ""
+            logger.debug(f"Executing: git clone {branch_flag}--depth 1 --single-branch {clone_config.safe_url} {local_path}")
             
             result = subprocess.run(
                 cmd, 
@@ -333,17 +367,22 @@ class LocalRepositoryManager:
                 check=True
             )
             commit_hash = commit_result.stdout.strip()
-            
-            # Get current branch
-            branch_result = subprocess.run(
-                ['git', 'branch', '--show-current'],
-                cwd=local_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            current_branch = branch_result.stdout.strip()
-            
+
+            # Get current branch. Prefer read_checked_out_branch (#7273) —
+            # it is what the no-branch clone fallback needs to report the
+            # real branch that was actually checked out; fall back to the
+            # previous detection for parity with any edge case it covered.
+            current_branch = read_checked_out_branch(local_path)
+            if not current_branch:
+                branch_result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=local_path,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                current_branch = branch_result.stdout.strip()
+
             # Get remote URL
             remote_result = subprocess.run(
                 ['git', 'remote', 'get-url', 'origin'],

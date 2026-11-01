@@ -436,7 +436,11 @@ function repositoryLeafAndBranchMatch(candidateRepoIdentity, expectedInfo) {
   return true;
 }
 
-function manifestRepoMatchKey(manifest) {
+// ignoreBranch (#7273): when the configured identity has no branch, the
+// uniqueness key must dedupe by repository only — branch is not part of
+// what the user configured, so two manifests of the same repo on different
+// branches are still "the same configured repository" for this check.
+function manifestRepoMatchKey(manifest, ignoreBranch = false) {
   const candidates = [
     manifest?.canonical_repo_identifier,
     { repository: manifest?.repository, branch: manifest?.branch },
@@ -444,7 +448,11 @@ function manifestRepoMatchKey(manifest) {
 
   for (const candidate of candidates) {
     const info = getRepositoryMatchInfo(candidate);
-    if (info.parsed.repository && info.branchPart) {
+    if (!info.parsed.repository) continue;
+    if (ignoreBranch) {
+      return info.parsed.repository.toLowerCase();
+    }
+    if (info.branchPart) {
       return `${info.parsed.repository.toLowerCase()}:${info.branchPart}`;
     }
   }
@@ -458,14 +466,21 @@ function filterManifestsByRepo(manifests, configuredRepoIdentity) {
 
   const expectedInfo = getRepositoryMatchInfo(configuredRepoIdentity);
   const repoParts = expectedInfo.parsed.repository?.split('/').filter(Boolean) || [];
-  if (repoParts.length !== 1 || !expectedInfo.leafBranchSuffix) return [];
+  if (repoParts.length !== 1) return [];
+  // With a configured branch, the leaf fallback also needs a branch suffix
+  // to match against. With no branch configured (#7273 — toolkit left
+  // branch empty), fall back to matching by repository leaf alone.
+  if (expectedInfo.hasBranch && !expectedInfo.leafBranchSuffix) return [];
 
   const leafMatches = manifests.filter(manifest => [
     { repository: manifest.repository, branch: manifest.branch },
     manifest.canonical_repo_identifier,
   ].some(candidate => repositoryLeafAndBranchMatch(candidate, expectedInfo)));
 
-  const canonicalKeys = new Set(leafMatches.map(manifestRepoMatchKey).filter(Boolean));
+  const ignoreBranch = !expectedInfo.hasBranch;
+  const canonicalKeys = new Set(
+    leafMatches.map(manifest => manifestRepoMatchKey(manifest, ignoreBranch)).filter(Boolean)
+  );
   return canonicalKeys.size === 1 ? leafMatches : [];
 }
 
