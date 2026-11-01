@@ -972,6 +972,35 @@ tests.push({
   }
 });
 
+tests.push({
+  name: '#7273: ADO repository GUID with no configured branch matches its manifests (dev shape)',
+  fn: () => {
+    const repoId = '45c8f088-1595-4e83-b600-ab25f066a2fc';
+    const identity = { repository: repoId, branch: null };
+    const ownManifest = (version) => ({
+      name: `samvelsimonyan-0660--samvel-simonyan--${repoId}--main/wiki_manifest_${version}.json`,
+      wiki_id: `samvelsimonyan-0660--samvel-simonyan--${repoId}--main`,
+      canonical_repo_identifier: `SamvelSimonyan-0660/Samvel_Simonyan/${repoId}:main:3f9594be`,
+      repository: `SamvelSimonyan-0660/Samvel_Simonyan/${repoId}`,
+      branch: 'main',
+      provider_type: 'ado_repos',
+    });
+    const otherRepo = {
+      name: 'samvelsimonyan-0660--samvel-simonyan--toolkit-test--main/wiki_manifest_20261028T134544Z.json',
+      wiki_id: 'samvelsimonyan-0660--samvel-simonyan--toolkit-test--main',
+      canonical_repo_identifier: 'SamvelSimonyan-0660/Samvel_Simonyan/toolkit-test:main:46a05eb4',
+      repository: 'SamvelSimonyan-0660/Samvel_Simonyan/toolkit-test',
+      branch: 'main',
+      provider_type: 'ado_repos',
+    };
+    const own = [ownManifest('20261101T123322Z'), ownManifest('20261101T123038Z')];
+    const matches = filterManifestsByRepo([...own, otherRepo], identity);
+    if (matches.length !== 2 || !own.every(m => matches.includes(m))) {
+      throw new Error(`Expected the 2 GUID-repo manifests only, got ${matches.length}`);
+    }
+  }
+});
+
 // Run tests
 console.log('🧪 Running getConfiguredRepo smoke tests...\n');
 
