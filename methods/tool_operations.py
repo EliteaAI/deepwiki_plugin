@@ -634,7 +634,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                     'provider_type': 'github',
                     'provider_config': kwargs.get('github_configuration', {}),
                     'repository': kwargs.get('github_repository'),
-                    'branch': kwargs.get('github_base_branch', 'main'),
+                    'branch': kwargs.get('github_base_branch'),
                     'project': None,
                 }
 
@@ -652,7 +652,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                     "llm_settings": llm_settings,
                     "embedding_model": embedding_model,
                     "repo_config": repo_config,
-                    "active_branch": kwargs.get("active_branch") or repo_config.get("branch", "main"),
+                    "active_branch": kwargs.get("active_branch") or repo_config.get("branch"),
                     "force_rebuild_index": kwargs.get("force_rebuild_index", True),
                     "indexing_method": kwargs.get("indexing_method", "filesystem"),
                     # User-facing structure planner choice + test exclusion.
@@ -718,9 +718,9 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
             provider_type = repo_config.get('provider_type', 'github')
             provider_config = repo_config.get('provider_config', {})
             repository = repo_config.get('repository')
-            branch = repo_config.get('branch', 'main')
+            branch = repo_config.get('branch')
             project = repo_config.get('project')
-            
+
             # Build clone configuration for the repository
             try:
                 clone_config = RepoProviderFactory.from_toolkit_config(

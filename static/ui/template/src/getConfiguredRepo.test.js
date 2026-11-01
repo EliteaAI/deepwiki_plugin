@@ -270,7 +270,11 @@ function repositoryLeafAndBranchMatch(candidateRepoIdentity, expectedInfo) {
   return true;
 }
 
-function manifestRepoMatchKey(manifest) {
+// ignoreBranch (#7273): when the configured identity has no branch, the
+// uniqueness key must dedupe by repository only — branch is not part of
+// what the user configured, so two manifests of the same repo on different
+// branches are still "the same configured repository" for this check.
+function manifestRepoMatchKey(manifest, ignoreBranch = false) {
   const candidates = [
     manifest?.canonical_repo_identifier,
     { repository: manifest?.repository, branch: manifest?.branch },
@@ -278,7 +282,11 @@ function manifestRepoMatchKey(manifest) {
 
   for (const candidate of candidates) {
     const info = getRepositoryMatchInfo(candidate);
-    if (info.parsed.repository && info.branchPart) {
+    if (!info.parsed.repository) continue;
+    if (ignoreBranch) {
+      return info.parsed.repository.toLowerCase();
+    }
+    if (info.branchPart) {
       return `${info.parsed.repository.toLowerCase()}:${info.branchPart}`;
     }
   }
@@ -292,14 +300,21 @@ function filterManifestsByRepo(manifests, configuredRepoIdentity) {
 
   const expectedInfo = getRepositoryMatchInfo(configuredRepoIdentity);
   const repoParts = expectedInfo.parsed.repository?.split('/').filter(Boolean) || [];
-  if (repoParts.length !== 1 || !expectedInfo.leafBranchSuffix) return [];
+  if (repoParts.length !== 1) return [];
+  // With a configured branch, the leaf fallback also needs a branch suffix
+  // to match against. With no branch configured (#7273 — toolkit left
+  // branch empty), fall back to matching by repository leaf alone.
+  if (expectedInfo.hasBranch && !expectedInfo.leafBranchSuffix) return [];
 
   const leafMatches = manifests.filter(manifest => [
     { repository: manifest.repository, branch: manifest.branch },
     manifest.canonical_repo_identifier,
   ].some(candidate => repositoryLeafAndBranchMatch(candidate, expectedInfo)));
 
-  const canonicalKeys = new Set(leafMatches.map(manifestRepoMatchKey).filter(Boolean));
+  const ignoreBranch = !expectedInfo.hasBranch;
+  const canonicalKeys = new Set(
+    leafMatches.map(manifest => manifestRepoMatchKey(manifest, ignoreBranch)).filter(Boolean)
+  );
   return canonicalKeys.size === 1 ? leafMatches : [];
 }
 
@@ -843,6 +858,116 @@ tests.push({
     const result = getConfiguredRepo({}, settings, null);
     if (result !== null) {
       throw new Error(`Expected null, got '${result}'`);
+    }
+  }
+});
+
+// --- #7273: no-branch configured identity matching ---
+
+tests.push({
+  name: '#7273: full-path identity without a branch matches any manifest branch by prefix',
+  fn: () => {
+    const identity = { repository: 'org/proj/repo', branch: null };
+    const manifest = {
+      wiki_id: 'org--proj--repo--master',
+      canonical_repo_identifier: 'org/proj/repo:master:11111111',
+      repository: 'org/proj/repo',
+      branch: 'master',
+    };
+
+    if (!manifestMatchesRepo(manifest, identity)) {
+      throw new Error('Expected no-branch full-path identity to match a manifest of any branch');
+    }
+  }
+});
+
+tests.push({
+  name: '#7273: full-path identity without a branch does not match a different repo by suffix',
+  fn: () => {
+    const identity = { repository: 'org/proj/repo', branch: null };
+    const manifest = {
+      wiki_id: 'org--proj--repo-x--master',
+      canonical_repo_identifier: 'org/proj/repo-x:master:22222222',
+      repository: 'org/proj/repo-x',
+      branch: 'master',
+    };
+
+    if (manifestMatchesRepo(manifest, identity)) {
+      throw new Error('Expected no-branch identity not to suffix-match a different repository');
+    }
+  }
+});
+
+tests.push({
+  name: '#7273: single-segment repo with no configured branch matches an unambiguous leaf manifest',
+  fn: () => {
+    const identity = { repository: 'TestProject', branch: null };
+    const manifests = [
+      {
+        wiki_id: 'epameliteatest--testproject--testproject--master',
+        canonical_repo_identifier: 'epameliteatest/TestProject/TestProject:master:6f785643',
+        repository: 'epameliteatest/TestProject/TestProject',
+        branch: 'master',
+      },
+    ];
+
+    const matches = filterManifestsByRepo(manifests, identity);
+    if (matches.length !== 1 || matches[0] !== manifests[0]) {
+      throw new Error(`Expected exactly one leaf match ignoring branch, got ${matches.length}`);
+    }
+  }
+});
+
+tests.push({
+  name: '#7273: single-segment repo with no configured branch matches across multiple branches of the same repo',
+  fn: () => {
+    const identity = { repository: 'TestProject', branch: null };
+    const manifests = [
+      {
+        wiki_id: 'epameliteatest--testproject--testproject--master',
+        canonical_repo_identifier: 'epameliteatest/TestProject/TestProject:master:6f785643',
+        repository: 'epameliteatest/TestProject/TestProject',
+        branch: 'master',
+      },
+      {
+        wiki_id: 'epameliteatest--testproject--testproject--dev',
+        canonical_repo_identifier: 'epameliteatest/TestProject/TestProject:dev:7a8b9c0d',
+        repository: 'epameliteatest/TestProject/TestProject',
+        branch: 'dev',
+      },
+    ];
+
+    // Both manifests resolve to the SAME canonical repository (ignoring
+    // branch), so this stays unambiguous and both are returned.
+    const matches = filterManifestsByRepo(manifests, identity);
+    if (matches.length !== 2) {
+      throw new Error(`Expected both same-repo branch manifests to match, got ${matches.length}`);
+    }
+  }
+});
+
+tests.push({
+  name: '#7273: single-segment repo with no configured branch still rejects ambiguous leaf matches across different repos',
+  fn: () => {
+    const identity = { repository: 'service', branch: null };
+    const manifests = [
+      {
+        wiki_id: 'orga--proj1--service--main',
+        canonical_repo_identifier: 'orgA/proj1/service:main:11111111',
+        repository: 'orgA/proj1/service',
+        branch: 'main',
+      },
+      {
+        wiki_id: 'orgb--proj2--service--master',
+        canonical_repo_identifier: 'orgB/proj2/service:master:22222222',
+        repository: 'orgB/proj2/service',
+        branch: 'master',
+      },
+    ];
+
+    const matches = filterManifestsByRepo(manifests, identity);
+    if (matches.length !== 0) {
+      throw new Error(`Expected ambiguous cross-repo leaf matches to be rejected, got ${matches.length}`);
     }
   }
 });

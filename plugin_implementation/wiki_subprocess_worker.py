@@ -225,9 +225,12 @@ def main(argv=None) -> int:
             provider_type = repo_config.get("provider_type", "github")
             provider_config = repo_config.get("provider_config", {})
             repository = repo_config.get("repository")
-            branch = repo_config.get("branch", "main")
+            # None (not 'main') when the toolkit left branch unconfigured
+            # (#7273) — local_repository_manager resolves the real default
+            # branch at clone time.
+            branch = repo_config.get("branch")
             project = repo_config.get("project")
-            active_branch = payload.get("active_branch", branch)
+            active_branch = payload.get("active_branch") or branch
         else:
             # Legacy GitHub-only mode
             provider_type = "github"

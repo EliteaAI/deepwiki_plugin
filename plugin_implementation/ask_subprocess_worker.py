@@ -202,12 +202,15 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     llm_settings = payload.get("llm_settings", {})
     embedding_model = payload.get("embedding_model")
 
-    # Support new multi-provider repo_config with legacy fallback
+    # Support new multi-provider repo_config with legacy fallback. ``branch``
+    # is None (not 'main') when repo_config carries no branch — dispatch
+    # (#7273) resolves it before invoking ask, so this should not happen
+    # in practice; the missing-branch check below covers it defensively.
     repo_config = payload.get("repo_config", {})
     if repo_config:
         provider_type = repo_config.get("provider_type", "github")
         repository = repo_config.get("repository", "")
-        branch = repo_config.get("branch", "main")
+        branch = repo_config.get("branch")
     else:
         provider_type = "github"
         repository = payload.get("github_repository", "")
@@ -221,6 +224,8 @@ async def run_ask_agentic_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": "No question provided"}
     if not repository:
         return {"success": False, "error": "No repository specified"}
+    if not branch:
+        return {"success": False, "error": f"No branch specified for repository '{repository}'"}
 
     from .repository_identity import build_query_repo_identifier
     repo_identifier = build_query_repo_identifier(
@@ -558,29 +563,34 @@ def run_ask(payload: Dict[str, Any]) -> Dict[str, Any]:
     llm_settings = payload.get("llm_settings", {})
     embedding_model = payload.get("embedding_model")
     
-    # Support new multi-provider repo_config with legacy fallback
+    # Support new multi-provider repo_config with legacy fallback. ``branch``
+    # is None (not 'main') when repo_config carries no branch — dispatch
+    # (#7273) resolves it before invoking ask.
     repo_config = payload.get("repo_config", {})
     if repo_config:
         provider_type = repo_config.get("provider_type", "github")
         repository = repo_config.get("repository", "")
-        branch = repo_config.get("branch", "main")
+        branch = repo_config.get("branch")
     else:
         # Legacy GitHub-only mode
         provider_type = "github"
         repository = payload.get("github_repository", "")
         branch = payload.get("github_branch", "main")
-    
+
     k = payload.get("k", 15)
     chat_history = payload.get("chat_history", [])
     repo_identifier_override = payload.get("repo_identifier_override")
     analysis_key_override = payload.get("analysis_key_override")
-    
+
     if not question:
         return {"success": False, "error": "No question provided"}
-    
+
     if not repository:
         return {"success": False, "error": "No repository specified"}
-    
+
+    if not branch:
+        return {"success": False, "error": f"No branch specified for repository '{repository}'"}
+
     from .repository_identity import build_query_repo_identifier
     repo_identifier = build_query_repo_identifier(
         repository=repository,

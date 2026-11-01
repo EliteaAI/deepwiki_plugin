@@ -197,7 +197,10 @@ def run_wiki_generation(input_data: Dict[str, Any]) -> Dict[str, Any]:
         provider_type = repo_config.get("provider_type", "github")
         provider_config = repo_config.get("provider_config", {})
         repository = repo_config.get("repository")
-        branch = repo_config.get("branch", "main")
+        # None (not 'main') when the toolkit left branch unconfigured
+        # (#7273) — local_repository_manager resolves the real default
+        # branch at clone time.
+        branch = repo_config.get("branch")
         project = repo_config.get("project")
         active_branch = input_data.get("active_branch") or branch
     else:
