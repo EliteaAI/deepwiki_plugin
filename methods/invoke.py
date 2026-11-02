@@ -63,6 +63,11 @@ try:
 except ImportError:  # Standalone test/subprocess import mode
     from plugin_implementation.repo_resolution import split_repo_identifier
 
+try:
+    from ..plugin_implementation.llm_content import message_text
+except ImportError:  # Standalone test/subprocess import mode
+    from plugin_implementation.llm_content import message_text
+
 default_bucket = 'wiki-artifacts'
 
 _TOOLKIT_PROVIDER_KEYS = (
@@ -1484,7 +1489,7 @@ Do not include any explanation or other text."""
             )
             
             response = llm.invoke(resolution_prompt)
-            resolved_id = response.content.strip().strip('"').strip("'")
+            resolved_id = message_text(response).strip().strip('"').strip("'")
             
             # Validate the resolved ID exists
             valid_ids = [w.get("wiki_id", "") if isinstance(w, dict) else str(w) for w in wikis]

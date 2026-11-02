@@ -36,6 +36,7 @@ from ..prompts.wiki_prompts_enhanced import ENHANCED_WIKI_STRUCTURE_PROMPT, TARG
     ENHANCED_CONTENT_GENERATION_PROMPT_V5, ENHANCED_CONTENT_GENERATION_PROMPT_V3_TONE_ADJUSTED, \
     ENHANCED_CONTENT_GENERATION_PROMPT_V3_WITH_CONTINUATION
 from ..retrievers import WikiRetrieverStack
+from ..llm_content import message_text
 from ..constants import DOC_SYMBOL_TYPES, EXPANSION_SYMBOL_TYPES, ARCHITECTURAL_SYMBOLS, \
     DOCUMENTATION_EXTENSIONS_SET, KNOWN_FILENAMES, COVERAGE_IGNORE_DIRS, DOT_DIR_WHITELIST
 from ..code_graph.expansion_engine import expand_smart, has_relationship, SMART_EXPANSION_ENABLED
@@ -901,7 +902,7 @@ class OptimizedWikiGenerationAgent:
                 config=config
             )
 
-            enhanced_content = response.content
+            enhanced_content = message_text(response)
 
             return {
                 "enhanced_pages": [WikiPage(
@@ -4080,7 +4081,7 @@ class OptimizedWikiGenerationAgent:
             )
 
             # Parse assessment response
-            assessment_data = self._parse_llm_json_response(response.content)
+            assessment_data = self._parse_llm_json_response(message_text(response))
             return QualityAssessment(**assessment_data)
 
         except Exception as e:
@@ -4277,7 +4278,7 @@ class OptimizedWikiGenerationAgent:
                 config=config
             )
 
-            analysis_text = response.content
+            analysis_text = message_text(response)
             
             # Log format-specific info
             if USE_STRUCTURED_REPO_ANALYSIS:
@@ -5371,7 +5372,7 @@ class OptimizedWikiGenerationAgent:
             config=config
         )
 
-        return response.content
+        return message_text(response)
 
     def _generate_agentic(self, page_spec: PageSpec, relevant_content: Dict[str, Any],
                           repo_context: str, config: RunnableConfig) -> str:
@@ -5485,7 +5486,7 @@ class OptimizedWikiGenerationAgent:
             
             # Generate content with current message history
             response = self.llm.invoke(messages, config=config)
-            generated_content = response.content
+            generated_content = message_text(response)
             
             # Check for NEED_CONTEXT requests
             need_context_requests = self._parse_need_context_requests(generated_content)
