@@ -64,9 +64,9 @@ except ImportError:  # Standalone test/subprocess import mode
     from plugin_implementation.repo_resolution import split_repo_identifier
 
 try:
-    from ..plugin_implementation.llm_content import message_text
+    from ..plugin_implementation.llm_content import message_text, model_temperature
 except ImportError:  # Standalone test/subprocess import mode
-    from plugin_implementation.llm_content import message_text
+    from plugin_implementation.llm_content import message_text, model_temperature
 
 default_bucket = 'wiki-artifacts'
 
@@ -162,7 +162,7 @@ def create_llm(
     organization: str = None,
     default_headers: Dict = None,
     max_tokens: int = 4000,
-    temperature: float = 0,
+    temperature: Optional[float] = None,
     max_retries: int = 2,
     streaming: bool = False,
 ):
@@ -208,10 +208,6 @@ def create_llm(
         openai_base_url = api_base.rstrip("/")
         if not openai_base_url.endswith("/v1"):
             openai_base_url += "/v1"
-
-        # o-series models require temperature=1
-        if str(model_name).startswith("o"):
-            temperature = 1.0
 
         return ChatOpenAI(
             model=model_name,
@@ -1485,7 +1481,7 @@ Do not include any explanation or other text."""
                 organization=organization,
                 default_headers=default_headers,
                 max_tokens=max_tokens,
-                temperature=0,
+                temperature=model_temperature(llm_settings),
             )
             
             response = llm.invoke(resolution_prompt)

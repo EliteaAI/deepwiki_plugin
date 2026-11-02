@@ -53,3 +53,23 @@ def message_text(message: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content)
+
+
+def model_temperature(llm_settings: Any) -> Any:
+    """Temperature to send for a model: the one the platform configured, else none.
+
+    Agents send no temperature unless the model's settings carry one, and so
+    must DeepWiki. A fixed value breaks models that only accept their default:
+    GPT-5-family models served through Bedrock reject ``temperature`` outright
+    (DIAL drops it silently, which is why the same models worked there).
+    Returns ``None`` to mean "do not send"; LangChain then omits the field.
+    """
+    if not isinstance(llm_settings, dict):
+        return None
+    value = llm_settings.get("temperature")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

@@ -50,6 +50,7 @@ import traceback
 from typing import Any, Dict, List, Optional
 
 from .budget_errors import budget_error_result, raise_if_budget_exceeded
+from .llm_content import model_temperature
 
 
 def _configure_logging() -> None:
@@ -134,7 +135,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
             api_key=api_key,
             base_url=anthropic_base_url,
             max_tokens=max_tokens,
-            temperature=0.1,
+            temperature=model_temperature(llm_settings),
             max_retries=max_retries,
             streaming=False,
             default_headers=default_headers,
@@ -142,7 +143,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
         embeddings_base_url = api_base if api_base.endswith("/v1") else api_base.rstrip("/") + "/v1"
     else:
         # OpenAI
-        temperature = 1.0 if str(model_name).startswith("o") else 0.1
+        temperature = model_temperature(llm_settings)
         
         llm = ChatOpenAI(
             model=model_name,

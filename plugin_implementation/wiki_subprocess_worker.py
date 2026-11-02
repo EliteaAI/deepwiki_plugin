@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 import uuid
 
 from .budget_errors import budget_error_result
+from .llm_content import model_temperature
 
 
 def _configure_logging() -> None:
@@ -111,8 +112,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
         if anthropic_base_url.endswith("/v1"):
             anthropic_base_url = anthropic_base_url[:-3]
 
-        # Temperature: use 0.1 as default for Anthropic
-        temperature = 0.1
+        temperature = model_temperature(llm_settings)
 
         # Build default_headers if not provided
         if not default_headers:
@@ -139,7 +139,7 @@ def _build_llm_and_embeddings(llm_settings: Dict[str, Any], embedding_model: Any
             embeddings_base_url = embeddings_base_url.rstrip("/") + "/v1"
     else:
         # OpenAI models
-        temperature = 1.0 if str(model_name).startswith("o") else 0.1
+        temperature = model_temperature(llm_settings)
 
         llm = ChatOpenAI(
             model=model_name,
