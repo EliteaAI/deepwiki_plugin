@@ -684,7 +684,8 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
                 raise ValueError("llm_settings.openai_api_key is required")
 
             # Create model for usage from parameters
-            temperature = 1.0 if openai_model.startswith('o') else 0.1
+            from ..plugin_implementation.llm_content import model_temperature
+            temperature = model_temperature(llm_settings)
             from langchain_openai import ChatOpenAI
             from langchain_openai.embeddings import OpenAIEmbeddings
             llm = ChatOpenAI(

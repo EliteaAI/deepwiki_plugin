@@ -21,6 +21,7 @@ from datetime import datetime
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, ToolMessage
 
+from ..llm_content import model_temperature
 from .structure_skeleton import build_skeleton, StructureSkeleton
 from .structure_refiner import refine_with_llm
 from .context_eviction_middleware import ContextEvictionMiddleware
@@ -131,7 +132,7 @@ class WikiStructurePlannerEngine:
             api_key=api_key,
             base_url=api_base,
             default_headers=self.llm_settings.get('default_headers') or None,
-            temperature=0.0,
+            temperature=model_temperature(self.llm_settings),
             max_tokens=4096,  # Reduced for speed - tool-based output needs less tokens
         )
     

@@ -29,7 +29,7 @@ from .research_prompts import (
     get_research_prompt
 )
 from ..budget_errors import budget_error_result
-from ..llm_content import message_text
+from ..llm_content import message_text, model_temperature
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ class DeepResearchEngine:
             api_key=api_key,
             base_url=api_base,
             default_headers=self.llm_settings.get('default_headers') or None,
-            temperature=0.0,
+            temperature=model_temperature(self.llm_settings),
             max_tokens=max_tokens,
         )
     
