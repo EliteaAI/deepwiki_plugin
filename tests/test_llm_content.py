@@ -143,12 +143,14 @@ def _captured_body(build_llm):
     return captured["body"]
 
 
+# A provider-prefixed GPT-5 name: langchain_openai drops temperature only for
+# names that start with "gpt-5", so prefixed (e.g. Bedrock) names kept it.
 BEDROCK_SETTINGS = {
     "provider": "openai",
     "api_base": "http://platform/llm/v1",
     "api_key": "key",
-    "model_name": "global.openai.gpt-5.6-luna",
-    "organization": "406",
+    "model_name": "provider.openai.gpt-5-example",
+    "organization": "1",
     "streaming": True,
 }
 
@@ -166,7 +168,7 @@ def test_workers_send_no_temperature_unless_configured(worker_module):
 
     body = _captured_body(lambda: build(dict(BEDROCK_SETTINGS)))
     assert "temperature" not in body
-    assert body["model"] == "global.openai.gpt-5.6-luna"
+    assert body["model"] == "provider.openai.gpt-5-example"
 
     configured = _captured_body(lambda: build({**BEDROCK_SETTINGS, "temperature": 0.2}))
     assert configured["temperature"] == 0.2
@@ -176,8 +178,8 @@ def test_resolve_wiki_llm_sends_no_temperature_unless_configured():
     from test_invoke_repo_config import _load_invoke_module
 
     invoke = _load_invoke_module()
-    kwargs = dict(provider="openai", model_name="global.openai.gpt-5.6-luna", api_key="key",
-                  api_base="http://platform/llm/v1", organization="406")
+    kwargs = dict(provider="openai", model_name="provider.openai.gpt-5-example", api_key="key",
+                  api_base="http://platform/llm/v1", organization="1")
 
     body = _captured_body(lambda: invoke.create_llm(**kwargs))
     assert "temperature" not in body
