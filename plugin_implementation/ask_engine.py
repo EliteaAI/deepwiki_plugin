@@ -23,6 +23,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
 from .budget_errors import budget_error_result
+from .llm_content import message_text
 
 logger = logging.getLogger(__name__)
 
@@ -320,8 +321,9 @@ class AskEngine:
                                 }
 
                         # Final content (no tool calls = final answer)
-                        if message.content and not message.tool_calls:
-                            self.final_answer = message.content
+                        final_text = message_text(message)
+                        if final_text and not message.tool_calls:
+                            self.final_answer = final_text
 
                     elif isinstance(message, ToolMessage):
                         step_count += 1

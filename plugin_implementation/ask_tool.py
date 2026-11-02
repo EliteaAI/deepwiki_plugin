@@ -22,6 +22,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .token_counter import get_token_counter, CONTEXT_TOKEN_BUDGET
+from .llm_content import message_text
 from .repository_analysis_store import (
     is_structured_analysis,
     get_query_optimized_context,
@@ -291,7 +292,7 @@ class AskTool:
                 HumanMessage(content=user_prompt)
             ])
             
-            optimized = response.content.strip()
+            optimized = message_text(response).strip()
             
             # Validate the optimized query
             # Don't use if it's too long, empty, or looks like an explanation
@@ -491,7 +492,7 @@ class AskTool:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
-            return response.content
+            return message_text(response)
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")
             raise

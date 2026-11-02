@@ -35,6 +35,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
+from ..llm_content import message_text
 from .structure_skeleton import (
     DirCluster,
     DocCluster,
@@ -268,7 +269,7 @@ IMPORTANT:
 """
 
     response = llm.invoke(prompt)
-    return _parse_llm_json(response.content)
+    return _parse_llm_json(message_text(response))
 
 
 def _batched_llm_refinement(

@@ -39,6 +39,8 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Overwrite
 
+from ..llm_content import message_text
+
 logger = logging.getLogger(__name__)
 
 # Feature flag: disable eviction to compare behavior
@@ -122,7 +124,7 @@ class ContextEvictionMiddleware(AgentMiddleware):
                 # The model is mid-cycle (e.g., query_graph results just came in).
                 return None
 
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            content = message_text(msg)
 
             # Check for CONTINUE signal markers
             if '🚨' in content and ('CONTINUE' in content or 'COVERAGE' in content):

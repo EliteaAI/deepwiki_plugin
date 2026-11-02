@@ -29,6 +29,7 @@ from .research_prompts import (
     get_research_prompt
 )
 from ..budget_errors import budget_error_result
+from ..llm_content import message_text
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +290,9 @@ class DeepResearchEngine:
                                 }
                         
                         # Check for final content (no tool calls = final response)
-                        if message.content and not message.tool_calls:
-                            self.final_report = message.content
+                        final_text = message_text(message)
+                        if final_text and not message.tool_calls:
+                            self.final_report = final_text
                     
                     # Tool response message
                     elif isinstance(message, ToolMessage):
