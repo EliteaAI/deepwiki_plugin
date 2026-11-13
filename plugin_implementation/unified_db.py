@@ -296,6 +296,19 @@ except ImportError:
     def is_test_path(rel_path: str) -> bool:  # noqa: D103
         return False
 
+# WAL bounds (large repositories). The WAL is kept small by committing and
+# truncating it between bulk writes instead of letting one transaction grow it.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+# populate_embeddings reads nodes in keyset pages of this many rows (rounded
+# down to a multiple of the embed batch so batch boundaries stay the same).
+_EMBED_PAGE_ROWS = 1024
+# ...and truncates the WAL every this many committed pages (or sooner once it
+# exceeds _WAL_SIZE_LIMIT_BYTES).
+_EMBED_CHECKPOINT_EVERY_PAGES = 8
+# Row count per committed chunk for the other bulk rewrites (FTS rebuild,
+# edge rewrite, cluster assignment).
+_BULK_ROWS = 5000
+
 # Legacy symbol types used by graph_builder (pre-constants.py centralization)
 # These coexist with the *_document types in DOC_SYMBOL_TYPES from constants.py
 _LEGACY_DOC_TYPES = {'module_doc', 'file_doc'}
@@ -366,6 +379,8 @@ class UnifiedWikiDB:
         self.conn.execute("PRAGMA cache_size=-65536")   # 64 MB
         self.conn.execute("PRAGMA mmap_size=268435456")  # 256 MB
         self.conn.execute("PRAGMA foreign_keys=ON")
+        if not readonly:
+            self.conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
 
         self._load_extensions()
         if not readonly:
@@ -480,6 +495,24 @@ class UnifiedWikiDB:
     # ------------------------------------------------------------------
     # Context manager / cleanup
     # ------------------------------------------------------------------
+
+    def checkpoint_wal(self) -> None:
+        """Copy the WAL into the DB file and truncate it (best effort).
+
+        Called after bulk writes so the WAL does not keep the size of the
+        largest transaction on disk. Must not run while a read cursor is
+        open on this connection.
+        """
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except Exception as exc:
+            logger.debug("wal_checkpoint(TRUNCATE) failed for %s: %s", self.db_path, exc)
+
+    def _wal_size_bytes(self) -> int:
+        try:
+            return os.path.getsize(f"{self.db_path}-wal")
+        except OSError:
+            return 0
 
     def close(self) -> None:
         if self.conn:
@@ -765,12 +798,21 @@ class UnifiedWikiDB:
     def _populate_fts5(self) -> None:
         """Populate FTS5 table from repo_nodes (full rebuild)."""
         self.conn.execute("DELETE FROM repo_fts")
-        self.conn.execute("""
-            INSERT INTO repo_fts (node_id, symbol_name, signature, docstring, source_text)
-            SELECT node_id, symbol_name, signature, docstring, source_text
-            FROM repo_nodes
-        """)
         self.conn.commit()
+        # Copy in rowid ranges, one commit per range, so the WAL holds one
+        # range instead of the whole text corpus. Rows go in the same rowid
+        # order as a single INSERT…SELECT, so repo_fts contents are the same.
+        lo_rowid, max_rowid = self.conn.execute(
+            "SELECT min(rowid), max(rowid) FROM repo_nodes"
+        ).fetchone()
+        for lo in range((lo_rowid or 1) - 1, max_rowid or 0, _BULK_ROWS):
+            self.conn.execute("""
+                INSERT INTO repo_fts (node_id, symbol_name, signature, docstring, source_text)
+                SELECT node_id, symbol_name, signature, docstring, source_text
+                FROM repo_nodes WHERE rowid > ? AND rowid <= ? ORDER BY rowid
+            """, (lo, lo + _BULK_ROWS))
+            self.conn.commit()
+        self.checkpoint_wal()
         logger.debug("FTS5 index rebuilt (%d rows)", self.node_count())
 
     def search_fts5(
@@ -959,43 +1001,76 @@ class UnifiedWikiDB:
 
         # SQLite trim() only strips spaces; use explicit whitespace chars
         _ws = " ' ' || char(9) || char(10) || char(13) "
-        rows = self.conn.execute(
-            "SELECT node_id, source_text FROM repo_nodes "
-            f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
-        ).fetchall()
+        text_filter = (
+            f"source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
+        )
+        n_rows = self.conn.execute(
+            f"SELECT count(*) FROM repo_nodes WHERE {text_filter}"
+        ).fetchone()[0]
+
+        # Keyset pages by rowid (the same order a plain scan returns), each
+        # fully fetched before its commit: an open read cursor would make the
+        # WAL checkpoint fail. The page size is a multiple of batch_size so
+        # the embed batches are the same as in one pass over all rows.
+        page_rows = max(batch_size, (_EMBED_PAGE_ROWS // batch_size) * batch_size)
+        last_rowid = -(2 ** 63)
+        offset = 0
+        pages = 0
 
         total = 0
         # Large repos embed hundreds of thousands of nodes here; without
         # periodic progress the phase is indistinguishable from a hang.
         progress_every = max(batch_size, 20_000)
         t0 = time.monotonic()
-        logger.info("populate_embeddings: embedding %d nodes (batch=%d)", len(rows), batch_size)
-        for i in range(0, len(rows), batch_size):
-            if i and i % progress_every < batch_size:
-                logger.info(
-                    "populate_embeddings: %d/%d nodes processed (%.0fs)",
-                    i, len(rows), time.monotonic() - t0,
-                )
-            batch = rows[i : i + batch_size]
-            texts = [r["source_text"] for r in batch]
-            node_ids = [r["node_id"] for r in batch]
+        logger.info("populate_embeddings: embedding %d nodes (batch=%d)", n_rows, batch_size)
+        while True:
+            rows = self.conn.execute(
+                "SELECT rowid, node_id, source_text FROM repo_nodes "
+                f"WHERE rowid > ? AND {text_filter} ORDER BY rowid LIMIT ?",
+                (last_rowid, page_rows),
+            ).fetchall()
+            if not rows:
+                break
+            last_rowid = rows[-1]["rowid"]
 
-            try:
-                vectors = embedding_fn(texts)
-            except Exception as exc:
-                raise_if_budget_exceeded(exc)
-                logger.warning(
-                    "populate_embeddings: batch %d–%d failed: %s",
-                    i, i + len(batch), exc,
-                )
-                continue
+            for j in range(0, len(rows), batch_size):
+                i = offset + j
+                if i and i % progress_every < batch_size:
+                    logger.info(
+                        "populate_embeddings: %d/%d nodes processed (%.0fs)",
+                        i, n_rows, time.monotonic() - t0,
+                    )
+                batch = rows[j : j + batch_size]
+                texts = [r["source_text"] for r in batch]
+                node_ids = [r["node_id"] for r in batch]
 
-            pairs = list(zip(node_ids, vectors))
-            self.upsert_embeddings_batch(pairs)
-            total += len(pairs)
+                try:
+                    vectors = embedding_fn(texts)
+                except Exception as exc:
+                    raise_if_budget_exceeded(exc)
+                    logger.warning(
+                        "populate_embeddings: batch %d–%d failed: %s",
+                        i, i + len(batch), exc,
+                    )
+                    continue
+
+                pairs = list(zip(node_ids, vectors))
+                self.upsert_embeddings_batch(pairs)
+                total += len(pairs)
+
+            offset += len(rows)
+            del rows
+            self.conn.commit()
+            pages += 1
+            if (
+                pages % _EMBED_CHECKPOINT_EVERY_PAGES == 0
+                or self._wal_size_bytes() > _WAL_SIZE_LIMIT_BYTES
+            ):
+                self.checkpoint_wal()
 
         self.conn.commit()
-        logger.info("populate_embeddings: %d/%d nodes embedded", total, len(rows))
+        self.checkpoint_wal()
+        logger.info("populate_embeddings: %d/%d nodes embedded", total, n_rows)
         return total
 
     def search_vec(
@@ -1245,6 +1320,7 @@ class UnifiedWikiDB:
             if len(node_batch) >= BATCH:
                 self._upsert_nodes_batch(node_batch)
                 node_batch.clear()
+                self.conn.commit()  # keep the WAL at one batch
 
         if node_batch:
             self._upsert_nodes_batch(node_batch)
@@ -1312,6 +1388,7 @@ class UnifiedWikiDB:
             if len(edge_batch) >= BATCH:
                 self._upsert_edges_batch(edge_batch)
                 edge_batch.clear()
+                self.conn.commit()  # keep the WAL at one batch
 
         if edge_batch:
             self._upsert_edges_batch(edge_batch)

@@ -55,7 +55,6 @@ from .budget_errors import raise_if_budget_exceeded
 try:
     from .feature_flags import FeatureFlags, get_feature_flags  # type: ignore
     from .graph_orphan_cascade_v2 import (  # type: ignore
-        collect_orphan_embeddings,
         resolve_orphans_explicit_refs,
     )
     from .graph_orphan_hybrid import resolve_orphans_hybrid  # type: ignore
@@ -63,14 +62,12 @@ except ImportError:  # pragma: no cover — non-package import fallback
     try:
         from feature_flags import FeatureFlags, get_feature_flags  # type: ignore
         from graph_orphan_cascade_v2 import (  # type: ignore
-            collect_orphan_embeddings,
             resolve_orphans_explicit_refs,
         )
         from graph_orphan_hybrid import resolve_orphans_hybrid  # type: ignore
     except ImportError:
         FeatureFlags = None  # type: ignore[assignment]
         get_feature_flags = None  # type: ignore[assignment]
-        collect_orphan_embeddings = None  # type: ignore[assignment]
         resolve_orphans_explicit_refs = None  # type: ignore[assignment]
         resolve_orphans_hybrid = None  # type: ignore[assignment]
 
@@ -544,20 +541,17 @@ def _resolve_orphans_v2(
     stats.setdefault("hybrid", 0)
     pass2_t = _time.monotonic()
     pending = [nid for nid in orphans if nid not in resolved]
-    orphan_embs: Optional[Dict[str, Optional[List[float]]]] = None
-    if flags.orphan_reuse_embeddings and pending:
-        try:
-            orphan_embs = collect_orphan_embeddings(db, pending)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("collect_orphan_embeddings failed: %s", exc)
-            orphan_embs = None
-
+    # Persisted vectors are read one orphan at a time inside
+    # resolve_orphans_hybrid (db.get_embedding_by_id). Pre-fetching them all
+    # into one dict held ~62 KB per orphan and OOM-killed large repositories;
+    # the DB is not written during this pass, so each lookup returns the
+    # same vector the pre-fetch did.
     if pending and flags.orphan_hybrid_search:
         for nid in pending:
             try:
                 hits = resolve_orphans_hybrid(
                     db, G, nid,
-                    orphan_embeddings=orphan_embs,
+                    orphan_embeddings=None,
                     embed_fn=embedding_fn,
                     flags=flags,
                 )
@@ -1467,6 +1461,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
     # This is simple and correct for the dual-write scenario (the DB is
     # fully reconstructed from the graph each run anyway in Phase 1-2).
     db.conn.execute("DELETE FROM repo_edges")
+    db.conn.commit()
 
     edge_batch = []
     BATCH = 5000
@@ -1495,11 +1490,15 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
         if len(edge_batch) >= BATCH:
             db.upsert_edges_batch(edge_batch)
             edge_batch.clear()
+            # Commit per batch so the WAL holds one batch, not every edge.
+            db.conn.commit()
 
     if edge_batch:
         db.upsert_edges_batch(edge_batch)
 
     db.conn.commit()
+    if hasattr(db, "checkpoint_wal"):
+        db.checkpoint_wal()
 
     count = db.edge_count()
     logger.info("Persisted %d weighted edges to unified DB", count)

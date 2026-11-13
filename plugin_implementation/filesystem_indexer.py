@@ -8,6 +8,7 @@ Supports multi-provider repositories: GitHub, GitLab, Bitbucket, Azure DevOps.
 
 import logging
 import os
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
@@ -45,6 +46,30 @@ try:
 except ImportError:
     logger.error("Enhanced Unified Graph Builder not available")
     EnhancedUnifiedGraphBuilder = None
+
+
+def _drop_git_objects(repo_path: str) -> None:
+    """Free the clone's git object store once commit/branch/remote are read.
+
+    Nothing after ``get_repository_info`` reads git objects, but the pack is
+    the largest part of ``.git`` on big repositories. HEAD, refs and config
+    stay, so ``get_repository_info`` still works when a later run reuses this
+    clone path, and ``.git`` still marks the repository root. Best effort.
+    """
+    git_dir = os.path.join(repo_path, ".git")
+    if not os.path.isdir(git_dir):
+        return
+    try:
+        objects_dir = os.path.join(git_dir, "objects")
+        if os.path.isdir(objects_dir):
+            shutil.rmtree(objects_dir)
+            os.mkdir(objects_dir)
+        index_file = os.path.join(git_dir, "index")
+        if os.path.isfile(index_file):
+            os.remove(index_file)
+        logger.info("Removed git object store from clone: %s", git_dir)
+    except OSError as exc:
+        logger.warning("Could not remove git object store from %s: %s", git_dir, exc)
 
 
 class FilesystemRepositoryIndexer:
@@ -126,6 +151,9 @@ class FilesystemRepositoryIndexer:
         self._parser_cross_language_relationships = []
         self.vectorstore = None
         self.last_index_stats = None
+        # Set when the document stream was reduced by _retain_documents:
+        # aggregates of the full stream (count, stats, sources, files).
+        self._doc_summary = None
         self._doc_type_counts = {
             'text': 0,
             'code': 0,
@@ -177,6 +205,8 @@ class FilesystemRepositoryIndexer:
             self._repo_root = repo_path
             if self.current_repo_info:
                 self._last_commit_hash = self.current_repo_info.get('commit_hash')
+            if self._last_commit_hash:
+                _drop_git_objects(repo_path)
             
             # Use actual branch from cloned repo (handles cases like 'master' vs 'main').
             # Never let a falsy branch/None leak into the identifier (#7273) —
@@ -225,6 +255,7 @@ class FilesystemRepositoryIndexer:
     
     def _try_load_from_cache(self, repo_identifier: str, repo_path: str) -> Optional[Dict[str, Any]]:
         """Try to load complete index from cache (graph + vectorstore + docs)."""
+        self._doc_summary = None
         try:
             commit_hash = self._last_commit_hash
             
@@ -270,6 +301,7 @@ class FilesystemRepositoryIndexer:
                                force_rebuild: bool = False) -> Dict[str, Any]:
         """Build index from filesystem using Enhanced Unified Graph Builder"""
         logger.info(f"Building filesystem index for {repo_path}")
+        self._doc_summary = None
         if this and getattr(this, 'module', None):
             this.module.invocation_thinking("I am on phase indexing\nDiscovering & filtering repository files...\nReasoning: Apply inclusion/exclusion rules to bound analysis scope.\nNext: Run unified graph analysis on accepted files.")
         
@@ -278,7 +310,8 @@ class FilesystemRepositoryIndexer:
         with resource_monitor("index.discover_files", logger):
             all_files = self._discover_files(repo_path)
         
-        if max_files and len(all_files) > max_files:
+        limited = bool(max_files and len(all_files) > max_files)
+        if limited:
             logger.info(f"Limiting to {max_files} files (found {len(all_files)})")
             all_files = all_files[:max_files]
         
@@ -295,10 +328,17 @@ class FilesystemRepositoryIndexer:
             # Stream documents by default for memory efficiency
             # Set DEEPWIKI_DISABLE_STREAM_DOCS=1 to materialize all documents at once
             stream_documents = os.getenv("DEEPWIKI_DISABLE_STREAM_DOCS") != "1"
+            # Configured filters and max_files narrow what the graph builder
+            # parses (it walks the repo itself). Without them the builder's own
+            # walk is kept as is, so unfiltered indexing does not change.
+            allowed_files = None
+            if limited or self.filter_manager.has_user_filters():
+                allowed_files = set(all_files)
             with resource_monitor("index.graph_analysis", logger):
                 analysis = self.graph_builder.analyze_repository(
                     repo_path,
-                    stream_documents=stream_documents
+                    stream_documents=stream_documents,
+                    allowed_files=allowed_files,
                 )
             
             # Extract results
@@ -370,7 +410,15 @@ class FilesystemRepositoryIndexer:
             logger.info("Skipping legacy vectorstore build (UnifiedWikiDB only)")
             # Materialize streaming iterator so self.all_documents is populated
             # (needed for stats and unified DB write).
-            if documents_iter and not self.all_documents:
+            if documents_iter and not self.all_documents and os.getenv("DEEPWIKI_KEEP_DOC_SPLITS") != "1":
+                # Consume the stream once and keep only what later readers use
+                # (see _retain_documents) instead of every Document.
+                logger.info("Consuming document stream without vectorstore...")
+                self._retain_documents(documents_iter)
+                logger.info("Consumed %d documents, kept %d for repository analysis "
+                            "(no FAISS/BM25 indexes created)",
+                            self.get_document_count(), len(self.all_documents))
+            elif documents_iter and not self.all_documents:
                 logger.info("Materializing document stream without vectorstore...")
                 self.all_documents = list(documents_iter)
                 self._add_repository_metadata()
@@ -514,7 +562,13 @@ class FilesystemRepositoryIndexer:
             # Apply file filters
             for file_name in files:
                 file_path = os.path.relpath(os.path.join(root, file_name), repo_path)
-                if self.filter_manager.should_process_file(file_path):
+                file_size = None
+                if self.filter_manager.max_file_size_configured:
+                    try:
+                        file_size = os.path.getsize(os.path.join(root, file_name))
+                    except OSError:
+                        file_size = None
+                if self.filter_manager.should_process_file(file_path, file_size):
                     all_files.append(file_path)
         
         logger.info(f"Discovered {len(all_files)} files after filtering")
@@ -525,19 +579,125 @@ class FilesystemRepositoryIndexer:
         if not self.current_repo_info:
             return
         
-        repo_metadata = {
+        repo_metadata = self._repository_metadata()
+        for doc in self.all_documents:
+            self._apply_repository_metadata(doc, repo_metadata)
+
+    def _repository_metadata(self) -> Dict[str, Any]:
+        return {
             'repository_path': self.current_repo_path,
             'commit_hash': self.current_repo_info.get('commit_hash'),
             'branch': self.current_repo_info.get('branch'),
             'remote_url': self.current_repo_info.get('remote_url')
         }
-        
-        for doc in self.all_documents:
-            doc.metadata.update(repo_metadata)
-            # Provide 'source' key for compatibility with GitHubIndexer-dependent code paths
-            # Use rel_path (relative) for source to avoid absolute paths in citations
-            if 'source' not in doc.metadata:
-                doc.metadata['source'] = doc.metadata.get('rel_path') or doc.metadata.get('file_path')
+
+    @staticmethod
+    def _apply_repository_metadata(doc: Document, repo_metadata: Dict[str, Any]) -> None:
+        doc.metadata.update(repo_metadata)
+        # Provide 'source' key for compatibility with GitHubIndexer-dependent code paths
+        # Use rel_path (relative) for source to avoid absolute paths in citations
+        if 'source' not in doc.metadata:
+            doc.metadata['source'] = doc.metadata.get('rel_path') or doc.metadata.get('file_path')
+
+    # Extensions matched (as substrings of the lower-cased source) by
+    # wiki_graph_optimized._extract_representative_code_samples.
+    _SAMPLE_CONFIG_EXTS = ('yaml', 'json', 'toml', 'ini', 'proto', 'tf', 'gradle', 'wsdl', 'xsd')
+
+    def _retain_documents(self, documents) -> None:
+        """Consume a document stream, keeping only what later readers use.
+
+        Holding every Document for the whole job cost ~1.5 KB per node. The
+        readers after indexing are the repository-analysis step
+        (wiki_graph_optimized: every README chunk, the first 3 ``.py``, first
+        2 config and first 2 ``.md`` documents, the document count and the
+        source list) and the index stats (per-document counts). The selected
+        documents are kept in stream order and the rest is aggregated here,
+        so each reader gets the same input as from the full list.
+        """
+        repo_metadata = self._repository_metadata() if self.current_repo_info else None
+        kept: List[Document] = []
+        n_py = n_cfg = n_md = 0
+        total = text_count = code_count = 0
+        file_types: Dict[str, int] = {}
+        languages: set = set()
+        code_languages: set = set()
+        symbols_by_type: Dict[str, int] = {}
+        files_with_symbols: set = set()
+        files: set = set()
+        sources: Dict[str, None] = {}  # ordered set
+
+        for doc in documents:
+            if repo_metadata is not None:
+                self._apply_repository_metadata(doc, repo_metadata)
+            meta = doc.metadata
+            total += 1
+
+            # Same aggregation as _generate_index_stats / export_index_summary.
+            if 'file_extension' in meta:
+                ext = meta['file_extension']
+                file_types[ext] = file_types.get(ext, 0) + 1
+            if meta.get('language'):
+                languages.add(meta['language'])
+            if meta.get('symbol_type'):
+                symbol_type = meta['symbol_type']
+                symbols_by_type[symbol_type] = symbols_by_type.get(symbol_type, 0) + 1
+                files_with_symbols.add(meta.get('file_path', ''))
+            if meta.get('file_path'):
+                files.add(meta.get('file_path'))
+            chunk_type = meta.get('chunk_type')
+            if chunk_type == 'text':
+                text_count += 1
+            elif chunk_type in ['symbol', 'code']:
+                code_count += 1
+                if meta.get('language'):
+                    code_languages.add(meta['language'])
+
+            # Same selection as the repository-analysis fallbacks.
+            source = meta.get('source', '')
+            if source:
+                sources[source] = None
+            source = source or ''
+            keep = 'readme' in source.lower()
+            if source.endswith('.py') and n_py < 3:
+                n_py += 1
+                keep = True
+            if n_cfg < 2 and any(ext in source.lower() for ext in self._SAMPLE_CONFIG_EXTS):
+                n_cfg += 1
+                keep = True
+            if source.endswith('.md') and n_md < 2:
+                n_md += 1
+                keep = True
+            if keep:
+                kept.append(doc)
+
+        self.all_documents = kept
+        self._doc_type_counts = {'text': text_count, 'code': code_count}
+        self.text_documents = None
+        self.code_documents = None
+        self._doc_summary = {
+            'total': total,
+            'file_types': file_types,
+            'languages': languages,
+            'code_languages': code_languages,
+            'symbols_by_type': symbols_by_type,
+            'files_with_symbols': files_with_symbols,
+            'files': files,
+            'sources': list(sources),
+        }
+
+    def get_document_count(self) -> int:
+        """Number of documents produced by indexing (not only those retained)."""
+        if self._doc_summary is not None:
+            return self._doc_summary['total']
+        return len(self.all_documents) if self.all_documents else 0
+
+    def get_document_sources(self) -> List[str]:
+        """``source`` of every indexed document, in order, without duplicates."""
+        if self._doc_summary is not None:
+            return list(self._doc_summary['sources'])
+        return list(dict.fromkeys(
+            doc.metadata.get('source', '') for doc in self.all_documents if doc.metadata.get('source')
+        ))
 
     def _write_unified_db(self, repo_path: str, repo_identifier: str) -> Optional[str]:
         """Write unified SQLite DB from current graph + metadata.
@@ -761,7 +921,7 @@ class FilesystemRepositoryIndexer:
                     udb.set_meta("repo_path", repo_path)
                     udb.set_meta("node_count", self.relationship_graph.number_of_nodes())
                     udb.set_meta("edge_count", self.relationship_graph.number_of_edges())
-                    udb.set_meta("doc_count", len(self.all_documents) if self.all_documents else 0)
+                    udb.set_meta("doc_count", self.get_document_count())
 
                     stats = udb.stats()
                     logger.info(
@@ -826,8 +986,14 @@ class FilesystemRepositoryIndexer:
         languages = set()
         symbols_by_type = {}
         files_with_symbols = set()
-        
-        for doc in self.all_documents:
+        summary = self._doc_summary
+        if summary is not None:
+            file_types = summary['file_types']
+            languages = summary['languages']
+            symbols_by_type = summary['symbols_by_type']
+            files_with_symbols = summary['files_with_symbols']
+
+        for doc in (self.all_documents if summary is None else ()):
             # File type analysis
             if 'file_extension' in doc.metadata:
                 ext = doc.metadata['file_extension']
@@ -852,7 +1018,7 @@ class FilesystemRepositoryIndexer:
             'repository_identifier': repo_identifier,
             'loaded_from_cache': from_cache,
             'documents': {
-                'total': len(self.all_documents),
+                'total': self.get_document_count(),
                 'text_documents': self._get_text_count(),
                 'code_documents': self._get_code_count(),
                 'file_types': file_types
@@ -912,28 +1078,34 @@ class FilesystemRepositoryIndexer:
     
     def export_index_summary(self) -> Dict[str, Any]:
         """Export comprehensive index summary"""
-        if not self.all_documents:
+        if not self.get_document_count():
             return {"error": "No documents indexed"}
         
         # Document summary
         doc_summary = {
-            'total_documents': len(self.all_documents),
+            'total_documents': self.get_document_count(),
             'text_documents': self._get_text_count(),
             'code_documents': self._get_code_count()
         }
         
         # File summary
-        files = set(doc.metadata.get('file_path') for doc in self.all_documents if doc.metadata.get('file_path'))
+        if self._doc_summary is not None:
+            files = self._doc_summary['files']
+        else:
+            files = set(doc.metadata.get('file_path') for doc in self.all_documents if doc.metadata.get('file_path'))
         file_summary = {
             'total_files': len(files),
             'files': list(files)
         }
         
         # Language summary
-        languages = set()
-        for doc in self._iter_code_documents():
-            if doc.metadata.get('language'):
-                languages.add(doc.metadata['language'])
+        if self._doc_summary is not None:
+            languages = self._doc_summary['code_languages']
+        else:
+            languages = set()
+            for doc in self._iter_code_documents():
+                if doc.metadata.get('language'):
+                    languages.add(doc.metadata['language'])
         
         # Graph summary
         graph_summary = {}

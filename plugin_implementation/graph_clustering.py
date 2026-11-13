@@ -1289,10 +1289,19 @@ def persist_clusters(
     """
     # Reset all existing cluster / hub columns so stale assignments
     # from a previous run on the same cached DB file do not survive.
-    db.conn.execute(
-        "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
-        " is_hub = 0, hub_assignment = NULL"
-    )
+    # Both UPDATEs rewrite whole rows (text included), so they run in
+    # committed chunks to keep the WAL at one chunk instead of the table.
+    _CHUNK = 5000
+    max_rowid = db.conn.execute("SELECT max(rowid) FROM repo_nodes").fetchone()[0]
+    if not isinstance(max_rowid, int):
+        max_rowid = 0
+    for lo in range(0, max_rowid, _CHUNK):
+        db.conn.execute(
+            "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
+            " is_hub = 0, hub_assignment = NULL WHERE rowid > ? AND rowid <= ?",
+            (lo, lo + _CHUNK),
+        )
+        db.conn.commit()
 
     # Batch-build (node_id, macro, micro) tuples
     batch: List[Tuple[str, int, Optional[int]]] = []
@@ -1304,13 +1313,17 @@ def persist_clusters(
     for hub_id, (macro_id, micro_id) in hub_assignments.items():
         batch.append((hub_id, macro_id, micro_id))
 
-    db.set_clusters_batch(batch)
+    for i in range(0, len(batch), _CHUNK):
+        db.set_clusters_batch(batch[i : i + _CHUNK])
+        db.conn.commit()
 
     # Hub flags (is_hub + assignment label for metadata/debugging)
     for hub_id, (macro_id, _micro_id) in hub_assignments.items():
         db.set_hub(hub_id, is_hub=True, assignment=str(macro_id))
 
     db.conn.commit()
+    if hasattr(db, "checkpoint_wal"):
+        db.checkpoint_wal()
 
     stats = {
         "nodes_clustered": len(batch),

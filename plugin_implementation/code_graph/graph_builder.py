@@ -505,7 +505,8 @@ class EnhancedUnifiedGraphBuilder:
     def analyze_repository(self, repo_path: str, 
                           include_patterns: Optional[List[str]] = None,
                           exclude_patterns: Optional[List[str]] = None,
-                          stream_documents: bool = False) -> UnifiedAnalysis:
+                          stream_documents: bool = False,
+                          allowed_files: Optional[Set[str]] = None) -> UnifiedAnalysis:
         """
         Single pass analysis: parse once, generate chunks + multi-tier code_graph
         
@@ -513,6 +514,8 @@ class EnhancedUnifiedGraphBuilder:
             repo_path: Path to the repository root
             include_patterns: File patterns to include
             exclude_patterns: File patterns to exclude
+            allowed_files: Optional repo-relative paths approved by the
+                caller's filters; when given, files outside it are skipped
             
         Returns:
             Unified analysis with documents and code_graph from single parsing
@@ -527,7 +530,9 @@ class EnhancedUnifiedGraphBuilder:
         
         # Phase 1: Discover files by language
         with resource_monitor("graph_builder.discover_files", logger):
-            files_by_language = self._discover_files_by_language(repo_path, include_patterns, exclude_patterns)
+            files_by_language = self._discover_files_by_language(
+                repo_path, include_patterns, exclude_patterns, allowed_files=allowed_files,
+            )
         
         # Phase 2: Single parse with appropriate parser tier
         parse_results = {}
@@ -690,7 +695,8 @@ class EnhancedUnifiedGraphBuilder:
     
     def _discover_files_by_language(self, repo_path: str,
                                    include_patterns: Optional[List[str]] = None,
-                                   exclude_patterns: Optional[List[str]] = None) -> Dict[str, List[str]]:
+                                   exclude_patterns: Optional[List[str]] = None,
+                                   allowed_files: Optional[Set[str]] = None) -> Dict[str, List[str]]:
         """Discover and categorize files by programming language"""
         files_by_language = defaultdict(list)
         
@@ -706,6 +712,9 @@ class EnhancedUnifiedGraphBuilder:
         # Walk through all files in the repository
         for file_path in repo_path.rglob('*'):
             if file_path.is_file():
+                if (allowed_files is not None
+                        and os.path.relpath(file_path, repo_path) not in allowed_files):
+                    continue
                 # Check exclusions
                 if self._should_exclude_file(str(file_path), exclude_patterns):
                     continue
