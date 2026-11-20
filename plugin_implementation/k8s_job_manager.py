@@ -20,6 +20,10 @@ from typing import Any, Callable, Dict, Optional
 log = logging.getLogger(__name__)
 
 
+def get_active_deadline_seconds() -> int:
+    return int(os.environ.get("ACTIVE_DEADLINE_SECONDS", "86400"))
+
+
 class K8sJobManager:
     """Manages Kubernetes Jobs for wiki generation."""
     
@@ -594,7 +598,7 @@ echo "[init] Bootstrap finished successfully"
             spec=client.V1JobSpec(
                 ttl_seconds_after_finished=self.ttl_seconds,
                 backoff_limit=0,  # No retries - fail fast
-                active_deadline_seconds=int(os.environ.get("ACTIVE_DEADLINE_SECONDS", "86400")), # default is 1 day deadline since there might be a huge repos to process
+                active_deadline_seconds=get_active_deadline_seconds(),
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(
                         labels={
