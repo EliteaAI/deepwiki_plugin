@@ -363,7 +363,10 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
         This provides cluster-wide slot management - the Job count is tracked
         via K8s API instead of process-local counters.
         """
-        from ..plugin_implementation.k8s_job_manager import get_job_manager
+        from ..plugin_implementation.k8s_job_manager import (
+            get_active_deadline_seconds,
+            get_job_manager,
+        )
         
         # Pass base_path from the YAML plugin config so the job manager
         # uses the Helm-configured value instead of env vars / hardcoded
@@ -397,6 +400,7 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
             }
         
         # Generate job ID and create job
+        max_wait = get_active_deadline_seconds()
         job_id = job_manager.generate_job_id()
         
         self.invocation_thinking(f"Starting wiki generation job: {job_id}")
@@ -457,7 +461,6 @@ raise SystemExit(m.main(['--input', {input_path!r}, '--output', {output_path!r}]
         t.start()
         
         # Poll for job completion - wrapped in try-finally to ensure job cleanup on stop
-        max_wait = 3600 * 24  # 24 hours max (large repos can take very long)
         poll_interval = 5
         elapsed = 0
         job_stopped = False
