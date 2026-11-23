@@ -24,6 +24,99 @@ def get_active_deadline_seconds() -> int:
     return int(os.environ.get("ACTIVE_DEADLINE_SECONDS", "86400"))
 
 
+# Worker pod/container securityContext (worker and plugin-bootstrap init
+# container). Defaults are the hardened values; an empty value leaves that
+# field unset, so the cluster/runtime default applies.
+JOB_RUN_AS_USER_ENV = "DEEPWIKI_JOB_RUN_AS_USER"
+JOB_RUN_AS_GROUP_ENV = "DEEPWIKI_JOB_RUN_AS_GROUP"
+JOB_FS_GROUP_ENV = "DEEPWIKI_JOB_FS_GROUP"
+JOB_RUN_AS_NON_ROOT_ENV = "DEEPWIKI_JOB_RUN_AS_NON_ROOT"
+JOB_ALLOW_PRIVILEGE_ESCALATION_ENV = "DEEPWIKI_JOB_ALLOW_PRIVILEGE_ESCALATION"
+JOB_READ_ONLY_ROOT_FILESYSTEM_ENV = "DEEPWIKI_JOB_READ_ONLY_ROOT_FILESYSTEM"
+JOB_CAPABILITIES_DROP_ENV = "DEEPWIKI_JOB_CAPABILITIES_DROP"
+JOB_SECCOMP_PROFILE_ENV = "DEEPWIKI_JOB_SECCOMP_PROFILE"
+
+
+def _env_or_default(name: str, default: str) -> Optional[str]:
+    """Unset -> default; set but blank -> None (leave the field unset); else the value."""
+    if name not in os.environ:
+        return default
+    return os.environ[name].strip() or None
+
+
+def _int_setting(name: str, default: str) -> Optional[int]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _bool_setting(name: str, default: str) -> Optional[bool]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes"):
+        return True
+    if lowered in ("false", "0", "no"):
+        return False
+    raise ValueError(f"{name} must be true or false, got {value!r}")
+
+
+def _list_setting(name: str, default: str) -> Optional[list]:
+    value = _env_or_default(name, default)
+    if value is None:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or None
+
+
+def get_security_settings() -> Dict[str, Any]:
+    """Worker securityContext settings from the controller's environment.
+
+    Defaults match the worker image (USER 33:33, no setuid binaries) and the
+    restricted Pod Security profile except readOnlyRootFilesystem, which stays
+    off by default: the init container's git clone / pip install and the
+    worker write temp files inside the image.
+    """
+    return {
+        "run_as_user": _int_setting(JOB_RUN_AS_USER_ENV, "33"),
+        "run_as_group": _int_setting(JOB_RUN_AS_GROUP_ENV, "33"),
+        "fs_group": _int_setting(JOB_FS_GROUP_ENV, "33"),
+        "run_as_non_root": _bool_setting(JOB_RUN_AS_NON_ROOT_ENV, "true"),
+        "allow_privilege_escalation": _bool_setting(JOB_ALLOW_PRIVILEGE_ESCALATION_ENV, "false"),
+        "read_only_root_filesystem": _bool_setting(JOB_READ_ONLY_ROOT_FILESYSTEM_ENV, "false"),
+        "capabilities_drop": _list_setting(JOB_CAPABILITIES_DROP_ENV, "ALL"),
+        "seccomp_profile": _env_or_default(JOB_SECCOMP_PROFILE_ENV, "RuntimeDefault"),
+    }
+
+
+def build_pod_security_context(client, settings: Dict[str, Any]):
+    seccomp = settings["seccomp_profile"]
+    return client.V1PodSecurityContext(
+        run_as_user=settings["run_as_user"],
+        run_as_group=settings["run_as_group"],
+        fs_group=settings["fs_group"],
+        run_as_non_root=settings["run_as_non_root"],
+        seccomp_profile=client.V1SeccompProfile(type=seccomp) if seccomp else None,
+    )
+
+
+def build_container_security_context(client, settings: Dict[str, Any]):
+    drop = settings["capabilities_drop"]
+    return client.V1SecurityContext(
+        run_as_user=settings["run_as_user"],
+        run_as_group=settings["run_as_group"],
+        run_as_non_root=settings["run_as_non_root"],
+        allow_privilege_escalation=settings["allow_privilege_escalation"],
+        read_only_root_filesystem=settings["read_only_root_filesystem"],
+        capabilities=client.V1Capabilities(drop=drop) if drop else None,
+    )
+
+
 class K8sJobManager:
     """Manages Kubernetes Jobs for wiki generation."""
     
@@ -91,6 +184,10 @@ class K8sJobManager:
             if storage:
                 self.resources[resource_type]["ephemeral-storage"] = storage
         
+        # Worker securityContext; read once so a bad value fails the
+        # controller at start instead of every Job.
+        self.security = get_security_settings()
+
         # PVC name for shared data
         self.pvc_name = os.environ.get("DEEPWIKI_PVC_NAME", "deepwiki-data")
         
@@ -437,10 +534,7 @@ echo "[init] Bootstrap finished successfully"
                 client.V1EnvVar(name="LICENSE_USERNAME", value=self.license_username),
                 client.V1EnvVar(name="LICENSE_PASSWORD", value=self.license_password),
             ],
-            security_context=client.V1SecurityContext(
-                run_as_user=33,
-                run_as_group=33,
-            ),
+            security_context=build_container_security_context(client, self.security),
             volume_mounts=[
                 client.V1VolumeMount(
                     name="data",
@@ -619,11 +713,7 @@ echo "[init] Bootstrap finished successfully"
                         service_account_name=os.environ.get(
                             "DEEPWIKI_WORKER_SERVICE_ACCOUNT", "deepwiki-worker"
                         ),
-                        security_context=client.V1PodSecurityContext(
-                            run_as_user=33,
-                            run_as_group=33,
-                            fs_group=33,
-                        ),
+                        security_context=build_pod_security_context(client, self.security),
                         # Init container bootstraps plugin code + pip deps
                         # into /data/plugins/ and /data/requirements/.
                         # Skipped if credentials aren't configured (PVC fallback).
@@ -644,10 +734,7 @@ echo "[init] Bootstrap finished successfully"
                                     f'exec python "$W" --job-id={job_id}'
                                 ],
                                 env=env_vars,
-                                security_context=client.V1SecurityContext(
-                                    run_as_user=33,
-                                    run_as_group=33,
-                                ),
+                                security_context=build_container_security_context(client, self.security),
                                 volume_mounts=[
                                     client.V1VolumeMount(
                                         name="data",
