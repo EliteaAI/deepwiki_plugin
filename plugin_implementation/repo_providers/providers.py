@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse, quote
 
-from .models import GitCloneConfig, ProviderConfig, ProviderType
+from .models import GitCloneConfig, ProviderConfig, ProviderType, host_matches_domain
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +261,7 @@ class BitbucketProvider(BaseRepoProvider):
     def build_clone_config(self, config: ProviderConfig) -> GitCloneConfig:
         """Build Bitbucket clone configuration."""
         host = self._extract_host(config.api_url)
-        is_cloud = "bitbucket.org" in host.lower()
+        is_cloud = host_matches_domain(host, "bitbucket.org")
         
         repo = self.normalize_repository(config.repository)
         

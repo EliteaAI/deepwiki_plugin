@@ -5,10 +5,41 @@ These models define the configuration and output structures for converting
 platform toolkit configs to git-clonable URLs.
 """
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
+
+
+_SCP_SSH_HOST_RE = re.compile(r"^[^/@\s]+@([^:/\s]+):")
+
+
+def extract_hostname(url_or_host: str) -> str:
+    """Extract normalized lowercase hostname (no credentials or port) from a URL or host string."""
+    if not url_or_host:
+        return ""
+    value = url_or_host.strip()
+    if not value:
+        return ""
+    if "://" in value:
+        hostname = urlparse(value).hostname or ""
+    else:
+        ssh_match = _SCP_SSH_HOST_RE.match(value)
+        if ssh_match:
+            hostname = ssh_match.group(1)
+        else:
+            hostname = urlparse(f"https://{value}").hostname or ""
+    return hostname.lower().rstrip(".")
+
+
+def host_matches_domain(url_or_host: str, domain: str) -> bool:
+    """Return True iff the parsed hostname equals *domain* or is a subdomain of *domain*."""
+    hostname = extract_hostname(url_or_host)
+    target = domain.lower().rstrip(".")
+    if not hostname or not target:
+        return False
+    return hostname == target or hostname.endswith(f".{target}")
 
 
 class ProviderType(str, Enum):
@@ -42,18 +73,30 @@ class ProviderType(str, Enum):
     
     @classmethod
     def detect_from_url(cls, url: str) -> Optional["ProviderType"]:
-        """Detect provider type from a URL."""
-        url_lower = url.lower()
-        
-        if "github.com" in url_lower or "github" in url_lower:
+        """Detect provider type from a URL's parsed hostname."""
+        hostname = extract_hostname(url)
+        if not hostname:
+            return None
+        labels = hostname.split(".")
+
+        if host_matches_domain(hostname, "github.com") or (
+            len(labels) >= 2 and labels[0] == "github" and labels[1] != "com"
+        ):
             return cls.GITHUB
-        elif "gitlab.com" in url_lower or "gitlab" in url_lower:
+        if host_matches_domain(hostname, "gitlab.com") or (
+            len(labels) >= 2 and labels[0] == "gitlab" and labels[1] != "com"
+        ):
             return cls.GITLAB
-        elif "bitbucket.org" in url_lower or "bitbucket" in url_lower:
+        if host_matches_domain(hostname, "bitbucket.org") or (
+            len(labels) >= 2 and labels[0] == "bitbucket" and labels[1] != "org"
+        ):
             return cls.BITBUCKET
-        elif "dev.azure.com" in url_lower or "visualstudio.com" in url_lower:
+        if (
+            host_matches_domain(hostname, "dev.azure.com")
+            or host_matches_domain(hostname, "visualstudio.com")
+        ):
             return cls.AZURE_DEVOPS
-        
+
         return None
 
 

@@ -3,6 +3,7 @@
 
 """ Plugin UI Route """
 
+import html
 import os
 import json
 import flask
@@ -46,40 +47,54 @@ class Route:
         # But the plugin only sees: /ui/...
         
         # Check if we're being accessed through ui_host by looking for injected headers
-        header_project_id = flask.request.headers.get('X-Project-Id')
-        effective_project_id = header_project_id or project_id
-        
-        if header_project_id:
+        raw_header_project_id = (flask.request.headers.get('X-Project-Id') or '').strip()
+        header_project_id = None
+        if raw_header_project_id:
+            if not raw_header_project_id.isdigit():
+                return "Invalid X-Project-Id header", 400
+            header_project_id = int(raw_header_project_id)
+
+        safe_toolkit_id = int(toolkit_id) if toolkit_id is not None else None
+        safe_project_id = int(project_id) if project_id is not None else None
+
+        if header_project_id is not None:
             # We're being accessed via ui_host proxy
             # Reconstruct the base_uri: /app/ui_host/wikis/ui/{project_id}/{toolkit_id}
-            base_uri = f"/app/ui_host/wikis/ui/{effective_project_id}/{toolkit_id}"
-        elif project_id:
+            base_uri = f"/app/ui_host/wikis/ui/{header_project_id}/{safe_toolkit_id}"
+        elif safe_project_id:
             # Direct access with project_id in path
-            base_uri = f"/ui/{project_id}/{toolkit_id}"
+            base_uri = f"/ui/{safe_project_id}/{safe_toolkit_id}"
         else:
             # Direct access to the plugin (legacy)
-            base_uri = f"/ui/{toolkit_id}" if toolkit_id else "/ui"
-        
+            base_uri = f"/ui/{safe_toolkit_id}" if safe_toolkit_id else "/ui"
+
         # Create runtime config
         deepwiki_ui_config = {
             "base_uri": base_uri,
         }
-        
-        # Inject config script
-        config_script = f'<script>window.deepwiki_ui_config = {json.dumps(deepwiki_ui_config)};</script>'
+
+        # Inject config script (escape HTML-sensitive chars in JSON for safe inline <script>)
+        config_json = (
+            json.dumps(deepwiki_ui_config)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
+        config_script = f'<script>window.deepwiki_ui_config = {config_json};</script>'
         idx_data = idx_data.replace(
             '<!-- deepwiki_ui_config -->',
             config_script
         )
-        
+
         # Rewrite asset paths to use base_uri
         # Vite builds with base: './' so assets are referenced as ./assets/...
         # We need to rewrite these to {base_uri}/assets/...
+        escaped_base_uri = html.escape(base_uri, quote=True)
         idx_data = idx_data.replace(
-            'src="./assets', f'src="{base_uri}/assets'
+            'src="./assets', f'src="{escaped_base_uri}/assets'
         )
         idx_data = idx_data.replace(
-            'href="./assets', f'href="{base_uri}/assets'
+            'href="./assets', f'href="{escaped_base_uri}/assets'
         )
         
         response = flask.make_response(idx_data, 200)
