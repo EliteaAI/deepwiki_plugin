@@ -14,7 +14,13 @@ Supported toolkit types (matching elitea-sdk names):
 import logging
 from typing import Dict, Any, Optional
 
-from .models import GitCloneConfig, ProviderConfig, ProviderType
+from .models import (
+    GitCloneConfig,
+    ProviderConfig,
+    ProviderType,
+    extract_hostname,
+    host_matches_domain,
+)
 from .providers import get_provider
 
 logger = logging.getLogger(__name__)
@@ -156,16 +162,18 @@ class RepoProviderFactory:
             return str(val).strip() if val else None
         
         if provider == ProviderType.GITHUB:
+            base_url = config.get('base_url', 'https://api.github.com')
+            hostname = extract_hostname(base_url)
             return ProviderConfig(
                 provider=provider,
-                host=cls._extract_host(config.get('base_url', 'https://api.github.com')),
-                api_url=config.get('base_url', 'https://api.github.com'),
+                host=cls._extract_host(base_url),
+                api_url=base_url,
                 repository=repository,
                 branch=branch,
                 token=get_secret('access_token'),
                 username=config.get('username'),
                 password=get_secret('password'),
-                is_cloud='api.github.com' in config.get('base_url', 'https://api.github.com'),
+                is_cloud=hostname in ('api.github.com', 'github.com'),
             )
         
         elif provider == ProviderType.GITLAB:
@@ -177,12 +185,12 @@ class RepoProviderFactory:
                 repository=repository,
                 branch=branch,
                 token=get_secret('private_token'),
-                is_cloud='gitlab.com' in url.lower(),
+                is_cloud=host_matches_domain(url, 'gitlab.com'),
             )
         
         elif provider == ProviderType.BITBUCKET:
             url = config.get('url', 'https://bitbucket.org')
-            is_cloud = 'bitbucket.org' in url.lower()
+            is_cloud = host_matches_domain(url, 'bitbucket.org')
             return ProviderConfig(
                 provider=provider,
                 host=cls._extract_host(url),

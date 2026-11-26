@@ -369,11 +369,12 @@ class PlatformArtifactClient:
         )
 
         if response.status_code == 403:
+            auth_state = "configured" if self.api_key else "missing"
             logger.error(
                 "Artifact upload 403 Forbidden — url=%s, project=%s, "
-                "key_prefix=%s, response=%s",
+                "auth=%s, response=%s",
                 url, self.project_id,
-                self.api_key[:8] + "..." if self.api_key else "(empty)",
+                auth_state,
                 response.text[:500],
             )
             raise ArtifactHTTPError(
@@ -617,11 +618,12 @@ class PlatformArtifactClient:
         )
 
         if response.status_code == 403:
+            auth_state = "configured" if self.api_key else "missing"
             logger.error(
                 "Artifact download 403 Forbidden — url=%s, project=%s, "
-                "key_prefix=%s, response=%s",
+                "auth=%s, response=%s",
                 url, self.project_id,
-                self.api_key[:8] + "..." if self.api_key else "(empty)",
+                auth_state,
                 response.text[:500],
             )
             raise RuntimeError(
