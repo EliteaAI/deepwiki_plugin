@@ -26,14 +26,22 @@ import json
 import logging
 import math
 import os
+import re
 import struct
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import networkx as nx
 
 from .budget_errors import raise_if_budget_exceeded
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
 
 # ---------------------------------------------------------------------------
 # SQLite driver selection
@@ -308,6 +316,45 @@ _EMBED_CHECKPOINT_EVERY_PAGES = 8
 # Row count per committed chunk for the other bulk rewrites (FTS rebuild,
 # edge rewrite, cluster assignment).
 _BULK_ROWS = 5000
+# Maximum candidate rows for indexed in-memory L2 vector search before falling
+# back to sqlite-vec global KNN.
+_SCOPED_VEC_SCAN_LIMIT = 2000
+
+
+def _sanitize_fts5_query(query: str) -> str:
+    """Sanitize a raw query string into safe double-quoted FTS5 tokens."""
+    if not query:
+        return ""
+    tokens = re.findall(r"\w+\*?", query, re.UNICODE)[:16]
+    if not tokens:
+        return ""
+    parts: List[str] = []
+    for tok in tokens:
+        if tok.endswith("*") and len(tok) > 1:
+            parts.append(f'"{tok[:-1]}"*')
+        else:
+            parts.append(f'"{tok}"')
+    return " ".join(parts)
+
+
+def _path_prefix_bounds(path_prefix: str) -> Optional[Tuple[str, str]]:
+    """Return ``(lo, hi)`` B-tree range bounds for a directory path prefix.
+
+    Returns ``None`` when *path_prefix* contains glob syntax other than a
+    trailing ``/*`` so callers can fall back to ``GLOB``.
+    """
+    if not path_prefix:
+        return None
+    if path_prefix.endswith("*"):
+        if not path_prefix.endswith("/*"):
+            return None
+        prefix = path_prefix[:-2]
+    else:
+        prefix = path_prefix
+    prefix = prefix.rstrip("/")
+    if not prefix or any(ch in prefix for ch in ("*", "?", "[")):
+        return None
+    return (prefix + "/", prefix + "0")
 
 # Legacy symbol types used by graph_builder (pre-constants.py centralization)
 # These coexist with the *_document types in DOC_SYMBOL_TYPES from constants.py
@@ -630,6 +677,24 @@ class UnifiedWikiDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_rel_paths_for_ids(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Batch-fetch ``rel_path`` for *node_ids* (missing IDs omitted)."""
+        if not node_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(node_ids))
+        out: Dict[str, str] = {}
+        chunk_size = 500
+        for i in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[i : i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT node_id, rel_path FROM repo_nodes WHERE node_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["node_id"]] = row["rel_path"] or ""
+        return out
+
     def get_nodes_by_path_prefix(self, prefix: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Get nodes whose ``rel_path`` starts with *prefix* (B-tree GLOB)."""
         rows = self.conn.execute(
@@ -830,15 +895,23 @@ class UnifiedWikiDB:
         if not query or not query.strip():
             return []
 
-        # Sanitize query for FTS5 (escape double quotes, wrap in quotes)
-        safe_query = query.replace('"', '""')
+        # Sanitize query into double-quoted FTS5 tokens so XML punctuation,
+        # dots, colons, and FTS5 keywords never trigger syntax errors.
+        safe_query = _sanitize_fts5_query(query)
+        if not safe_query:
+            return []
 
         conditions = ["repo_fts MATCH ?"]
         params: list = [safe_query]
 
         if path_prefix:
-            conditions.append("m.rel_path GLOB ?")
-            params.append(path_prefix.rstrip("/") + "/*" if not path_prefix.endswith("*") else path_prefix)
+            bounds = _path_prefix_bounds(path_prefix)
+            if bounds is not None:
+                conditions.append("m.rel_path >= ? AND m.rel_path < ?")
+                params.extend(bounds)
+            else:
+                conditions.append("m.rel_path GLOB ?")
+                params.append(path_prefix.rstrip("/") + "/*" if not path_prefix.endswith("*") else path_prefix)
 
         if cluster_id is not None:
             conditions.append("m.macro_cluster = ?")
@@ -867,10 +940,11 @@ class UnifiedWikiDB:
             rows = self.conn.execute(sql, params).fetchall()
             return [_attach_score_norm(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
-            # FTS5 query syntax errors — fall back to prefix search
+            # FTS5 query syntax errors — fall back to prefix search on last token
             logger.debug("FTS5 query failed (%s), trying prefix match", exc)
-            safe_query = safe_query.strip() + "*"
-            params[0] = safe_query
+            if safe_query.endswith("*"):
+                return []
+            params[0] = safe_query + "*"
             try:
                 rows = self.conn.execute(sql, params).fetchall()
                 return [_attach_score_norm(dict(r)) for r in rows]
@@ -912,7 +986,9 @@ class UnifiedWikiDB:
         if exact_match:
             q = '"' + query.replace('"', '""') + '"'
         else:
-            q = query.replace('"', '""')
+            q = _sanitize_fts5_query(query)
+            if not q:
+                return 0
         try:
             row = self.conn.execute(
                 "SELECT count(*) AS c FROM repo_fts WHERE repo_fts MATCH ?", (q,)
@@ -1073,6 +1149,83 @@ class UnifiedWikiDB:
         logger.info("populate_embeddings: %d/%d nodes embedded", total, n_rows)
         return total
 
+    def get_embedding_blobs_by_ids(self, node_ids: Sequence[str]) -> Dict[str, bytes]:
+        """Fetch raw float32 embedding blobs for *node_ids* via indexed PK lookups.
+
+        Note: sqlite-vec 0.1.9 executes ``WHERE node_id IN (...)`` as a full-table
+        virtual scan, whereas ``WHERE node_id = ?`` uses the ``repo_vec_rowids``
+        primary key index.
+        """
+        if not self._vec_available or not node_ids:
+            return {}
+        out: Dict[str, bytes] = {}
+        for nid in dict.fromkeys(node_ids):
+            try:
+                row = self.conn.execute(
+                    "SELECT embedding FROM repo_vec WHERE node_id = ?", (nid,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                logger.debug("get_embedding_blobs_by_ids failed for '%s': %s", nid, exc)
+                continue
+            if row and row["embedding"] is not None:
+                out[nid] = bytes(row["embedding"])
+        return out
+
+    def _search_vec_candidates(
+        self,
+        embedding: List[float],
+        cand_ids: List[str],
+        k: int,
+    ) -> List[Dict[str, Any]]:
+        """Exact L2 KNN over a bounded set of candidate *cand_ids*."""
+        blobs = self.get_embedding_blobs_by_ids(cand_ids)
+        if not blobs:
+            return []
+        dim = len(embedding)
+        expected_bytes = dim * 4
+        valid_items = [
+            (nid, blob) for nid, blob in blobs.items() if len(blob) == expected_bytes
+        ]
+        if not valid_items:
+            return []
+
+        if _HAS_NUMPY:
+            q = np.asarray(embedding, dtype=np.float32)
+            mat = np.stack(
+                [np.frombuffer(b, dtype=np.float32) for _, b in valid_items]
+            )
+            dists = np.sqrt(np.sum((mat - q) ** 2, axis=1))
+            scored = [
+                (float(dists[i]), valid_items[i][0])
+                for i in range(len(valid_items))
+            ]
+        else:
+            q_vals = struct.unpack(f"{dim}f", _serialize_float32_vec(embedding))
+            scored = []
+            for nid, blob in valid_items:
+                vec = struct.unpack(f"{dim}f", blob)
+                dist_sq = sum((a - b) * (a - b) for a, b in zip(vec, q_vals))
+                scored.append((math.sqrt(dist_sq), nid))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        top = scored[:k]
+        if not top:
+            return []
+
+        rows_by_id = {
+            r["node_id"]: r
+            for r in self.get_nodes_by_ids([nid for _, nid in top])
+        }
+        results: List[Dict[str, Any]] = []
+        for dist, nid in top:
+            row = rows_by_id.get(nid)
+            if row is None:
+                continue
+            entry = dict(row)
+            entry["vec_distance"] = dist
+            results.append(entry)
+        return results
+
     def search_vec(
         self,
         embedding: List[float],
@@ -1086,6 +1239,47 @@ class UnifiedWikiDB:
         """
         if not self._vec_available:
             return []
+
+        # When scoped by path_prefix or cluster_id, fetch candidate node_ids
+        # via indexed B-tree lookups first so we avoid scanning the entire
+        # repo_vec table and avoid missing local matches outside global top-k.
+        if path_prefix or cluster_id is not None:
+            cand_conds: List[str] = []
+            cand_params: list = []
+            if path_prefix:
+                bounds = _path_prefix_bounds(path_prefix)
+                if bounds is not None:
+                    cand_conds.append("rel_path >= ? AND rel_path < ?")
+                    cand_params.extend(bounds)
+                else:
+                    cand_conds.append("rel_path GLOB ?")
+                    cand_params.append(
+                        path_prefix.rstrip("/") + "/*"
+                        if not path_prefix.endswith("*")
+                        else path_prefix
+                    )
+            if cluster_id is not None:
+                cand_conds.append("macro_cluster = ?")
+                cand_params.append(cluster_id)
+
+            try:
+                cand_rows = self.conn.execute(
+                    f"SELECT node_id FROM repo_nodes WHERE {' AND '.join(cand_conds)} LIMIT ?",
+                    cand_params + [_SCOPED_VEC_SCAN_LIMIT + 1],
+                ).fetchall()
+            except Exception as exc:
+                logger.warning("Scoped vector candidate lookup failed: %s", exc)
+                cand_rows = None
+
+            if cand_rows is not None:
+                if not cand_rows:
+                    return []
+                if len(cand_rows) <= _SCOPED_VEC_SCAN_LIMIT:
+                    return self._search_vec_candidates(
+                        embedding,
+                        [r["node_id"] for r in cand_rows],
+                        k,
+                    )
 
         blob = _serialize_float32_vec(embedding)
 
