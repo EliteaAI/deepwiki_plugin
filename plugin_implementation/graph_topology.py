@@ -47,7 +47,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
-from .budget_errors import raise_if_budget_exceeded
+try:
+    from .budget_errors import raise_if_budget_exceeded
+except ImportError:  # pragma: no cover — non-package import fallback
+    from budget_errors import raise_if_budget_exceeded  # type: ignore
 
 # Optional sibling-module imports — guarded so this module remains
 # usable when imported via a sys.path insertion (legacy tests) rather
@@ -55,24 +58,31 @@ from .budget_errors import raise_if_budget_exceeded
 try:
     from .feature_flags import FeatureFlags, get_feature_flags  # type: ignore
     from .graph_orphan_cascade_v2 import (  # type: ignore
-        collect_orphan_embeddings,
         resolve_orphans_explicit_refs,
     )
-    from .graph_orphan_hybrid import resolve_orphans_hybrid  # type: ignore
+    from .graph_orphan_hybrid import (  # type: ignore
+        _DirHybridContext,
+        resolve_orphans_hybrid,
+    )
+    from .unified_db import UnifiedWikiDB  # type: ignore
 except ImportError:  # pragma: no cover — non-package import fallback
     try:
         from feature_flags import FeatureFlags, get_feature_flags  # type: ignore
         from graph_orphan_cascade_v2 import (  # type: ignore
-            collect_orphan_embeddings,
             resolve_orphans_explicit_refs,
         )
-        from graph_orphan_hybrid import resolve_orphans_hybrid  # type: ignore
+        from graph_orphan_hybrid import (  # type: ignore
+            _DirHybridContext,
+            resolve_orphans_hybrid,
+        )
+        from unified_db import UnifiedWikiDB  # type: ignore
     except ImportError:
         FeatureFlags = None  # type: ignore[assignment]
         get_feature_flags = None  # type: ignore[assignment]
-        collect_orphan_embeddings = None  # type: ignore[assignment]
         resolve_orphans_explicit_refs = None  # type: ignore[assignment]
+        _DirHybridContext = None  # type: ignore[assignment]
         resolve_orphans_hybrid = None  # type: ignore[assignment]
+        UnifiedWikiDB = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +404,8 @@ def _resolve_orphans_by_directory(
     db,
     G: nx.MultiDiGraph,
     orphan_ids: List[str],
+    *,
+    skip_db: bool = False,
 ) -> int:
     """Connect remaining orphans to the best anchor in same/parent directory.
 
@@ -415,16 +427,21 @@ def _resolve_orphans_by_directory(
     if not orphan_ids:
         return 0
 
+    is_udb = UnifiedWikiDB is not None and isinstance(db, UnifiedWikiDB)
     orphan_set = set(orphan_ids)
 
     # Build directory → [(node_id, total_degree)] for NON-orphan nodes
     dir_index: Dict[str, List[Tuple[str, int]]] = {}
+    missing_non_orphan_ids: List[str] = []
     for nid, data in G.nodes(data=True):
         if nid in orphan_set:
             continue
         rp = data.get("rel_path", "")
         if not rp:
-            row = db.get_node(nid)
+            if is_udb:
+                missing_non_orphan_ids.append(nid)
+                continue
+            row = db.get_node(nid) if db is not None else None
             rp = row.get("rel_path", "") if row else ""
         if not rp:
             continue
@@ -432,17 +449,31 @@ def _resolve_orphans_by_directory(
         deg = G.in_degree(nid) + G.out_degree(nid)
         dir_index.setdefault(d, []).append((nid, deg))
 
+    if missing_non_orphan_ids and is_udb:
+        non_orphan_paths = db.get_rel_paths_for_ids(missing_non_orphan_ids)
+        for nid in missing_non_orphan_ids:
+            rp = non_orphan_paths.get(nid, "")
+            if not rp:
+                continue
+            d = os.path.dirname(rp).replace("\\", "/") or "<root>"
+            deg = G.in_degree(nid) + G.out_degree(nid)
+            dir_index.setdefault(d, []).append((nid, deg))
+
     # Sort each directory bucket by degree descending (best anchors first)
     for d in dir_index:
         dir_index[d].sort(key=lambda x: x[1], reverse=True)
 
+    orphan_paths = db.get_rel_paths_for_ids(orphan_ids) if is_udb else None
     edges_added = 0
 
     for orphan_id in orphan_ids:
-        node = db.get_node(orphan_id)
-        if not node:
-            continue
-        rp = node.get("rel_path", "")
+        if orphan_paths is not None:
+            rp = orphan_paths.get(orphan_id, "")
+        else:
+            node = db.get_node(orphan_id) if db is not None else None
+            if not node:
+                continue
+            rp = node.get("rel_path", "")
         if not rp:
             continue
 
@@ -459,6 +490,7 @@ def _resolve_orphans_by_directory(
                     rel_type="directory_link",
                     edge_class="directory",
                     created_by="dir_proximity_fallback",
+                    skip_db=skip_db,
                 )
                 edges_added += 1
                 break  # resolved — stop climbing
@@ -543,54 +575,109 @@ def _resolve_orphans_v2(
     # ── Pass 2 — hybrid FTS+Vec via RRF
     stats.setdefault("hybrid", 0)
     pass2_t = _time.monotonic()
-    pending = [nid for nid in orphans if nid not in resolved]
-    orphan_embs: Optional[Dict[str, Optional[List[float]]]] = None
-    if flags.orphan_reuse_embeddings and pending:
-        try:
-            orphan_embs = collect_orphan_embeddings(db, pending)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("collect_orphan_embeddings failed: %s", exc)
-            orphan_embs = None
-
+    is_udb = UnifiedWikiDB is not None and isinstance(db, UnifiedWikiDB)
+    total_nodes = db.node_count() if is_udb else G.number_of_nodes()
+    pending = [
+        nid for nid in orphans
+        if nid not in resolved
+        and (
+            not is_udb
+            or (G.nodes.get(nid, {}).get("symbol_type") or "").lower() != "text_chunk"
+        )
+    ]
+    # Persisted vectors are read per directory (or on demand for giant dirs)
+    # rather than pre-fetching all ~500k vectors into one dict (~62 KB/orphan).
     if pending and flags.orphan_hybrid_search:
+        rel_paths: Dict[str, str] = {}
+        missing_path_ids: List[str] = []
         for nid in pending:
+            data = G.nodes.get(nid, {}) or {}
+            rp = data.get("rel_path", "") or ""
+            if not rp:
+                loc = data.get("location") or {}
+                if isinstance(loc, dict):
+                    rp = loc.get("rel_path", "") or ""
+            if rp:
+                rel_paths[nid] = rp
+            elif is_udb:
+                missing_path_ids.append(nid)
+        if missing_path_ids:
+            rel_paths.update(db.get_rel_paths_for_ids(missing_path_ids))
+
+        orphans_by_dir: Dict[str, List[str]] = {}
+        for nid in pending:
+            rp = rel_paths.get(nid, "")
+            local_dir = rp.rsplit("/", 1)[0] if "/" in rp else ""
+            orphans_by_dir.setdefault(local_dir, []).append(nid)
+
+        processed = 0
+        total_pending = len(pending)
+        last_log = pass2_t
+        for local_dir, dir_orphans in orphans_by_dir.items():
+            ctx = (
+                _DirHybridContext(db, G, local_dir, total_nodes=total_nodes)
+                if (is_udb and _DirHybridContext is not None)
+                else None
+            )
             try:
-                hits = resolve_orphans_hybrid(
-                    db, G, nid,
-                    orphan_embeddings=orphan_embs,
-                    embed_fn=embedding_fn,
-                    flags=flags,
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise_if_budget_exceeded(exc)
-                logger.debug("hybrid pass failed for %s: %s", nid, exc)
-                continue
-            if not hits:
-                continue
-            added = 0
-            for hit in hits[:max_lexical_edges]:
-                tgt = hit.get("node_id")
-                if not tgt or tgt == nid or not G.has_node(tgt):
-                    continue
-                _add_edge(
-                    db, G,
-                    source=nid, target=tgt,
-                    rel_type="hybrid_link",
-                    edge_class="semantic",
-                    created_by="hybrid_rrf",
-                    raw_similarity=float(hit.get("rrf_score", 0.0)),
-                    skip_db=True,
-                    provenance={
-                        "source": "hybrid_rrf",
-                        "rrf_score": hit.get("rrf_score"),
-                        "fts_rank": hit.get("fts_rank"),
-                        "vec_rank": hit.get("vec_rank"),
-                    },
-                )
-                stats["hybrid"] += 1
-                added += 1
-            if added:
-                resolved.add(nid)
+                for nid in dir_orphans:
+                    processed += 1
+                    try:
+                        if ctx is not None:
+                            hits = resolve_orphans_hybrid(
+                                db, G, nid,
+                                orphan_embeddings=None,
+                                embed_fn=embedding_fn,
+                                flags=flags,
+                                _dir_ctx=ctx,
+                            )
+                        else:
+                            hits = resolve_orphans_hybrid(
+                                db, G, nid,
+                                orphan_embeddings=None,
+                                embed_fn=embedding_fn,
+                                flags=flags,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        raise_if_budget_exceeded(exc)
+                        logger.debug("hybrid pass failed for %s: %s", nid, exc)
+                        hits = []
+                    if hits:
+                        added = 0
+                        for hit in hits[:max_lexical_edges]:
+                            tgt = hit.get("node_id")
+                            if not tgt or tgt == nid or not G.has_node(tgt):
+                                continue
+                            _add_edge(
+                                db, G,
+                                source=nid, target=tgt,
+                                rel_type="hybrid_link",
+                                edge_class="semantic",
+                                created_by="hybrid_rrf",
+                                raw_similarity=float(hit.get("rrf_score", 0.0)),
+                                skip_db=True,
+                                provenance={
+                                    "source": "hybrid_rrf",
+                                    "rrf_score": hit.get("rrf_score"),
+                                    "fts_rank": hit.get("fts_rank"),
+                                    "vec_rank": hit.get("vec_rank"),
+                                },
+                            )
+                            stats["hybrid"] += 1
+                            added += 1
+                        if added:
+                            resolved.add(nid)
+
+                    now = _time.monotonic()
+                    if now - last_log >= 15.0:
+                        logger.info(
+                            "[ORPHAN] Pass 2 progress: %d/%d orphans (%d edges, %d resolved, %.1fs)",
+                            processed, total_pending, stats["hybrid"], len(resolved), now - pass2_t,
+                        )
+                        last_log = now
+            finally:
+                if ctx is not None:
+                    ctx.close()
 
     logger.info(
         "[ORPHAN] Pass 2 (hybrid RRF): %d edges, %d resolved in %.1fs",
@@ -610,38 +697,58 @@ def _resolve_orphans_v2(
                 logger.debug("graph_lexical_v2 unavailable: %s", exc)
                 _tiered = None  # type: ignore[assignment]
         if _tiered is not None:
-            for nid in pending:
+            idf_cache: Dict[str, float] = {}
+            last_log3 = pass3_t
+            total_p3 = len(pending)
+            for idx3, nid in enumerate(pending, start=1):
                 try:
-                    hits = _tiered(
-                        db, G, nid,
-                        fts_limit=max(fts_limit, 8),
-                        max_lexical_edges=max_lexical_edges,
-                        flags=flags,
-                    )
+                    try:
+                        hits = _tiered(
+                            db, G, nid,
+                            fts_limit=max(fts_limit, 8),
+                            max_lexical_edges=max_lexical_edges,
+                            flags=flags,
+                            _idf_cache=idf_cache,
+                            _total_nodes=total_nodes,
+                        )
+                    except TypeError:
+                        hits = _tiered(
+                            db, G, nid,
+                            fts_limit=max(fts_limit, 8),
+                            max_lexical_edges=max_lexical_edges,
+                            flags=flags,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("tiered lexical failed for %s: %s", nid, exc)
-                    continue
-                if not hits:
-                    continue
-                for hit in hits:
-                    tgt = hit.get("node_id")
-                    if not tgt or tgt == nid or not G.has_node(tgt):
-                        continue
-                    _add_edge(
-                        db, G,
-                        source=nid, target=tgt,
-                        rel_type="lexical_link",
-                        edge_class="lexical",
-                        created_by="fts5_lexical_v2",
-                        skip_db=True,
-                        provenance={
-                            "source": "fts_lexical_tiered",
-                            "tier": hit.get("_tier"),
-                            "score_norm": hit.get("score_norm"),
-                        },
+                    hits = []
+                if hits:
+                    for hit in hits:
+                        tgt = hit.get("node_id")
+                        if not tgt or tgt == nid or not G.has_node(tgt):
+                            continue
+                        _add_edge(
+                            db, G,
+                            source=nid, target=tgt,
+                            rel_type="lexical_link",
+                            edge_class="lexical",
+                            created_by="fts5_lexical_v2",
+                            skip_db=True,
+                            provenance={
+                                "source": "fts_lexical_tiered",
+                                "tier": hit.get("_tier"),
+                                "score_norm": hit.get("score_norm"),
+                            },
+                        )
+                        stats["lexical"] += 1
+                    resolved.add(nid)
+
+                now3 = _time.monotonic()
+                if now3 - last_log3 >= 15.0:
+                    logger.info(
+                        "[ORPHAN] Pass 3 progress: %d/%d orphans (%d edges, %d resolved, %.1fs)",
+                        idx3, total_p3, stats["lexical"], len(resolved), now3 - pass3_t,
                     )
-                    stats["lexical"] += 1
-                resolved.add(nid)
+                    last_log3 = now3
 
     logger.info(
         "[ORPHAN] Pass 3 (tiered lexical): %d edges, %d resolved in %.1fs",
@@ -650,9 +757,11 @@ def _resolve_orphans_v2(
 
     # ── Pass 4 — directory proximity fallback
     pass4_t = _time.monotonic()
-    remaining = find_orphans(G)
+    remaining = [nid for nid in orphans if nid not in resolved]
     if remaining:
-        stats["directory"] = _resolve_orphans_by_directory(db, G, remaining)
+        stats["directory"] = _resolve_orphans_by_directory(
+            db, G, remaining, skip_db=True,
+        )
 
     # Stats use strict=True so the resolved-count is comparable across
     # legacy/calibrated profiles (see find_orphans docstring on the
@@ -1039,9 +1148,9 @@ def resolve_orphans(
 
     # ── Pass 3: Directory proximity fallback ─────────────────
     t4 = _time.monotonic()
-    remaining = find_orphans(G)
+    remaining = [nid for nid in orphans if nid not in resolved]
     if remaining:
-        dir_edges = _resolve_orphans_by_directory(db, G, remaining)
+        dir_edges = _resolve_orphans_by_directory(db, G, remaining, skip_db=True)
         stats["directory"] = dir_edges
 
     t5 = _time.monotonic()
@@ -1281,6 +1390,23 @@ def _extract_proximity_edges(
             if d:
                 dir_to_code.setdefault(d, []).append(nid)
 
+    # Index every path suffix of each code directory for O(1) topic_dir lookup,
+    # and precompute up to 20 top-level directories for root-level doc anchors.
+    suffix_to_code_dirs: Dict[str, List[str]] = {}
+    root_top_dirs: List[List[str]] = []
+    seen_top_global: Set[str] = set()
+    _ROOT_DOC_TOP_LEVEL_CAP = 20
+    for code_dir, code_nodes in dir_to_code.items():
+        parts = code_dir.split("/")
+        for idx in range(len(parts)):
+            suffix = "/".join(parts[idx:])
+            suffix_to_code_dirs.setdefault(suffix, []).append(code_dir)
+        top = parts[0]
+        if top and top not in seen_top_global and code_nodes:
+            seen_top_global.add(top)
+            if len(root_top_dirs) < _ROOT_DOC_TOP_LEVEL_CAP:
+                root_top_dirs.append(code_nodes)
+
     for nid, data in G.nodes(data=True):
         if not _is_doc_node(G, nid):
             continue
@@ -1306,8 +1432,7 @@ def _extract_proximity_edges(
             # one cluster — observed on the configurations repo's first
             # post-Track-2a run (54.6%-dominance cluster ate every
             # root doc plus the Configuration API + Event class).
-            seen_top: Set[str] = set()
-            _ROOT_DOC_TOP_LEVEL_CAP = 20
+            #
             # Stable hash — Python's built-in hash() is randomised per
             # process (PYTHONHASHSEED) and would pick a different anchor
             # symbol every run, churning doc edges and clustering output.
@@ -1316,18 +1441,10 @@ def _extract_proximity_edges(
             doc_hash = int.from_bytes(
                 hashlib.md5(nid.encode("utf-8")).digest()[:8], "big",
             )
-            for code_dir, code_nodes in dir_to_code.items():
-                top = code_dir.split("/", 1)[0]
-                if not top or top in seen_top:
-                    continue
-                if not code_nodes:
-                    continue
+            for code_nodes in root_top_dirs:
                 cnid = code_nodes[doc_hash % len(code_nodes)]
                 if cnid != nid:
                     edges.append((nid, cnid))
-                seen_top.add(top)
-                if len(seen_top) >= _ROOT_DOC_TOP_LEVEL_CAP:
-                    break
             continue
 
         # Strip doc prefix to get the "topic" directory
@@ -1342,11 +1459,10 @@ def _extract_proximity_edges(
 
         # Look for code in matching directories:
         # src/api, lib/api, api, etc.
-        for code_dir, code_nodes in dir_to_code.items():
-            if code_dir == topic_dir or code_dir.endswith("/" + topic_dir):
-                for cnid in code_nodes[:5]:  # Cap to avoid hairballs
-                    if cnid != nid:
-                        edges.append((nid, cnid))
+        for code_dir in suffix_to_code_dirs.get(topic_dir, ()):
+            for cnid in dir_to_code[code_dir][:5]:  # Cap to avoid hairballs
+                if cnid != nid:
+                    edges.append((nid, cnid))
 
     return edges
 
@@ -1366,6 +1482,21 @@ def _enrich_graph_nodes_from_db(db, G: nx.MultiDiGraph) -> None:
     if not to_enrich:
         return
 
+    is_udb = UnifiedWikiDB is not None and isinstance(db, UnifiedWikiDB)
+    if is_udb and len(to_enrich) > 100:
+        for i in range(0, len(to_enrich), 500):
+            chunk = to_enrich[i : i + 500]
+            for row in db.get_nodes_by_ids(chunk):
+                nid = row.get("node_id")
+                if not nid or not G.has_node(nid):
+                    continue
+                node_data = G.nodes[nid]
+                for key in ("rel_path", "source_text", "symbol_type", "symbol_name",
+                             "is_doc", "language"):
+                    if key not in node_data and key in row:
+                        node_data[key] = row[key]
+        return
+
     for nid in to_enrich:
         row = db.get_node(nid)
         if not row:
@@ -1380,6 +1511,8 @@ def _enrich_graph_nodes_from_db(db, G: nx.MultiDiGraph) -> None:
 def inject_doc_edges(
     db,
     G: nx.MultiDiGraph,
+    *,
+    skip_db: bool = False,
 ) -> Dict[str, Any]:
     """Inject Tier 1 (hyperlink) and Tier 2 (proximity) doc edges.
 
@@ -1411,6 +1544,7 @@ def inject_doc_edges(
                 rel_type="hyperlink",
                 edge_class="doc",
                 created_by="md_hyperlink",
+                skip_db=skip_db,
             )
             seen.add((src, tgt))
             stats["hyperlink_edges_added"] += 1
@@ -1424,6 +1558,7 @@ def inject_doc_edges(
                 rel_type="proximity",
                 edge_class="doc",
                 created_by="dir_proximity",
+                skip_db=skip_db,
             )
             seen.add((src, tgt))
             stats["proximity_edges_added"] += 1
@@ -1467,6 +1602,7 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
     # This is simple and correct for the dual-write scenario (the DB is
     # fully reconstructed from the graph each run anyway in Phase 1-2).
     db.conn.execute("DELETE FROM repo_edges")
+    db.conn.commit()
 
     edge_batch = []
     BATCH = 5000
@@ -1495,11 +1631,15 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
         if len(edge_batch) >= BATCH:
             db.upsert_edges_batch(edge_batch)
             edge_batch.clear()
+            # Commit per batch so the WAL holds one batch, not every edge.
+            db.conn.commit()
 
     if edge_batch:
         db.upsert_edges_batch(edge_batch)
 
     db.conn.commit()
+    if hasattr(db, "checkpoint_wal"):
+        db.checkpoint_wal()
 
     count = db.edge_count()
     logger.info("Persisted %d weighted edges to unified DB", count)
@@ -1513,6 +1653,8 @@ def persist_weights_to_db(db, G: nx.MultiDiGraph) -> int:
 def bridge_disconnected_components(
     db,
     G: nx.MultiDiGraph,
+    *,
+    skip_db: bool = False,
 ) -> Dict[str, Any]:
     """Connect disconnected components via directory-proximity bridge edges.
 
@@ -1577,17 +1719,61 @@ def bridge_disconnected_components(
     def _dir_sim(a: Counter, b: Counter) -> int:
         return sum(min(a[d], b[d]) for d in a if d in b)
 
+    # Inverted indexes over earlier components j < i:
+    # - dir_frontier[d]: strictly increasing (cnt, earliest_j) pairs for exact
+    #   O(1) lookup on single-directory components.
+    # - dir_to_comps[d]: bounded top-128 candidate components for multi-dir
+    #   components (largest cnt, breaking ties by earliest j).
+    _MAX_BRIDGE_CANDS_PER_DIR = 128
+    dir_frontier: Dict[str, List[Tuple[int, int]]] = {}
+    dir_to_comps: Dict[str, List[int]] = {}
+
+    def _index_component(comp_idx: int) -> None:
+        for d, cnt in comp_dirs[comp_idx].items():
+            frontier = dir_frontier.setdefault(d, [])
+            if not frontier or cnt > frontier[-1][0]:
+                frontier.append((cnt, comp_idx))
+            cands = dir_to_comps.setdefault(d, [])
+            if len(cands) < _MAX_BRIDGE_CANDS_PER_DIR:
+                cands.append(comp_idx)
+            else:
+                worst_pos = min(
+                    range(len(cands)),
+                    key=lambda pos: (comp_dirs[cands[pos]][d], -cands[pos]),
+                )
+                worst_idx = cands[worst_pos]
+                if cnt > comp_dirs[worst_idx][d]:
+                    cands[worst_pos] = comp_idx
+
+    _index_component(0)
+
     bridges_added = 0
     for i in range(1, n_before):
-        # Find the most directory-similar earlier (larger) component
-        best_target = 0
-        best_sim = _dir_sim(comp_dirs[i], comp_dirs[0])
-
-        for j in range(1, i):
-            sim = _dir_sim(comp_dirs[i], comp_dirs[j])
-            if sim > best_sim:
-                best_sim = sim
-                best_target = j
+        cd_i = comp_dirs[i]
+        if len(cd_i) == 1:
+            d, c_i = next(iter(cd_i.items()))
+            frontier = dir_frontier.get(d)
+            if not frontier:
+                best_target = 0
+            else:
+                best_target = frontier[-1][1]
+                for cnt_j, j in frontier:
+                    if cnt_j >= c_i:
+                        best_target = j
+                        break
+        else:
+            best_target = 0
+            best_sim = _dir_sim(cd_i, comp_dirs[0])
+            sim_by_comp: Dict[int, int] = {}
+            for d, c_i in cd_i.items():
+                for j in dir_to_comps.get(d, ()):
+                    if j == 0:
+                        continue
+                    sim_by_comp[j] = sim_by_comp.get(j, 0) + min(c_i, comp_dirs[j][d])
+            for j, sim in sim_by_comp.items():
+                if sim > best_sim or (sim == best_sim and j < best_target):
+                    best_sim = sim
+                    best_target = j
 
         src = comp_reps[i]
         dst = comp_reps[best_target]
@@ -1598,14 +1784,17 @@ def bridge_disconnected_components(
             rel_type="component_bridge",
             edge_class="bridge",
             created_by="component_bridging",
+            skip_db=skip_db,
         )
         _add_edge(
             db, G, source=dst, target=src,
             rel_type="component_bridge",
             edge_class="bridge",
             created_by="component_bridging",
+            skip_db=skip_db,
         )
         bridges_added += 2
+        _index_component(i)
 
     n_after = nx.number_weakly_connected_components(G)
     stats["components_after"] = n_after
@@ -1661,7 +1850,7 @@ def run_phase2(
     )
 
     # Step 2: Doc edge injection (hyperlink + proximity)
-    results["doc_edges"] = inject_doc_edges(db, G)
+    results["doc_edges"] = inject_doc_edges(db, G, skip_db=True)
 
     # Note: cross-language linking + API-surface extraction + test-linker
     # run in Phase 1c (``FilesystemRepositoryIndexer._write_unified_db``)
@@ -1670,7 +1859,9 @@ def run_phase2(
 
     # Step 3: Bridge disconnected components — BEFORE weighting so
     # bridge edges receive proper weights in step 4.
-    results["component_bridging"] = bridge_disconnected_components(db, G)
+    results["component_bridging"] = bridge_disconnected_components(
+        db, G, skip_db=True,
+    )
 
     # Step 4: Edge weighting — on ALL edges (structural + semantic + lexical + doc + bridge)
     results["weighting"] = apply_edge_weights(G)

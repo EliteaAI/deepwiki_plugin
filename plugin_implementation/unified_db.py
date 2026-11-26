@@ -26,14 +26,22 @@ import json
 import logging
 import math
 import os
+import re
 import struct
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import networkx as nx
 
 from .budget_errors import raise_if_budget_exceeded
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
 
 # ---------------------------------------------------------------------------
 # SQLite driver selection
@@ -296,6 +304,58 @@ except ImportError:
     def is_test_path(rel_path: str) -> bool:  # noqa: D103
         return False
 
+# WAL bounds (large repositories). The WAL is kept small by committing and
+# truncating it between bulk writes instead of letting one transaction grow it.
+_WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+# populate_embeddings reads nodes in keyset pages of this many rows (rounded
+# down to a multiple of the embed batch so batch boundaries stay the same).
+_EMBED_PAGE_ROWS = 1024
+# ...and truncates the WAL every this many committed pages (or sooner once it
+# exceeds _WAL_SIZE_LIMIT_BYTES).
+_EMBED_CHECKPOINT_EVERY_PAGES = 8
+# Row count per committed chunk for the other bulk rewrites (FTS rebuild,
+# edge rewrite, cluster assignment).
+_BULK_ROWS = 5000
+# Maximum candidate rows for indexed in-memory L2 vector search before falling
+# back to sqlite-vec global KNN.
+_SCOPED_VEC_SCAN_LIMIT = 2000
+
+
+def _sanitize_fts5_query(query: str) -> str:
+    """Sanitize a raw query string into safe double-quoted FTS5 tokens."""
+    if not query:
+        return ""
+    tokens = re.findall(r"\w+\*?", query, re.UNICODE)[:16]
+    if not tokens:
+        return ""
+    parts: List[str] = []
+    for tok in tokens:
+        if tok.endswith("*") and len(tok) > 1:
+            parts.append(f'"{tok[:-1]}"*')
+        else:
+            parts.append(f'"{tok}"')
+    return " ".join(parts)
+
+
+def _path_prefix_bounds(path_prefix: str) -> Optional[Tuple[str, str]]:
+    """Return ``(lo, hi)`` B-tree range bounds for a directory path prefix.
+
+    Returns ``None`` when *path_prefix* contains glob syntax other than a
+    trailing ``/*`` so callers can fall back to ``GLOB``.
+    """
+    if not path_prefix:
+        return None
+    if path_prefix.endswith("*"):
+        if not path_prefix.endswith("/*"):
+            return None
+        prefix = path_prefix[:-2]
+    else:
+        prefix = path_prefix
+    prefix = prefix.rstrip("/")
+    if not prefix or any(ch in prefix for ch in ("*", "?", "[")):
+        return None
+    return (prefix + "/", prefix + "0")
+
 # Legacy symbol types used by graph_builder (pre-constants.py centralization)
 # These coexist with the *_document types in DOC_SYMBOL_TYPES from constants.py
 _LEGACY_DOC_TYPES = {'module_doc', 'file_doc'}
@@ -366,6 +426,8 @@ class UnifiedWikiDB:
         self.conn.execute("PRAGMA cache_size=-65536")   # 64 MB
         self.conn.execute("PRAGMA mmap_size=268435456")  # 256 MB
         self.conn.execute("PRAGMA foreign_keys=ON")
+        if not readonly:
+            self.conn.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
 
         self._load_extensions()
         if not readonly:
@@ -480,6 +542,24 @@ class UnifiedWikiDB:
     # ------------------------------------------------------------------
     # Context manager / cleanup
     # ------------------------------------------------------------------
+
+    def checkpoint_wal(self) -> None:
+        """Copy the WAL into the DB file and truncate it (best effort).
+
+        Called after bulk writes so the WAL does not keep the size of the
+        largest transaction on disk. Must not run while a read cursor is
+        open on this connection.
+        """
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except Exception as exc:
+            logger.debug("wal_checkpoint(TRUNCATE) failed for %s: %s", self.db_path, exc)
+
+    def _wal_size_bytes(self) -> int:
+        try:
+            return os.path.getsize(f"{self.db_path}-wal")
+        except OSError:
+            return 0
 
     def close(self) -> None:
         if self.conn:
@@ -596,6 +676,24 @@ class UnifiedWikiDB:
             node_ids,
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_rel_paths_for_ids(self, node_ids: Sequence[str]) -> Dict[str, str]:
+        """Batch-fetch ``rel_path`` for *node_ids* (missing IDs omitted)."""
+        if not node_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(node_ids))
+        out: Dict[str, str] = {}
+        chunk_size = 500
+        for i in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[i : i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT node_id, rel_path FROM repo_nodes WHERE node_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                out[row["node_id"]] = row["rel_path"] or ""
+        return out
 
     def get_nodes_by_path_prefix(self, prefix: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Get nodes whose ``rel_path`` starts with *prefix* (B-tree GLOB)."""
@@ -765,12 +863,21 @@ class UnifiedWikiDB:
     def _populate_fts5(self) -> None:
         """Populate FTS5 table from repo_nodes (full rebuild)."""
         self.conn.execute("DELETE FROM repo_fts")
-        self.conn.execute("""
-            INSERT INTO repo_fts (node_id, symbol_name, signature, docstring, source_text)
-            SELECT node_id, symbol_name, signature, docstring, source_text
-            FROM repo_nodes
-        """)
         self.conn.commit()
+        # Copy in rowid ranges, one commit per range, so the WAL holds one
+        # range instead of the whole text corpus. Rows go in the same rowid
+        # order as a single INSERT…SELECT, so repo_fts contents are the same.
+        lo_rowid, max_rowid = self.conn.execute(
+            "SELECT min(rowid), max(rowid) FROM repo_nodes"
+        ).fetchone()
+        for lo in range((lo_rowid or 1) - 1, max_rowid or 0, _BULK_ROWS):
+            self.conn.execute("""
+                INSERT INTO repo_fts (node_id, symbol_name, signature, docstring, source_text)
+                SELECT node_id, symbol_name, signature, docstring, source_text
+                FROM repo_nodes WHERE rowid > ? AND rowid <= ? ORDER BY rowid
+            """, (lo, lo + _BULK_ROWS))
+            self.conn.commit()
+        self.checkpoint_wal()
         logger.debug("FTS5 index rebuilt (%d rows)", self.node_count())
 
     def search_fts5(
@@ -788,15 +895,23 @@ class UnifiedWikiDB:
         if not query or not query.strip():
             return []
 
-        # Sanitize query for FTS5 (escape double quotes, wrap in quotes)
-        safe_query = query.replace('"', '""')
+        # Sanitize query into double-quoted FTS5 tokens so XML punctuation,
+        # dots, colons, and FTS5 keywords never trigger syntax errors.
+        safe_query = _sanitize_fts5_query(query)
+        if not safe_query:
+            return []
 
         conditions = ["repo_fts MATCH ?"]
         params: list = [safe_query]
 
         if path_prefix:
-            conditions.append("m.rel_path GLOB ?")
-            params.append(path_prefix.rstrip("/") + "/*" if not path_prefix.endswith("*") else path_prefix)
+            bounds = _path_prefix_bounds(path_prefix)
+            if bounds is not None:
+                conditions.append("m.rel_path >= ? AND m.rel_path < ?")
+                params.extend(bounds)
+            else:
+                conditions.append("m.rel_path GLOB ?")
+                params.append(path_prefix.rstrip("/") + "/*" if not path_prefix.endswith("*") else path_prefix)
 
         if cluster_id is not None:
             conditions.append("m.macro_cluster = ?")
@@ -825,10 +940,11 @@ class UnifiedWikiDB:
             rows = self.conn.execute(sql, params).fetchall()
             return [_attach_score_norm(dict(r)) for r in rows]
         except sqlite3.OperationalError as exc:
-            # FTS5 query syntax errors — fall back to prefix search
+            # FTS5 query syntax errors — fall back to prefix search on last token
             logger.debug("FTS5 query failed (%s), trying prefix match", exc)
-            safe_query = safe_query.strip() + "*"
-            params[0] = safe_query
+            if safe_query.endswith("*"):
+                return []
+            params[0] = safe_query + "*"
             try:
                 rows = self.conn.execute(sql, params).fetchall()
                 return [_attach_score_norm(dict(r)) for r in rows]
@@ -870,7 +986,9 @@ class UnifiedWikiDB:
         if exact_match:
             q = '"' + query.replace('"', '""') + '"'
         else:
-            q = query.replace('"', '""')
+            q = _sanitize_fts5_query(query)
+            if not q:
+                return 0
         try:
             row = self.conn.execute(
                 "SELECT count(*) AS c FROM repo_fts WHERE repo_fts MATCH ?", (q,)
@@ -959,44 +1077,154 @@ class UnifiedWikiDB:
 
         # SQLite trim() only strips spaces; use explicit whitespace chars
         _ws = " ' ' || char(9) || char(10) || char(13) "
-        rows = self.conn.execute(
-            "SELECT node_id, source_text FROM repo_nodes "
-            f"WHERE source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
-        ).fetchall()
+        text_filter = (
+            f"source_text IS NOT NULL AND length(trim(source_text, {_ws})) > 0"
+        )
+        n_rows = self.conn.execute(
+            f"SELECT count(*) FROM repo_nodes WHERE {text_filter}"
+        ).fetchone()[0]
+
+        # Keyset pages by rowid (the same order a plain scan returns), each
+        # fully fetched before its commit: an open read cursor would make the
+        # WAL checkpoint fail. The page size is a multiple of batch_size so
+        # the embed batches are the same as in one pass over all rows.
+        page_rows = max(batch_size, (_EMBED_PAGE_ROWS // batch_size) * batch_size)
+        last_rowid = -(2 ** 63)
+        offset = 0
+        pages = 0
 
         total = 0
         # Large repos embed hundreds of thousands of nodes here; without
         # periodic progress the phase is indistinguishable from a hang.
         progress_every = max(batch_size, 20_000)
         t0 = time.monotonic()
-        logger.info("populate_embeddings: embedding %d nodes (batch=%d)", len(rows), batch_size)
-        for i in range(0, len(rows), batch_size):
-            if i and i % progress_every < batch_size:
-                logger.info(
-                    "populate_embeddings: %d/%d nodes processed (%.0fs)",
-                    i, len(rows), time.monotonic() - t0,
-                )
-            batch = rows[i : i + batch_size]
-            texts = [r["source_text"] for r in batch]
-            node_ids = [r["node_id"] for r in batch]
+        logger.info("populate_embeddings: embedding %d nodes (batch=%d)", n_rows, batch_size)
+        while True:
+            rows = self.conn.execute(
+                "SELECT rowid, node_id, source_text FROM repo_nodes "
+                f"WHERE rowid > ? AND {text_filter} ORDER BY rowid LIMIT ?",
+                (last_rowid, page_rows),
+            ).fetchall()
+            if not rows:
+                break
+            last_rowid = rows[-1]["rowid"]
 
-            try:
-                vectors = embedding_fn(texts)
-            except Exception as exc:
-                raise_if_budget_exceeded(exc)
-                logger.warning(
-                    "populate_embeddings: batch %d–%d failed: %s",
-                    i, i + len(batch), exc,
-                )
-                continue
+            for j in range(0, len(rows), batch_size):
+                i = offset + j
+                if i and i % progress_every < batch_size:
+                    logger.info(
+                        "populate_embeddings: %d/%d nodes processed (%.0fs)",
+                        i, n_rows, time.monotonic() - t0,
+                    )
+                batch = rows[j : j + batch_size]
+                texts = [r["source_text"] for r in batch]
+                node_ids = [r["node_id"] for r in batch]
 
-            pairs = list(zip(node_ids, vectors))
-            self.upsert_embeddings_batch(pairs)
-            total += len(pairs)
+                try:
+                    vectors = embedding_fn(texts)
+                except Exception as exc:
+                    raise_if_budget_exceeded(exc)
+                    logger.warning(
+                        "populate_embeddings: batch %d–%d failed: %s",
+                        i, i + len(batch), exc,
+                    )
+                    continue
+
+                pairs = list(zip(node_ids, vectors))
+                self.upsert_embeddings_batch(pairs)
+                total += len(pairs)
+
+            offset += len(rows)
+            del rows
+            self.conn.commit()
+            pages += 1
+            if (
+                pages % _EMBED_CHECKPOINT_EVERY_PAGES == 0
+                or self._wal_size_bytes() > _WAL_SIZE_LIMIT_BYTES
+            ):
+                self.checkpoint_wal()
 
         self.conn.commit()
-        logger.info("populate_embeddings: %d/%d nodes embedded", total, len(rows))
+        self.checkpoint_wal()
+        logger.info("populate_embeddings: %d/%d nodes embedded", total, n_rows)
         return total
+
+    def get_embedding_blobs_by_ids(self, node_ids: Sequence[str]) -> Dict[str, bytes]:
+        """Fetch raw float32 embedding blobs for *node_ids* via indexed PK lookups.
+
+        Note: sqlite-vec 0.1.9 executes ``WHERE node_id IN (...)`` as a full-table
+        virtual scan, whereas ``WHERE node_id = ?`` uses the ``repo_vec_rowids``
+        primary key index.
+        """
+        if not self._vec_available or not node_ids:
+            return {}
+        out: Dict[str, bytes] = {}
+        for nid in dict.fromkeys(node_ids):
+            try:
+                row = self.conn.execute(
+                    "SELECT embedding FROM repo_vec WHERE node_id = ?", (nid,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                logger.debug("get_embedding_blobs_by_ids failed for '%s': %s", nid, exc)
+                continue
+            if row and row["embedding"] is not None:
+                out[nid] = bytes(row["embedding"])
+        return out
+
+    def _search_vec_candidates(
+        self,
+        embedding: List[float],
+        cand_ids: List[str],
+        k: int,
+    ) -> List[Dict[str, Any]]:
+        """Exact L2 KNN over a bounded set of candidate *cand_ids*."""
+        blobs = self.get_embedding_blobs_by_ids(cand_ids)
+        if not blobs:
+            return []
+        dim = len(embedding)
+        expected_bytes = dim * 4
+        valid_items = [
+            (nid, blob) for nid, blob in blobs.items() if len(blob) == expected_bytes
+        ]
+        if not valid_items:
+            return []
+
+        if _HAS_NUMPY:
+            q = np.asarray(embedding, dtype=np.float32)
+            mat = np.stack(
+                [np.frombuffer(b, dtype=np.float32) for _, b in valid_items]
+            )
+            dists = np.sqrt(np.sum((mat - q) ** 2, axis=1))
+            scored = [
+                (float(dists[i]), valid_items[i][0])
+                for i in range(len(valid_items))
+            ]
+        else:
+            q_vals = struct.unpack(f"{dim}f", _serialize_float32_vec(embedding))
+            scored = []
+            for nid, blob in valid_items:
+                vec = struct.unpack(f"{dim}f", blob)
+                dist_sq = sum((a - b) * (a - b) for a, b in zip(vec, q_vals))
+                scored.append((math.sqrt(dist_sq), nid))
+
+        scored.sort(key=lambda item: (item[0], item[1]))
+        top = scored[:k]
+        if not top:
+            return []
+
+        rows_by_id = {
+            r["node_id"]: r
+            for r in self.get_nodes_by_ids([nid for _, nid in top])
+        }
+        results: List[Dict[str, Any]] = []
+        for dist, nid in top:
+            row = rows_by_id.get(nid)
+            if row is None:
+                continue
+            entry = dict(row)
+            entry["vec_distance"] = dist
+            results.append(entry)
+        return results
 
     def search_vec(
         self,
@@ -1011,6 +1239,47 @@ class UnifiedWikiDB:
         """
         if not self._vec_available:
             return []
+
+        # When scoped by path_prefix or cluster_id, fetch candidate node_ids
+        # via indexed B-tree lookups first so we avoid scanning the entire
+        # repo_vec table and avoid missing local matches outside global top-k.
+        if path_prefix or cluster_id is not None:
+            cand_conds: List[str] = []
+            cand_params: list = []
+            if path_prefix:
+                bounds = _path_prefix_bounds(path_prefix)
+                if bounds is not None:
+                    cand_conds.append("rel_path >= ? AND rel_path < ?")
+                    cand_params.extend(bounds)
+                else:
+                    cand_conds.append("rel_path GLOB ?")
+                    cand_params.append(
+                        path_prefix.rstrip("/") + "/*"
+                        if not path_prefix.endswith("*")
+                        else path_prefix
+                    )
+            if cluster_id is not None:
+                cand_conds.append("macro_cluster = ?")
+                cand_params.append(cluster_id)
+
+            try:
+                cand_rows = self.conn.execute(
+                    f"SELECT node_id FROM repo_nodes WHERE {' AND '.join(cand_conds)} LIMIT ?",
+                    cand_params + [_SCOPED_VEC_SCAN_LIMIT + 1],
+                ).fetchall()
+            except Exception as exc:
+                logger.warning("Scoped vector candidate lookup failed: %s", exc)
+                cand_rows = None
+
+            if cand_rows is not None:
+                if not cand_rows:
+                    return []
+                if len(cand_rows) <= _SCOPED_VEC_SCAN_LIMIT:
+                    return self._search_vec_candidates(
+                        embedding,
+                        [r["node_id"] for r in cand_rows],
+                        k,
+                    )
 
         blob = _serialize_float32_vec(embedding)
 
@@ -1245,6 +1514,7 @@ class UnifiedWikiDB:
             if len(node_batch) >= BATCH:
                 self._upsert_nodes_batch(node_batch)
                 node_batch.clear()
+                self.conn.commit()  # keep the WAL at one batch
 
         if node_batch:
             self._upsert_nodes_batch(node_batch)
@@ -1312,6 +1582,7 @@ class UnifiedWikiDB:
             if len(edge_batch) >= BATCH:
                 self._upsert_edges_batch(edge_batch)
                 edge_batch.clear()
+                self.conn.commit()  # keep the WAL at one batch
 
         if edge_batch:
             self._upsert_edges_batch(edge_batch)

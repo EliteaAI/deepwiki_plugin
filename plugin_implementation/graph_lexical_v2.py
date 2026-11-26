@@ -29,7 +29,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import networkx as nx
 
-from .feature_flags import FeatureFlags, get_feature_flags
+try:
+    from .feature_flags import FeatureFlags, get_feature_flags
+    from .unified_db import UnifiedWikiDB
+except ImportError:  # pragma: no cover — non-package import fallback
+    from feature_flags import FeatureFlags, get_feature_flags  # type: ignore
+    from unified_db import UnifiedWikiDB  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +101,13 @@ REST_BASE_CLASSES: frozenset[str] = frozenset({
 # IDF
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _compute_symbol_idf(db, symbol_name: str) -> float:
+def _compute_symbol_idf(
+    db,
+    symbol_name: str,
+    *,
+    total_nodes: Optional[int] = None,
+    idf_cache: Optional[Dict[str, float]] = None,
+) -> float:
     """Return ``log(N_total / (1 + N_matches))`` for *symbol_name*.
 
     Uses ``count_fts_matches(exact_match=True)`` so we get token-level
@@ -105,14 +116,19 @@ def _compute_symbol_idf(db, symbol_name: str) -> float:
     Returns ``+inf`` when the storage back-end refuses the query
     (treat as "very specific" — let the tier table decide).
     """
+    if idf_cache is not None and symbol_name in idf_cache:
+        return idf_cache[symbol_name]
     try:
-        total = db.node_count()
+        total = total_nodes if total_nodes is not None else db.node_count()
         matches = db.count_fts_matches(symbol_name, exact_match=True)
     except Exception:  # noqa: BLE001 — defensive
         return float("inf")
     if total <= 0:
         return float("inf")
-    return math.log(total / (1 + max(0, matches)))
+    val = math.log(total / (1 + max(0, matches)))
+    if idf_cache is not None:
+        idf_cache[symbol_name] = val
+    return val
 
 
 def _allowed_tiers(symbol_type: str, idf: float) -> frozenset[str]:
@@ -280,6 +296,8 @@ def resolve_orphans_lexical_tiered(
     fts_limit: int = 8,
     max_lexical_edges: int = 2,
     flags: Optional[FeatureFlags] = None,
+    _idf_cache: Optional[Dict[str, float]] = None,
+    _total_nodes: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Run the T1→T4 cascade for *orphan_id* and return the chosen hits.
 
@@ -295,6 +313,18 @@ def resolve_orphans_lexical_tiered(
     flags = flags or get_feature_flags()
 
     node_data = G.nodes.get(orphan_id, {}) or {}
+    if db is None or isinstance(db, UnifiedWikiDB):
+        g_stype = (node_data.get("symbol_type") or "").lower()
+        if g_stype and g_stype not in _TIER_ELIGIBILITY:
+            g_sym = node_data.get("symbol")
+            g_name = (
+                node_data.get("symbol_name")
+                or (g_sym.get("name", "") if isinstance(g_sym, dict) else getattr(g_sym, "name", "") if g_sym is not None else "")
+                or ""
+            )
+            if g_name not in GENERIC_CLASS_NAMES:
+                return []
+
     db_node = db.get_node(orphan_id) if db is not None else None
 
     symbol_name: str = ""
@@ -338,7 +368,9 @@ def resolve_orphans_lexical_tiered(
 
     # ── IDF gate
     if flags.orphan_lexical_idf_gate:
-        idf = _compute_symbol_idf(db, fts_query)
+        idf = _compute_symbol_idf(
+            db, fts_query, total_nodes=_total_nodes, idf_cache=_idf_cache,
+        )
     else:
         idf = float("inf")
     allowed = _allowed_tiers(symbol_type, idf)

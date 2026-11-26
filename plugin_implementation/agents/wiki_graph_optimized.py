@@ -235,22 +235,30 @@ class OptimizedWikiGenerationAgent:
 
         try:
             # Get documents from indexer (already indexed)
+            # The filesystem indexer keeps only the documents read below
+            # (README chunks, sample candidates) plus the count and sources.
             all_documents = self.indexer.get_all_documents()
-            if not all_documents:
+            _count_fn = getattr(self.indexer, 'get_document_count', None)
+            n_documents = _count_fn() if callable(_count_fn) else len(all_documents or [])
+            if not n_documents:
                 raise ValueError("No documents found in indexer - ensure repository is indexed first")
 
             # Get index statistics
             index_stats = getattr(self.indexer, 'last_index_stats', {}) or {}
-            logger.info(f"Retrieved {len(all_documents)} documents from indexer")
+            logger.info(f"Retrieved {n_documents} documents from indexer")
             if this and getattr(this, 'module', None):
-                this.module.invocation_thinking(f"I am on phase repository_analysis\nCollected {len(all_documents)} documents – synthesizing analysis\nReasoning: Need holistic context vector to inform section/page allocation.\nNext: Build repository tree + extract README + run LLM synthesis.")
+                this.module.invocation_thinking(f"I am on phase repository_analysis\nCollected {n_documents} documents – synthesizing analysis\nReasoning: Need holistic context vector to inform section/page allocation.\nNext: Build repository tree + extract README + run LLM synthesis.")
 
             # Build repository tree from repository file paths (avoid doc-based tree)
             repository_files = self._get_repository_file_paths()
             if not repository_files:
-                repository_files = list(set(
-                    doc.metadata.get('source', '') for doc in all_documents if doc.metadata.get('source')
-                ))
+                _sources_fn = getattr(self.indexer, 'get_document_sources', None)
+                if callable(_sources_fn):
+                    repository_files = list(set(_sources_fn()))
+                else:
+                    repository_files = list(set(
+                        doc.metadata.get('source', '') for doc in all_documents if doc.metadata.get('source')
+                    ))
             logger.info(f"Repository file list size: {len(repository_files)}")
             repository_tree = self._create_repository_tree(repository_files)
 

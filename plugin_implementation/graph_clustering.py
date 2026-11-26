@@ -23,6 +23,8 @@ Usage::
     results = run_phase3(db, G, hubs)
 """
 
+import heapq
+import itertools
 import logging
 import math
 from collections import Counter
@@ -1289,10 +1291,19 @@ def persist_clusters(
     """
     # Reset all existing cluster / hub columns so stale assignments
     # from a previous run on the same cached DB file do not survive.
-    db.conn.execute(
-        "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
-        " is_hub = 0, hub_assignment = NULL"
-    )
+    # Both UPDATEs rewrite whole rows (text included), so they run in
+    # committed chunks to keep the WAL at one chunk instead of the table.
+    _CHUNK = 5000
+    max_rowid = db.conn.execute("SELECT max(rowid) FROM repo_nodes").fetchone()[0]
+    if not isinstance(max_rowid, int):
+        max_rowid = 0
+    for lo in range(0, max_rowid, _CHUNK):
+        db.conn.execute(
+            "UPDATE repo_nodes SET macro_cluster = NULL, micro_cluster = NULL,"
+            " is_hub = 0, hub_assignment = NULL WHERE rowid > ? AND rowid <= ?",
+            (lo, lo + _CHUNK),
+        )
+        db.conn.commit()
 
     # Batch-build (node_id, macro, micro) tuples
     batch: List[Tuple[str, int, Optional[int]]] = []
@@ -1304,13 +1315,17 @@ def persist_clusters(
     for hub_id, (macro_id, micro_id) in hub_assignments.items():
         batch.append((hub_id, macro_id, micro_id))
 
-    db.set_clusters_batch(batch)
+    for i in range(0, len(batch), _CHUNK):
+        db.set_clusters_batch(batch[i : i + _CHUNK])
+        db.conn.commit()
 
     # Hub flags (is_hub + assignment label for metadata/debugging)
     for hub_id, (macro_id, _micro_id) in hub_assignments.items():
         db.set_hub(hub_id, is_hub=True, assignment=str(macro_id))
 
     db.conn.commit()
+    if hasattr(db, "checkpoint_wal"):
+        db.checkpoint_wal()
 
     stats = {
         "nodes_clustered": len(batch),
@@ -1475,12 +1490,15 @@ def _cross_edges_count(
         return 0
     src_set = src if isinstance(src, set) else set(src)
     tgt_set = tgt if isinstance(tgt, set) else set(tgt)
+    small, large = (
+        (src_set, tgt_set) if len(src_set) <= len(tgt_set) else (tgt_set, src_set)
+    )
     count = 0
-    for _u, v in G.out_edges(src_set):
-        if v in tgt_set:
+    for _u, v in G.out_edges(small):
+        if v in large:
             count += 1
-    for _u, v in G.out_edges(tgt_set):
-        if v in src_set:
+    for u, _v in G.in_edges(small):
+        if u in large:
             count += 1
     return count
 
@@ -1604,41 +1622,104 @@ def _consolidate_sections(
 
     original_count = len(sections)
 
-    # Pre-compute per-section directory histograms, node sets, sizes.
-    # The node set lets _cross_edges_count score by graph-edge density
-    # (semantic relatedness) instead of the directory-only heuristic
-    # the previous code used as its sole signal.
+    # Pre-compute per-section directory histograms, node sets, sizes, and
+    # reverse lookup indexes for O(deg + |dirs|) merge selection.
     sec_dirs: Dict[int, Counter] = {}
     sec_nodes: Dict[int, Set[str]] = {}
     sec_sizes: Dict[int, int] = {}
+    node_to_sec: Dict[str, int] = {}
+    dir_to_secs: Dict[str, Set[int]] = {}
     for sid, sec in sections.items():
         all_nids = [nid for pg in sec["pages"].values() for nid in pg]
-        sec_dirs[sid] = _dir_histogram(all_nids, G)
-        sec_nodes[sid] = set(all_nids)
+        d_hist = _dir_histogram(all_nids, G)
+        sec_dirs[sid] = d_hist
+        n_set = set(all_nids)
+        sec_nodes[sid] = n_set
         sec_sizes[sid] = len(all_nids)
+        for nid in n_set:
+            node_to_sec[nid] = sid
+        for d in d_hist:
+            dir_to_secs.setdefault(d, set()).add(sid)
+
+    size_heap: List[Tuple[int, int]] = [(sz, sid) for sid, sz in sec_sizes.items()]
+    heapq.heapify(size_heap)
+
+    def _pop_smallest_live(exclude_sid: Optional[int] = None) -> Optional[int]:
+        skipped: List[Tuple[int, int]] = []
+        chosen: Optional[int] = None
+        while size_heap:
+            sz, sid = heapq.heappop(size_heap)
+            if sid not in sec_sizes or sec_sizes[sid] != sz:
+                continue
+            if exclude_sid is not None and sid == exclude_sid:
+                skipped.append((sz, sid))
+                continue
+            chosen = sid
+            break
+        for item in skipped:
+            heapq.heappush(size_heap, item)
+        return chosen
 
     while len(sections) > target:
-        # Pick the smallest section
-        smallest_id = min(sec_sizes, key=sec_sizes.get)
+        smallest_id = _pop_smallest_live()
+        if smallest_id is None:
+            break
         dirs_a = sec_dirs[smallest_id]
         nodes_a = sec_nodes[smallest_id]
 
-        # Score each candidate by (edges, dir_similarity, -size).
-        # Edges first (semantic relatedness — most cross-edges to the
-        # merging section win). Dir-similarity as tiebreak preserves
-        # the prior signal for the case where two siblings have equal
-        # cross-edge counts (typical for tiny components). Smaller
-        # sibling as third tiebreak — same as _consolidate_pages and
-        # the cluster_planner MERGE_WITH policy, keeps tie-breaking
-        # consistent across all merge layers.
+        # Score candidate targets by (edges, dir_similarity, -size).
+        edges_by_sid: Dict[int, int] = {}
+        for _u, v in G.out_edges(nodes_a):
+            other_sid = node_to_sec.get(v)
+            if other_sid is not None and other_sid != smallest_id and other_sid in sections:
+                edges_by_sid[other_sid] = edges_by_sid.get(other_sid, 0) + 1
+        for u, _v in G.in_edges(nodes_a):
+            other_sid = node_to_sec.get(u)
+            if other_sid is not None and other_sid != smallest_id and other_sid in sections:
+                edges_by_sid[other_sid] = edges_by_sid.get(other_sid, 0) + 1
+
+        dir_sim_by_sid: Dict[int, int] = {}
+        for d, cnt_a in dirs_a.items():
+            sids_in_d = dir_to_secs.get(d)
+            if not sids_in_d:
+                continue
+            if len(sids_in_d) > 256:
+                cand_sids = (set(edges_by_sid) & sids_in_d) | set(
+                    itertools.islice(sids_in_d, 256)
+                )
+            else:
+                cand_sids = sids_in_d
+            for sid in cand_sids:
+                if sid == smallest_id or sid not in sections:
+                    continue
+                dir_sim_by_sid[sid] = (
+                    dir_sim_by_sid.get(sid, 0) + min(cnt_a, sec_dirs[sid][d])
+                )
+
+        # Ensure the smallest other live section is considered as (0, 0, -size)
+        # fallback when no cross-edges or shared dirs match.
+        fallback_sid = _pop_smallest_live(exclude_sid=smallest_id)
+        if fallback_sid is not None:
+            heapq.heappush(size_heap, (sec_sizes[fallback_sid], fallback_sid))
+            if fallback_sid not in dir_sim_by_sid:
+                dir_sim_by_sid[fallback_sid] = _dir_similarity(
+                    dirs_a, sec_dirs[fallback_sid],
+                )
+
+        candidates: Set[int] = set(edges_by_sid) | set(dir_sim_by_sid)
+        if fallback_sid is not None:
+            candidates.add(fallback_sid)
+
         best_target = None
         best_key: Tuple[int, int, int] = (-1, -1, 1)
-        for sid in sections:
-            if sid == smallest_id:
+        for sid in candidates:
+            if sid == smallest_id or sid not in sections:
                 continue
-            edges = _cross_edges_count(G, nodes_a, sec_nodes[sid])
-            dir_sim = _dir_similarity(dirs_a, sec_dirs[sid])
-            key = (edges, dir_sim, -sec_sizes[sid])
+            key = (
+                edges_by_sid.get(sid, 0),
+                dir_sim_by_sid.get(sid, 0),
+                -sec_sizes[sid],
+            )
             if key > best_key:
                 best_key = key
                 best_target = sid
@@ -1661,12 +1742,19 @@ def _consolidate_sections(
         micro_assign.pop(smallest_id, None)
 
         # Update bookkeeping
+        for nid in nodes_a:
+            node_to_sec[nid] = best_target
         for d, c in dirs_a.items():
             sec_dirs[best_target][d] = sec_dirs[best_target].get(d, 0) + c
+            sids_in_d = dir_to_secs.get(d)
+            if sids_in_d is not None:
+                sids_in_d.discard(smallest_id)
+                sids_in_d.add(best_target)
         del sec_dirs[smallest_id]
         sec_nodes[best_target] |= sec_nodes.pop(smallest_id)
         sec_sizes[best_target] += sec_sizes.pop(smallest_id)
         del sections[smallest_id]
+        heapq.heappush(size_heap, (sec_sizes[best_target], best_target))
 
     logger.info(
         "Section consolidation: %d → %d sections (target %d, scale %d %s)",
@@ -1713,70 +1801,150 @@ def _consolidate_pages(
     pg_sizes: Dict[tuple, int] = {}
     pg_dirs: Dict[tuple, Counter] = {}
     pg_nodes: Dict[tuple, Set[str]] = {}
+    node_to_page: Dict[int, Dict[str, int]] = {}
+    dir_to_pages: Dict[int, Dict[str, Set[int]]] = {}
+    sec_pg_heap: Dict[int, List[Tuple[int, int]]] = {}
+    global_heap: List[Tuple[int, int, int]] = []
 
     for sid, sec in sections.items():
+        n2p: Dict[str, int] = {}
+        d2p: Dict[str, Set[int]] = {}
+        sheap: List[Tuple[int, int]] = []
         for pid, nids in sec["pages"].items():
             key = (sid, pid)
-            pg_sizes[key] = len(nids)
-            pg_dirs[key] = _dir_histogram(nids, G)
-            pg_nodes[key] = set(nids)
+            sz = len(nids)
+            d_hist = _dir_histogram(nids, G)
+            pg_sizes[key] = sz
+            pg_dirs[key] = d_hist
+            n_set = set(nids)
+            pg_nodes[key] = n_set
+            for nid in n_set:
+                n2p[nid] = pid
+            for d in d_hist:
+                d2p.setdefault(d, set()).add(pid)
+            sheap.append((sz, pid))
+            global_heap.append((sz, sid, pid))
+        heapq.heapify(sheap)
+        node_to_page[sid] = n2p
+        dir_to_pages[sid] = d2p
+        sec_pg_heap[sid] = sheap
 
-    while total_pages > target_total:
-        # Find the globally smallest page that has a sibling in its section
-        candidates = sorted(pg_sizes.items(), key=lambda x: x[1])
+    heapq.heapify(global_heap)
 
-        merged = False
-        for (sid, pid), _size in candidates:
-            # Must have at least one sibling to merge into
-            sec_pages = sections[sid]["pages"]
-            if len(sec_pages) <= 1:
+    def _pop_smallest_sibling(sid: int, exclude_pid: int) -> Optional[int]:
+        sheap = sec_pg_heap[sid]
+        sec_pages = sections[sid]["pages"]
+        skipped: List[Tuple[int, int]] = []
+        chosen: Optional[int] = None
+        while sheap:
+            sz, other_pid = heapq.heappop(sheap)
+            if other_pid not in sec_pages or pg_sizes.get((sid, other_pid)) != sz:
                 continue
-
-            dirs_a = pg_dirs[(sid, pid)]
-            nodes_a = pg_nodes[(sid, pid)]
-
-            # Best same-section neighbour scored by
-            # (edges, dir_similarity, -size). Edges first
-            # (semantic relatedness), dir as tiebreak, smaller-sibling
-            # third tiebreak — same policy as _consolidate_sections
-            # and cluster_planner MERGE_WITH.
-            best_pg = None
-            best_key: Tuple[int, int, int] = (-1, -1, 1)
-            for other_pid in sec_pages:
-                if other_pid == pid:
-                    continue
-                edges = _cross_edges_count(
-                    G, nodes_a, pg_nodes[(sid, other_pid)],
-                )
-                dir_sim = _dir_similarity(
-                    dirs_a, pg_dirs[(sid, other_pid)],
-                )
-                key = (edges, dir_sim, -pg_sizes[(sid, other_pid)])
-                if key > best_key:
-                    best_key = key
-                    best_pg = other_pid
-
-            if best_pg is None:
+            if other_pid == exclude_pid:
+                skipped.append((sz, other_pid))
                 continue
-
-            # Merge
-            sec_pages[best_pg].extend(sec_pages.pop(pid))
-            for nid in sec_pages[best_pg]:
-                micro_assign.setdefault(sid, {})[nid] = best_pg
-
-            for d, c in dirs_a.items():
-                pg_dirs[(sid, best_pg)][d] = pg_dirs[(sid, best_pg)].get(d, 0) + c
-            pg_nodes[(sid, best_pg)] |= nodes_a
-            del pg_dirs[(sid, pid)]
-            del pg_nodes[(sid, pid)]
-            pg_sizes[(sid, best_pg)] += pg_sizes.pop((sid, pid))
-
-            total_pages -= 1
-            merged = True
+            chosen = other_pid
             break
+        for item in skipped:
+            heapq.heappush(sheap, item)
+        return chosen
 
-        if not merged:
-            break  # no more mergeable pages
+    while total_pages > target_total and global_heap:
+        sz, sid, pid = heapq.heappop(global_heap)
+        key_a = (sid, pid)
+        if key_a not in pg_sizes or pg_sizes[key_a] != sz:
+            continue
+        sec_pages = sections[sid]["pages"]
+        if len(sec_pages) <= 1 or pid not in sec_pages:
+            continue
+
+        dirs_a = pg_dirs[key_a]
+        nodes_a = pg_nodes[key_a]
+        n2p = node_to_page[sid]
+        d2p = dir_to_pages[sid]
+
+        # Best same-section neighbour scored by (edges, dir_similarity, -size).
+        edges_by_pid: Dict[int, int] = {}
+        for _u, v in G.out_edges(nodes_a):
+            other_pid = n2p.get(v)
+            if other_pid is not None and other_pid != pid and other_pid in sec_pages:
+                edges_by_pid[other_pid] = edges_by_pid.get(other_pid, 0) + 1
+        for u, _v in G.in_edges(nodes_a):
+            other_pid = n2p.get(u)
+            if other_pid is not None and other_pid != pid and other_pid in sec_pages:
+                edges_by_pid[other_pid] = edges_by_pid.get(other_pid, 0) + 1
+
+        dir_sim_by_pid: Dict[int, int] = {}
+        for d, cnt_a in dirs_a.items():
+            pids_in_d = d2p.get(d)
+            if not pids_in_d:
+                continue
+            if len(pids_in_d) > 256:
+                cand_pids = (set(edges_by_pid) & pids_in_d) | set(
+                    itertools.islice(pids_in_d, 256)
+                )
+            else:
+                cand_pids = pids_in_d
+            for other_pid in cand_pids:
+                if other_pid == pid or other_pid not in sec_pages:
+                    continue
+                dir_sim_by_pid[other_pid] = (
+                    dir_sim_by_pid.get(other_pid, 0)
+                    + min(cnt_a, pg_dirs[(sid, other_pid)][d])
+                )
+
+        fallback_pg = _pop_smallest_sibling(sid, pid)
+        if fallback_pg is not None:
+            heapq.heappush(sec_pg_heap[sid], (pg_sizes[(sid, fallback_pg)], fallback_pg))
+            if fallback_pg not in dir_sim_by_pid:
+                dir_sim_by_pid[fallback_pg] = _dir_similarity(
+                    dirs_a, pg_dirs[(sid, fallback_pg)],
+                )
+
+        candidates: Set[int] = set(edges_by_pid) | set(dir_sim_by_pid)
+        if fallback_pg is not None:
+            candidates.add(fallback_pg)
+
+        best_pg = None
+        best_key: Tuple[int, int, int] = (-1, -1, 1)
+        for other_pid in candidates:
+            if other_pid == pid or other_pid not in sec_pages:
+                continue
+            key = (
+                edges_by_pid.get(other_pid, 0),
+                dir_sim_by_pid.get(other_pid, 0),
+                -pg_sizes[(sid, other_pid)],
+            )
+            if key > best_key:
+                best_key = key
+                best_pg = other_pid
+
+        if best_pg is None:
+            continue
+
+        # Merge — only update micro_assign and node_to_page for moved nodes
+        moved_nodes = sec_pages.pop(pid)
+        sec_pages[best_pg].extend(moved_nodes)
+        sec_micro = micro_assign.setdefault(sid, {})
+        for nid in moved_nodes:
+            sec_micro[nid] = best_pg
+            n2p[nid] = best_pg
+
+        for d, c in dirs_a.items():
+            pg_dirs[(sid, best_pg)][d] = pg_dirs[(sid, best_pg)].get(d, 0) + c
+            pids_in_d = d2p.get(d)
+            if pids_in_d is not None:
+                pids_in_d.discard(pid)
+                pids_in_d.add(best_pg)
+        pg_nodes[(sid, best_pg)] |= nodes_a
+        del pg_dirs[key_a]
+        del pg_nodes[key_a]
+        pg_sizes[(sid, best_pg)] += pg_sizes.pop(key_a)
+
+        new_sz = pg_sizes[(sid, best_pg)]
+        heapq.heappush(global_heap, (new_sz, sid, best_pg))
+        heapq.heappush(sec_pg_heap[sid], (new_sz, best_pg))
+        total_pages -= 1
 
     new_total = sum(len(s["pages"]) for s in sections.values())
     logger.info(
@@ -1916,17 +2084,25 @@ def hierarchical_leiden_cluster(
         for idx, sec_id in enumerate(sec_partition.membership):
             file_to_section[file_list[idx]] = sec_id
 
-    # Assign isolated files to nearest section by directory proximity
+    # Assign isolated files to nearest section by directory proximity (O(1) lookup)
     if isolated_files and file_to_section:
         sec_dirs: Dict[int, Counter] = {}
         for f, sid in file_to_section.items():
             d = f.rsplit("/", 1)[0] if "/" in f else "<root>"
             sec_dirs.setdefault(sid, Counter())[d] += 1
 
+        default_sec = next(iter(sec_dirs))
+        dir_best_cnt: Dict[str, int] = {}
+        dir_best_sec: Dict[str, int] = {}
+        for sid, d_hist in sec_dirs.items():
+            for d, cnt in d_hist.items():
+                if cnt > dir_best_cnt.get(d, 0):
+                    dir_best_cnt[d] = cnt
+                    dir_best_sec[d] = sid
+
         for f in isolated_files:
             d = f.rsplit("/", 1)[0] if "/" in f else "<root>"
-            best_sec = max(sec_dirs, key=lambda s: sec_dirs[s].get(d, 0))
-            file_to_section[f] = best_sec
+            file_to_section[f] = dir_best_sec.get(d, default_sec)
     elif isolated_files:
         # All files are isolated — each gets its own section so
         # consolidation can merge them by directory proximity later.

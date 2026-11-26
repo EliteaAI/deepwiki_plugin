@@ -35,6 +35,12 @@ class FilterManager:
         self.excluded_files = self._build_excluded_files()
         self.allowed_extensions = self._build_allowed_extensions()
         self.max_file_size_mb = self._get_max_file_size()
+        # The size cap only applies when it was configured; the 10 MB
+        # default has never been enforced (no caller passed a file size).
+        self.max_file_size_configured = (
+            'max_file_size_mb' in self.api_filters
+            or 'max_size_mb' in (self.repo_config.get('repository') or {})
+        )
         
         logger.info(f"Filter manager initialized with {len(self.excluded_dirs)} excluded dirs, "
                    f"{len(self.excluded_files)} excluded files, "
@@ -300,6 +306,14 @@ class FilterManager:
         
         return ext in text_extensions or name in text_names
     
+    def has_user_filters(self) -> bool:
+        """True when API filters or repo.json file filters / size limit are set."""
+        return bool(
+            self.api_filters
+            or self.repo_config.get('file_filters')
+            or self.max_file_size_configured
+        )
+
     def get_filter_summary(self) -> Dict[str, Any]:
         """Get summary of active filters"""
         return {
